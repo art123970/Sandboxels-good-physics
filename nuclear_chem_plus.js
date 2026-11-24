@@ -189,6 +189,27 @@
   const POISONS = new Set(["boron", "molten_boron", "cadmium", "molten_cadmium", "xenon_135", "hafnium"]);
   const SHIELDING = new Set(["lead", "molten_lead", "concrete", "osmium"]);
 
+  // Performance & runaway safeguards (prevents Demon Core freeze)
+  const MAX_NEUTRONS = 300;
+  const MAX_SPAWN_PER_TICK = 35;
+  const EXPLODE_COOLDOWN_TICKS = 8;
+
+  let lastPhysicsTick = -1;
+  let neutronsThisTick = 0;
+  let prevTickNeutrons = 0;
+  let spawnedThisTick = 0;
+  let lastExplodeTick = -100;
+
+  function syncPhysicsTick() {
+    const t = typeof pixelTicks === "number" ? pixelTicks : 0;
+    if (t !== lastPhysicsTick) {
+      prevTickNeutrons = neutronsThisTick;
+      neutronsThisTick = 0;
+      spawnedThisTick = 0;
+      lastPhysicsTick = t;
+    }
+  }
+
   const FISSILE_SPECS = {
     uranium_235: { thermalProb: 0.78, fastProb: 0.08, neutrons: [2, 3], heat: 2400, daughters: ["barium_141", "krypton_92", "xenon_135", "strontium_90"] },
     molten_uranium_235: { thermalProb: 0.72, fastProb: 0.07, neutrons: [2, 3], heat: 2400, daughters: ["barium_141", "krypton_92", "xenon_135", "strontium_90"] },
@@ -196,26 +217,30 @@
     molten_plutonium_239: { thermalProb: 0.78, fastProb: 0.20, neutrons: [2, 3], heat: 2700, daughters: ["barium_141", "xenon_135", "strontium_90", "cesium_135"] },
     uranium_233: { thermalProb: 0.80, fastProb: 0.14, neutrons: [2, 3], heat: 2300, daughters: ["barium_141", "krypton_92", "strontium_90"] },
     molten_uranium_233: { thermalProb: 0.75, fastProb: 0.12, neutrons: [2, 3], heat: 2300, daughters: ["barium_141", "krypton_92", "strontium_90"] },
-    // Vanilla & chem.js compatibility
     uranium: { thermalProb: 0.35, fastProb: 0.03, neutrons: [2, 2], heat: 1600, daughters: ["barium_141", "krypton_92", "xenon_135"] },
     plutonium: { thermalProb: 0.82, fastProb: 0.22, neutrons: [2, 3], heat: 2700, daughters: ["barium_141", "xenon_135", "strontium_90"] },
     enriched_uranium: { thermalProb: 0.76, fastProb: 0.08, neutrons: [2, 3], heat: 2400, daughters: ["barium_141", "krypton_92", "xenon_135", "strontium_90"] }
   };
 
   function spawnNeutronsAround(cx, cy, count, type = "fast_neutron") {
+    syncPhysicsTick();
+    if (prevTickNeutrons + spawnedThisTick >= MAX_NEUTRONS) return;
+    if (spawnedThisTick >= MAX_SPAWN_PER_TICK) return;
+
     const dirs = [
       [-1, -1], [0, -1], [1, -1],
       [-1,  0],          [1,  0],
       [-1,  1], [0,  1], [1,  1]
     ];
-    // Shuffle directions
     for (let i = dirs.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
       [dirs[i], dirs[j]] = [dirs[j], dirs[i]];
     }
+
     let spawned = 0;
     for (const [dx, dy] of dirs) {
       if (spawned >= count) break;
+      if (prevTickNeutrons + spawnedThisTick >= MAX_NEUTRONS || spawnedThisTick >= MAX_SPAWN_PER_TICK) break;
       for (let dist = 1; dist <= 2; dist++) {
         const nx = cx + dx * dist;
         const ny = cy + dy * dist;
@@ -226,9 +251,10 @@
           if (np) {
             np.vx = dx;
             np.vy = dy;
-            np.life = 180;
+            np.life = 90;
           }
           spawned++;
+          spawnedThisTick++;
           break;
         }
       }
@@ -236,6 +262,7 @@
   }
 
   function triggerFission(targetPixel, spec, neutronPixel) {
+    syncPhysicsTick();
     const tx = targetPixel.x;
     const ty = targetPixel.y;
 
@@ -243,7 +270,7 @@
     const daughter = spec.daughters[Math.floor(Math.random() * spec.daughters.length)];
     changePixel(targetPixel, daughter);
 
-    // 2. Deposit fission kinetic energy as heat (no arbitrary explosion!)
+    // 2. Deposit fission kinetic energy as heat
     targetPixel.temp += spec.heat;
     let nearbyFissile = 0;
     for (let dx = -2; dx <= 2; dx++) {
@@ -264,25 +291,34 @@
       deletePixel(neutronPixel.x, neutronPixel.y);
     }
 
-    // 4. Emit 2-3 prompt fast neutrons
+    // 4. Emit 2-3 prompt fast neutrons (respecting global cap)
     const nCount = spec.neutrons[0] + (Math.random() < 0.5 ? (spec.neutrons[1] - spec.neutrons[0]) : 0);
     spawnNeutronsAround(tx, ty, nCount, "fast_neutron");
 
-    // 5. Realistic Prompt-Critical Hydrodynamic Disassembly:
-    // Only happens when tightly packed supercritical mass reaches extreme energy density!
-    if (targetPixel.temp > 6000 && nearbyFissile >= 10) {
-      explodeAt(tx, ty, 9, "plasma,fire,radiation,fallout");
+    // 5. Throttled Prompt-Critical Hydrodynamic Disassembly
+    if (targetPixel.temp > 6000 && nearbyFissile >= 10 && (lastPhysicsTick - lastExplodeTick >= EXPLODE_COOLDOWN_TICKS)) {
+      lastExplodeTick = lastPhysicsTick;
+      explodeAt(tx, ty, 8, "plasma,fire,radiation,fallout");
     }
   }
 
   function neutronTick(pixel, isFast) {
+    syncPhysicsTick();
+    neutronsThisTick++;
+
+    // Gracefully cull excess neutrons if a runaway spikes past the cap
+    if (neutronsThisTick > MAX_NEUTRONS * 1.25) {
+      deletePixel(pixel.x, pixel.y);
+      return;
+    }
+
     if (pixel.vx === undefined || pixel.vy === undefined || (pixel.vx === 0 && pixel.vy === 0)) {
       const dirs = [[-1,-1],[0,-1],[1,-1],[-1,0],[1,0],[-1,1],[0,1],[1,1]];
       const d = dirs[Math.floor(Math.random() * dirs.length)];
       pixel.vx = d[0];
       pixel.vy = d[1];
     }
-    if (pixel.life === undefined) pixel.life = 180;
+    if (pixel.life === undefined) pixel.life = 90;
     pixel.life--;
 
     // Free neutron beta decay (n -> p + e- + antineutrino)
@@ -291,7 +327,7 @@
       return;
     }
 
-    const steps = isFast ? 2 : 1; // Fast neutrons move twice as fast
+    const steps = isFast ? 2 : 1;
     for (let s = 0; s < steps; s++) {
       const nx = pixel.x + pixel.vx;
       const ny = pixel.y + pixel.vy;
@@ -318,7 +354,6 @@
           triggerFission(target, spec, pixel);
           return;
         } else {
-          // Elastic scatter or pass through
           if (Math.random() < 0.5) {
             swapPixels(pixel, target);
           } else {
@@ -346,7 +381,7 @@
         }
       }
 
-      // C. Tritium breeding blanket (Li-6 + n -> T + He-4 + 4.8 MeV)
+      // C. Tritium breeding blanket (Li-6 + n -> T + He-4)
       if (tElem === "lithium_6" || tElem === "molten_lithium_6") {
         if (Math.random() < 0.55) {
           changePixel(target, "tritium");
@@ -385,7 +420,6 @@
       if (MODERATORS.has(tElem)) {
         target.temp += isFast ? 35 : 5;
         if (isFast) {
-          // Heavy water & graphite moderate without absorbing; light water occasionally absorbs
           if (tElem === "water" && Math.random() < 0.06) {
             changePixel(target, "heavy_water");
             deletePixel(pixel.x, pixel.y);
@@ -396,7 +430,6 @@
           pixel.vy = Math.floor(Math.random() * 3) - 1;
           return;
         } else {
-          // Thermal neutron diffuses through moderator
           swapPixels(pixel, target);
           return;
         }
@@ -408,8 +441,9 @@
         pixel.vy = -pixel.vy + (Math.random() < 0.3 ? (Math.random() < 0.5 ? 1 : -1) : 0);
         pixel.vx = Math.max(-1, Math.min(1, pixel.vx));
         pixel.vy = Math.max(-1, Math.min(1, pixel.vy));
-        // Beryllium (n, 2n) neutron multiplication for fast neutrons!
-        if (isFast && (tElem === "beryllium" || tElem === "molten_beryllium") && Math.random() < 0.14) {
+        // Beryllium (n, 2n) triggers at most once per neutron to prevent infinite reflection loops
+        if (isFast && !pixel.beMultiplied && (tElem === "beryllium" || tElem === "molten_beryllium") && Math.random() < 0.08) {
+          pixel.beMultiplied = true;
           spawnNeutronsAround(pixel.x, pixel.y, 1, "fast_neutron");
         }
         return;
@@ -433,14 +467,12 @@
       if (tState === "gas" || tElem === "fire" || tElem === "plasma" || tElem === "radiation") {
         swapPixels(pixel, target);
       } else {
-        // Elastic bounce off arbitrary solids
         pixel.vx = Math.floor(Math.random() * 3) - 1;
         pixel.vy = Math.floor(Math.random() * 3) - 1;
         return;
       }
     }
   }
-
   // ---------------------------------------------------------------------------
   // 3. NEUTRON PARTICLES
   // ---------------------------------------------------------------------------
