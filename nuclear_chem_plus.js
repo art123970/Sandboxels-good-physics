@@ -181,7 +181,7 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 2. NUCLEAR PHYSICS ENGINE (NEUTRON TRANSPORT, FISSION & CRITICALITY)
+  // 2. NUCLEAR PHYSICS ENGINE (CRASH-PROOF NEUTRON TRANSPORT & FISSION)
   // ---------------------------------------------------------------------------
 
   const MODERATORS = new Set(["heavy_water", "water", "graphite", "ice", "heavy_ice", "paraffin"]);
@@ -189,7 +189,13 @@
   const POISONS = new Set(["boron", "molten_boron", "cadmium", "molten_cadmium", "xenon_135", "hafnium"]);
   const SHIELDING = new Set(["lead", "molten_lead", "concrete", "osmium"]);
 
-  // Performance & runaway safeguards (prevents Demon Core freeze)
+  const NON_ZERO_DIRS = [
+    [-1, -1], [0, -1], [1, -1],
+    [-1,  0],          [1,  0],
+    [-1,  1], [0,  1], [1,  1]
+  ];
+
+  // Performance & runaway safeguards
   const MAX_NEUTRONS = 300;
   const MAX_SPAWN_PER_TICK = 35;
   const EXPLODE_COOLDOWN_TICKS = 8;
@@ -199,6 +205,7 @@
   let prevTickNeutrons = 0;
   let spawnedThisTick = 0;
   let lastExplodeTick = -100;
+  let loggedNeutronError = false;
 
   function syncPhysicsTick() {
     const t = typeof pixelTicks === "number" ? pixelTicks : 0;
@@ -208,6 +215,35 @@
       spawnedThisTick = 0;
       lastPhysicsTick = t;
     }
+  }
+
+  function randomDir() {
+    return NON_ZERO_DIRS[Math.floor(Math.random() * NON_ZERO_DIRS.length)];
+  }
+
+  function inSafeBounds(x, y) {
+    return !outOfBounds(x, y) && pixelMap[x] !== undefined;
+  }
+
+  function safeChange(pixel, elemName) {
+    if (!pixel || pixel.del) return false;
+    if (!elements[elemName]) {
+      if (inSafeBounds(pixel.x, pixel.y)) deletePixel(pixel.x, pixel.y);
+      return false;
+    }
+    changePixel(pixel, elemName);
+    return true;
+  }
+
+  function safeSwap(p1, p2) {
+    if (!p1 || !p2 || p1 === p2 || p1.del || p2.del) return;
+    const x1 = p1.x, y1 = p1.y;
+    const x2 = p2.x, y2 = p2.y;
+    if (!inSafeBounds(x1, y1) || !inSafeBounds(x2, y2)) return;
+    p1.x = x2; p1.y = y2;
+    p2.x = x1; p2.y = y1;
+    pixelMap[x1][y1] = p2;
+    pixelMap[x2][y2] = p1;
   }
 
   const FISSILE_SPECS = {
@@ -224,14 +260,11 @@
 
   function spawnNeutronsAround(cx, cy, count, type = "fast_neutron") {
     syncPhysicsTick();
+    if (!elements[type]) return;
     if (prevTickNeutrons + spawnedThisTick >= MAX_NEUTRONS) return;
     if (spawnedThisTick >= MAX_SPAWN_PER_TICK) return;
 
-    const dirs = [
-      [-1, -1], [0, -1], [1, -1],
-      [-1,  0],          [1,  0],
-      [-1,  1], [0,  1], [1,  1]
-    ];
+    const dirs = NON_ZERO_DIRS.slice();
     for (let i = dirs.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
       [dirs[i], dirs[j]] = [dirs[j], dirs[i]];
@@ -244,7 +277,7 @@
       for (let dist = 1; dist <= 2; dist++) {
         const nx = cx + dx * dist;
         const ny = cy + dy * dist;
-        if (outOfBounds(nx, ny)) break;
+        if (!inSafeBounds(nx, ny)) break;
         if (isEmpty(nx, ny)) {
           createPixel(type, nx, ny);
           const np = pixelMap[nx][ny];
@@ -263,39 +296,35 @@
 
   function triggerFission(targetPixel, spec, neutronPixel) {
     syncPhysicsTick();
+    if (!targetPixel || targetPixel.del) return;
     const tx = targetPixel.x;
     const ty = targetPixel.y;
 
-    // 1. Transmute fissile nucleus into a realistic fission daughter
     const daughter = spec.daughters[Math.floor(Math.random() * spec.daughters.length)];
-    changePixel(targetPixel, daughter);
+    safeChange(targetPixel, daughter);
 
-    // 2. Deposit fission kinetic energy as heat
     targetPixel.temp += spec.heat;
     let nearbyFissile = 0;
     for (let dx = -2; dx <= 2; dx++) {
       for (let dy = -2; dy <= 2; dy++) {
         const nx = tx + dx;
         const ny = ty + dy;
-        if (outOfBounds(nx, ny)) continue;
+        if (!inSafeBounds(nx, ny)) continue;
         const p = pixelMap[nx][ny];
-        if (p) {
+        if (p && !p.del) {
           p.temp += Math.round(spec.heat * 0.18);
           if (FISSILE_SPECS[p.element]) nearbyFissile++;
         }
       }
     }
 
-    // 3. Consume incident neutron
-    if (neutronPixel && pixelMap[neutronPixel.x]?.[neutronPixel.y] === neutronPixel) {
+    if (neutronPixel && !neutronPixel.del && inSafeBounds(neutronPixel.x, neutronPixel.y) && pixelMap[neutronPixel.x][neutronPixel.y] === neutronPixel) {
       deletePixel(neutronPixel.x, neutronPixel.y);
     }
 
-    // 4. Emit 2-3 prompt fast neutrons (respecting global cap)
     const nCount = spec.neutrons[0] + (Math.random() < 0.5 ? (spec.neutrons[1] - spec.neutrons[0]) : 0);
     spawnNeutronsAround(tx, ty, nCount, "fast_neutron");
 
-    // 5. Throttled Prompt-Critical Hydrodynamic Disassembly
     if (targetPixel.temp > 6000 && nearbyFissile >= 10 && (lastPhysicsTick - lastExplodeTick >= EXPLODE_COOLDOWN_TICKS)) {
       lastExplodeTick = lastPhysicsTick;
       explodeAt(tx, ty, 8, "plasma,fire,radiation,fallout");
@@ -303,176 +332,189 @@
   }
 
   function neutronTick(pixel, isFast) {
-    syncPhysicsTick();
-    neutronsThisTick++;
+    try {
+      if (!pixel || pixel.del) return;
+      syncPhysicsTick();
+      neutronsThisTick++;
 
-    // Gracefully cull excess neutrons if a runaway spikes past the cap
-    if (neutronsThisTick > MAX_NEUTRONS * 1.25) {
-      deletePixel(pixel.x, pixel.y);
-      return;
-    }
-
-    if (pixel.vx === undefined || pixel.vy === undefined || (pixel.vx === 0 && pixel.vy === 0)) {
-      const dirs = [[-1,-1],[0,-1],[1,-1],[-1,0],[1,0],[-1,1],[0,1],[1,1]];
-      const d = dirs[Math.floor(Math.random() * dirs.length)];
-      pixel.vx = d[0];
-      pixel.vy = d[1];
-    }
-    if (pixel.life === undefined) pixel.life = 90;
-    pixel.life--;
-
-    // Free neutron beta decay (n -> p + e- + antineutrino)
-    if (pixel.life <= 0) {
-      changePixel(pixel, "proton");
-      return;
-    }
-
-    const steps = isFast ? 2 : 1;
-    for (let s = 0; s < steps; s++) {
-      const nx = pixel.x + pixel.vx;
-      const ny = pixel.y + pixel.vy;
-
-      if (outOfBounds(nx, ny)) {
+      if (neutronsThisTick > MAX_NEUTRONS * 1.25) {
         deletePixel(pixel.x, pixel.y);
         return;
       }
 
-      if (isEmpty(nx, ny)) {
-        movePixel(pixel, nx, ny);
-        continue;
+      if (!pixel.vx && !pixel.vy) {
+        const d = randomDir();
+        pixel.vx = d[0];
+        pixel.vy = d[1];
+      }
+      if (pixel.life === undefined) pixel.life = 90;
+      pixel.life--;
+
+      if (pixel.life <= 0) {
+        safeChange(pixel, "proton");
+        return;
       }
 
-      const target = pixelMap[nx][ny];
-      if (!target) continue;
-      const tElem = target.element;
+      const steps = isFast ? 2 : 1;
+      for (let s = 0; s < steps; s++) {
+        if (pixel.del) return;
+        const nx = pixel.x + pixel.vx;
+        const ny = pixel.y + pixel.vy;
 
-      // A. Fission on fissile nuclei
-      if (FISSILE_SPECS[tElem]) {
-        const spec = FISSILE_SPECS[tElem];
-        const prob = isFast ? spec.fastProb : spec.thermalProb;
-        if (Math.random() < prob) {
-          triggerFission(target, spec, pixel);
+        if (!inSafeBounds(nx, ny)) {
+          deletePixel(pixel.x, pixel.y);
           return;
-        } else {
-          if (Math.random() < 0.5) {
-            swapPixels(pixel, target);
+        }
+
+        if (isEmpty(nx, ny)) {
+          movePixel(pixel, nx, ny);
+          continue;
+        }
+
+        const target = pixelMap[nx][ny];
+        if (!target || target === pixel || target.del) continue;
+        const tElem = target.element;
+
+        // A. Fission
+        if (FISSILE_SPECS[tElem]) {
+          const spec = FISSILE_SPECS[tElem];
+          const prob = isFast ? spec.fastProb : spec.thermalProb;
+          if (Math.random() < prob) {
+            triggerFission(target, spec, pixel);
+            return;
           } else {
-            pixel.vx = -pixel.vx;
-            pixel.vy = -pixel.vy;
+            if (Math.random() < 0.5) {
+              safeSwap(pixel, target);
+            } else {
+              pixel.vx = -pixel.vx;
+              pixel.vy = -pixel.vy;
+            }
+            return;
           }
-          return;
         }
-      }
 
-      // B. Fertile breeding reactions
-      if (tElem === "uranium_238" || tElem === "molten_uranium_238") {
-        if (Math.random() < (isFast ? 0.12 : 0.35)) {
-          changePixel(target, "neptunium_239");
-          target.temp += 150;
-          deletePixel(pixel.x, pixel.y);
-          return;
-        }
-      } else if (tElem === "thorium_232" || tElem === "molten_thorium_232" || tElem === "thorium") {
-        if (Math.random() < (isFast ? 0.10 : 0.38)) {
-          changePixel(target, "protactinium_233");
-          target.temp += 140;
-          deletePixel(pixel.x, pixel.y);
-          return;
-        }
-      }
-
-      // C. Tritium breeding blanket (Li-6 + n -> T + He-4)
-      if (tElem === "lithium_6" || tElem === "molten_lithium_6") {
-        if (Math.random() < 0.55) {
-          changePixel(target, "tritium");
-          target.temp += 850;
-          changePixel(pixel, "helium");
-          return;
-        }
-      }
-
-      // D. Cobalt-59 neutron activation -> Cobalt-60
-      if (tElem === "cobalt" || tElem === "molten_cobalt") {
-        if (Math.random() < 0.30) {
-          changePixel(target, "cobalt_60");
-          target.temp += 120;
-          deletePixel(pixel.x, pixel.y);
-          return;
-        }
-      }
-
-      // E. Control rods & reactor poisons (Boron, Cadmium, Xenon-135)
-      if (POISONS.has(tElem)) {
-        const absorbProb = tElem === "xenon_135" ? 0.96 : 0.85;
-        if (!isFast && Math.random() < absorbProb) {
-          target.temp += 80;
-          if (tElem === "boron" && Math.random() < 0.15) {
-            changePixel(target, "lithium_7");
-          } else if (tElem === "xenon_135") {
-            changePixel(target, "xenon_136");
-          }
-          deletePixel(pixel.x, pixel.y);
-          return;
-        }
-      }
-
-      // F. Moderators (slow fast neutrons -> thermal neutrons)
-      if (MODERATORS.has(tElem)) {
-        target.temp += isFast ? 35 : 5;
-        if (isFast) {
-          if (tElem === "water" && Math.random() < 0.06) {
-            changePixel(target, "heavy_water");
+        // B. Fertile breeding
+        if (tElem === "uranium_238" || tElem === "molten_uranium_238") {
+          if (Math.random() < (isFast ? 0.12 : 0.35)) {
+            safeChange(target, "neptunium_239");
+            target.temp += 150;
             deletePixel(pixel.x, pixel.y);
             return;
           }
-          changePixel(pixel, "thermal_neutron");
-          pixel.vx = Math.floor(Math.random() * 3) - 1;
-          pixel.vy = Math.floor(Math.random() * 3) - 1;
+        } else if (tElem === "thorium_232" || tElem === "molten_thorium_232" || tElem === "thorium") {
+          if (Math.random() < (isFast ? 0.10 : 0.38)) {
+            safeChange(target, "protactinium_233");
+            target.temp += 140;
+            deletePixel(pixel.x, pixel.y);
+            return;
+          }
+        }
+
+        // C. Tritium breeding blanket (Li-6 + n -> T + He-4)
+        if (tElem === "lithium_6" || tElem === "molten_lithium_6") {
+          if (Math.random() < 0.55) {
+            safeChange(target, "tritium");
+            target.temp += 850;
+            safeChange(pixel, "helium");
+            return;
+          }
+        }
+
+        // D. Cobalt-59 neutron activation -> Cobalt-60
+        if (tElem === "cobalt" || tElem === "molten_cobalt") {
+          if (Math.random() < 0.30) {
+            safeChange(target, "cobalt_60");
+            target.temp += 120;
+            deletePixel(pixel.x, pixel.y);
+            return;
+          }
+        }
+
+        // E. Control rods & reactor poisons
+        if (POISONS.has(tElem)) {
+          const absorbProb = tElem === "xenon_135" ? 0.96 : 0.85;
+          if (!isFast && Math.random() < absorbProb) {
+            target.temp += 80;
+            if (tElem === "boron" && Math.random() < 0.15) {
+              safeChange(target, "lithium_7");
+            } else if (tElem === "xenon_135") {
+              safeChange(target, "xenon_136");
+            }
+            deletePixel(pixel.x, pixel.y);
+            return;
+          }
+        }
+
+        // F. Moderators
+        if (MODERATORS.has(tElem)) {
+          target.temp += isFast ? 35 : 5;
+          if (isFast) {
+            if (tElem === "water" && Math.random() < 0.06) {
+              safeChange(target, "heavy_water");
+              deletePixel(pixel.x, pixel.y);
+              return;
+            }
+            safeChange(pixel, "thermal_neutron");
+            const d = randomDir();
+            pixel.vx = d[0];
+            pixel.vy = d[1];
+            return;
+          } else {
+            safeSwap(pixel, target);
+            return;
+          }
+        }
+
+        // G. Neutron Reflectors
+        if (REFLECTORS.has(tElem)) {
+          pixel.vx = -pixel.vx + (Math.random() < 0.3 ? (Math.random() < 0.5 ? 1 : -1) : 0);
+          pixel.vy = -pixel.vy + (Math.random() < 0.3 ? (Math.random() < 0.5 ? 1 : -1) : 0);
+          pixel.vx = Math.max(-1, Math.min(1, pixel.vx));
+          pixel.vy = Math.max(-1, Math.min(1, pixel.vy));
+          if (!pixel.vx && !pixel.vy) {
+            const d = randomDir();
+            pixel.vx = d[0];
+            pixel.vy = d[1];
+          }
+          if (isFast && !pixel.beMultiplied && (tElem === "beryllium" || tElem === "molten_beryllium") && Math.random() < 0.08) {
+            pixel.beMultiplied = true;
+            spawnNeutronsAround(pixel.x, pixel.y, 1, "fast_neutron");
+          }
           return;
+        }
+
+        // H. High-Z Shielding
+        if (SHIELDING.has(tElem)) {
+          target.temp += 15;
+          if (Math.random() < 0.45) {
+            deletePixel(pixel.x, pixel.y);
+            return;
+          } else {
+            pixel.vx = -pixel.vx;
+            pixel.vy = -pixel.vy;
+            return;
+          }
+        }
+
+        // I. Pass through gases, plasma, fire, radiation, or other neutrons
+        const tState = elements[tElem]?.state;
+        if (tState === "gas" || tElem === "fire" || tElem === "plasma" || tElem === "radiation") {
+          safeSwap(pixel, target);
         } else {
-          swapPixels(pixel, target);
+          const d = randomDir();
+          pixel.vx = d[0];
+          pixel.vy = d[1];
           return;
         }
       }
-
-      // G. Neutron Reflectors (Beryllium, Tungsten)
-      if (REFLECTORS.has(tElem)) {
-        pixel.vx = -pixel.vx + (Math.random() < 0.3 ? (Math.random() < 0.5 ? 1 : -1) : 0);
-        pixel.vy = -pixel.vy + (Math.random() < 0.3 ? (Math.random() < 0.5 ? 1 : -1) : 0);
-        pixel.vx = Math.max(-1, Math.min(1, pixel.vx));
-        pixel.vy = Math.max(-1, Math.min(1, pixel.vy));
-        // Beryllium (n, 2n) triggers at most once per neutron to prevent infinite reflection loops
-        if (isFast && !pixel.beMultiplied && (tElem === "beryllium" || tElem === "molten_beryllium") && Math.random() < 0.08) {
-          pixel.beMultiplied = true;
-          spawnNeutronsAround(pixel.x, pixel.y, 1, "fast_neutron");
-        }
-        return;
-      }
-
-      // H. High-Z Shielding (Lead, Concrete, Osmium)
-      if (SHIELDING.has(tElem)) {
-        target.temp += 15;
-        if (Math.random() < 0.45) {
-          deletePixel(pixel.x, pixel.y);
-          return;
-        } else {
-          pixel.vx = -pixel.vx;
-          pixel.vy = -pixel.vy;
-          return;
-        }
-      }
-
-      // I. Pass through gases, plasma, fire, radiation, or other neutrons
-      const tState = elements[tElem]?.state;
-      if (tState === "gas" || tElem === "fire" || tElem === "plasma" || tElem === "radiation") {
-        swapPixels(pixel, target);
-      } else {
-        pixel.vx = Math.floor(Math.random() * 3) - 1;
-        pixel.vy = Math.floor(Math.random() * 3) - 1;
-        return;
+    } catch (err) {
+      if (!loggedNeutronError) {
+        loggedNeutronError = true;
+        console.error("[nuclear_chem_plus] neutronTick error:", err);
       }
     }
   }
+  
   // ---------------------------------------------------------------------------
   // 3. NEUTRON PARTICLES
   // ---------------------------------------------------------------------------
