@@ -526,6 +526,7 @@
     state: "gas",
     density: 0.01,
     temp: 20,
+    reactions: {},
     desc: "High-energy (~2 MeV) neutron emitted by fission or D-T fusion. Slows down in moderators (heavy water, graphite, water) to become a thermal neutron.",
     tick: function (pixel) {
       neutronTick(pixel, true);
@@ -539,6 +540,7 @@
     state: "gas",
     density: 0.01,
     temp: 20,
+    reactions: {},
     desc: "Moderated slow neutron (~0.025 eV). Has a very high capture cross-section for fissile isotopes (U-235, Pu-239, U-233) and control rods (Boron, Cadmium, Xe-135).",
     tick: function (pixel) {
       neutronTick(pixel, false);
