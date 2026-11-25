@@ -534,7 +534,12 @@
   function isImmobileElement(elemName) {
     const el = elements[elemName];
     if (!el) return true;
-    return el.behavior === behaviors.WALL || IMMOBILE_SPECIAL.has(elemName);
+    if (IMMOBILE_SPECIAL.has(elemName)) return true;
+    if (el.movable === false) return true;
+    if (el.behavior === behaviors.WALL) return true;
+    if (typeof el.tick === "function" && el.tick.name === "WALL") return true;
+    if (typeof el.tick2 === "function" && el.tick2.name === "WALL") return true;
+    return false;
   }
 
   function stepToward(mover, targetX, targetY) {
@@ -925,6 +930,45 @@
       // High-pressure graphite -> diamond synthesis (requires real pressure + heat)
       if (p.element === "graphite" && p.pressure > 220 && p.temp >= 1200 && elements.diamond) {
         safeChange(p, "diamond");
+      }
+      // Solids are virtually incompressible: zero static gravitational heating
+      return;
+    } else if (st === "liquid") {
+      // Liquids are nearly incompressible -> mild deep-core warming only, capped below boiling
+      if (heatScale > 0 && phiNet > 70 && surrounded >= 6) {
+        const boilCap = el?.tempHigh ? Math.min(el.tempHigh * 0.75, 450) : 250;
+        const targetLiq = Math.min(boilCap, 20 + (phiNet - 70) * 0.35 * heatScale);
+        if (p.temp < targetLiq) {
+          p.temp += Math.min(targetLiq - p.temp, (targetLiq - p.temp) * 0.015);
+        }
+      }
+    } else {
+      // Gases & Plasma are highly compressible -> adiabatic Virial heating
+      if (heatScale > 0 && phiNet > 36) {
+        const loadFactor = Math.min(2.2, 0.8 + gMag * 0.05);
+        const targetGas = Math.min(180000, Math.pow(phiNet - 35, 2.15) * 2.1 * heatScale * loadFactor);
+        if (p.temp < targetGas) {
+          p.temp += Math.min(targetGas - p.temp, (targetGas - p.temp) * 0.035 + 6 * heatScale);
+        }
+      }
+    }
+  }
+
+    // Hydrostatic overburden pressure (depends on potential depth, gravity load & density)
+    const dens = el?.density || 1000;
+    const densNorm = Math.min(3.5, Math.max(0.25, Math.sqrt(dens / 1000)));
+    p.pressure = phiNet > 4
+      ? Math.round(phiNet * (0.65 + Math.min(2.5, gMag * 0.08)) * (surrounded / 8) * densNorm * 1.4)
+      : 0;
+
+    if (surrounded < 5) return;
+
+    const heatScale = UPC_CONFIG.compressionHeatScale;
+
+    if (st === "solid") {
+      // High-pressure graphite -> diamond synthesis (requires real pressure + heat)
+      if (p.element === "graphite" && p.pressure > 220 && p.temp >= 1200 && elements.diamond) {
+        safeChange(p, "diamond");
         return;
       }
       // Static solids are virtually incompressible -> ZERO static gravitational heating!
@@ -1232,7 +1276,9 @@
     p.ry -= remY;
 
     const steps = Math.min(3, Math.max(Math.abs(remX), Math.abs(remY)));
-    const pDens = elements[p.element]?.density || 1000;
+    const pEl = elements[p.element];
+    const pDens = pEl?.density || 1000;
+    const pIsSolid = (pEl?.state || "solid") === "solid";
 
     for (let s = 0; s < steps; s++) {
       if (p.del) return;
@@ -1247,11 +1293,13 @@
         if (sx !== 0) p.vx = 0;
         if (sy !== 0) p.vy = 0;
         p.rx = 0; p.ry = 0;
+        p.freeSteps = 0;
         break;
       }
 
       if (isEmpty(nx, ny)) {
         movePixel(p, nx, ny);
+        p.freeSteps = Math.min(20, (p.freeSteps || 0) + 1);
         remX -= sx;
         remY -= sy;
         continue;
@@ -1260,12 +1308,14 @@
       if (sx !== 0 && sy !== 0) {
         if (inSafeBounds(p.x + sx, p.y) && isEmpty(p.x + sx, p.y)) {
           movePixel(p, p.x + sx, p.y);
+          p.freeSteps = Math.min(20, (p.freeSteps || 0) + 1);
           remX -= sx;
           p.vy *= 0.5;
           continue;
         }
         if (inSafeBounds(p.x, p.y + sy) && isEmpty(p.x, p.y + sy)) {
           movePixel(p, p.x, p.y + sy);
+          p.freeSteps = Math.min(20, (p.freeSteps || 0) + 1);
           remY -= sy;
           p.vx *= 0.5;
           continue;
@@ -1284,30 +1334,47 @@
           safeSwap(p, target);
           p.vx *= 0.88;
           p.vy *= 0.88;
+          p.freeSteps = 0;
           remX -= sx;
           remY -= sy;
           continue;
         }
 
-        // Momentum-conserving inelastic impact + kinetic shock heating on fast impacts
         const totalM = pDens + tDens;
         const tvx = target.vx || 0, tvy = target.vy || 0;
         const relSpd = Math.hypot(p.vx - tvx, p.vy - tvy);
-        if (relSpd > 1.35) {
-          const heat = Math.round((relSpd - 1.1) * 42);
+
+        // Kinetic shock heating ONLY for genuine free-flying impacts (never resting weight)
+        if ((p.freeSteps || 0) >= 2 && relSpd > 1.5) {
+          const heat = Math.min(180, Math.round((relSpd - 1.4) * 28));
           p.temp += heat;
           target.temp += heat;
         }
-        const newVx = (pDens * p.vx + tDens * tvx) / totalM;
-        const newVy = (pDens * p.vy + tDens * tvy) / totalM;
-        p.vx = newVx * 0.82;
-        p.vy = newVy * 0.82;
-        target.vx = Math.max(-MAX_SPEED, Math.min(MAX_SPEED, tvx + (newVx - tvx) * 1.15));
-        target.vy = Math.max(-MAX_SPEED, Math.min(MAX_SPEED, tvy + (newVy - tvy) * 1.15));
+
+        p.freeSteps = 0;
+        target.freeSteps = 0;
+
+        if (pIsSolid && tState === "solid" && relSpd < 0.9) {
+          if (sx !== 0) { p.vx = 0; p.rx = 0; }
+          if (sy !== 0) { p.vy = 0; p.ry = 0; }
+        } else {
+          const newVx = (pDens * p.vx + tDens * tvx) / totalM;
+          const newVy = (pDens * p.vy + tDens * tvy) / totalM;
+          const damp = (pIsSolid && tState === "solid") ? 0.55 : 0.82;
+          p.vx = newVx * damp;
+          p.vy = newVy * damp;
+          target.vx = Math.max(-MAX_SPEED, Math.min(MAX_SPEED, tvx + (newVx - tvx) * 1.05));
+          target.vy = Math.max(-MAX_SPEED, Math.min(MAX_SPEED, tvy + (newVy - tvy) * 1.05));
+        }
         break;
       } else {
-        if (sx !== 0) p.vx = Math.abs(p.vx) > 1.2 ? -p.vx * 0.25 : 0;
-        if (sy !== 0) p.vy = Math.abs(p.vy) > 1.2 ? -p.vy * 0.25 : 0;
+        if ((p.freeSteps || 0) >= 2) {
+          const spd = Math.hypot(p.vx, p.vy);
+          if (spd > 1.6) p.temp += Math.min(120, Math.round((spd - 1.5) * 22));
+        }
+        p.freeSteps = 0;
+        if (sx !== 0) { p.vx = Math.abs(p.vx) > 1.2 ? -p.vx * 0.25 : 0; p.rx = 0; }
+        if (sy !== 0) { p.vy = Math.abs(p.vy) > 1.2 ? -p.vy * 0.25 : 0; p.ry = 0; }
         p.vx *= 0.85;
         p.vy *= 0.85;
         break;
@@ -1340,7 +1407,7 @@
       let ax = 0;
       let ay = 0;
 
-      // 1. Multi-Body CIC Gravity (identically zero self-force) + State-Aware Compression
+      // 1. Multi-Body CIC Gravity + State-Aware Compression
       if (gravFieldActive) {
         const gx = sampleField(macroGx, p.x, p.y);
         const gy = sampleField(macroGy, p.x, p.y);
@@ -1357,7 +1424,7 @@
         }
       }
 
-      // 2. Unified CIC Magnetic Field (identically zero self-force)
+      // 2. Unified CIC Magnetic Field
       if (magFieldActive) {
         const poleSign = MAGNET_POLE_MAP[p.element];
         if (poleSign !== undefined) {
@@ -1375,6 +1442,46 @@
         } else if (UPC_CONFIG.plasmaConfinement && p.temp >= 6000 && PLASMA_CONFINABLE.has(p.element)) {
           ax -= sampleField(macroGradBx, p.x, p.y) * MAG_PLASMA_ACCEL;
           ay -= sampleField(macroGradBy, p.x, p.y) * MAG_PLASMA_ACCEL;
+        }
+      }
+
+      // 3. Normal-force contact cancellation for solids resting against supporting solids/walls
+      const pEl = elements[p.element];
+      if ((pEl?.state || "solid") === "solid") {
+        const pDens = pEl?.density || 1000;
+        if (ax !== 0) {
+          const sx = Math.sign(ax);
+          const nx = p.x + sx;
+          if (!inSafeBounds(nx, p.y)) {
+            ax = 0;
+            if (Math.sign(p.vx || 0) === sx) { p.vx = 0; p.rx = 0; }
+          } else if (!isEmpty(nx, p.y)) {
+            const nb = pixelMap[nx][p.y];
+            const nbEl = nb && elements[nb.element];
+            const nbStatic = nb && (isImmobileElement(nb.element) || ((nbEl?.state || "solid") === "solid" && (nbEl?.density || 1000) >= pDens * 0.85 && ((nb.vx || 0) * sx <= 0.15)));
+            if (nbStatic) {
+              ax = 0;
+              if (Math.sign(p.vx || 0) === sx) { p.vx = 0; p.rx = 0; }
+              p.freeSteps = 0;
+            }
+          }
+        }
+        if (ay !== 0) {
+          const sy = Math.sign(ay);
+          const ny = p.y + sy;
+          if (!inSafeBounds(p.x, ny)) {
+            ay = 0;
+            if (Math.sign(p.vy || 0) === sy) { p.vy = 0; p.ry = 0; }
+          } else if (!isEmpty(p.x, ny)) {
+            const nb = pixelMap[p.x][ny];
+            const nbEl = nb && elements[nb.element];
+            const nbStatic = nb && (isImmobileElement(nb.element) || ((nbEl?.state || "solid") === "solid" && (nbEl?.density || 1000) >= pDens * 0.85 && ((nb.vy || 0) * sy <= 0.15)));
+            if (nbStatic) {
+              ay = 0;
+              if (Math.sign(p.vy || 0) === sy) { p.vy = 0; p.ry = 0; }
+              p.freeSteps = 0;
+            }
+          }
         }
       }
 
@@ -1409,7 +1516,6 @@
     movingPixelsLastTick = movingNow;
     UPC_STATS.movingPixels = movingNow;
   }
-
   function drawFieldOverlay() {
     if (!visualizerActive || (!gravFieldActive && !magFieldActive)) return;
     if (typeof ctx === "undefined" || !ctx || typeof pixelSize !== "number") return;
