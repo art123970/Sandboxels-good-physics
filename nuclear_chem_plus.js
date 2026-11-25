@@ -1,12 +1,10 @@
 /*
- * Nuclear & Chemistry Plus (nuclear_chem_plus.js)
+ * Nuclear & Chemistry Plus v2 (nuclear_chem_plus.js)
  * Add-on for Sandboxels + chem.js
- * Features:
- *  - Accurate neutron-mediated fission (fast vs. thermal neutrons, moderation, control rods, reflectors, Xenon poisoning)
- *  - Breeder fuel cycles (U-238 -> Np-239 -> Pu-239, Th-232 -> Pa-233 -> U-233)
- *  - Accurate nuclear fusion (D-T, D-D, D-He3, Triple-Alpha, Li-6 tritium breeding)
- *  - Full solid / molten / gas state chains for isotopes & missing elements
- *  - Real-world chemistry (Cs/Rb water explosions, Gallium aluminum embrittlement, Po-Be neutron initiators)
+ * - Crash-proof neutron transport, moderation, delayed neutrons, Doppler feedback, Xenon poisoning
+ * - Full stellar & terrestrial fusion ladder (D-T, D-D, D-He3, He3-He3, p-p, Triple-Alpha, C+He->O, O+O->Si, Si+He->Fe)
+ * - Accurate carbon sublimation (graphite <-> carbon_vapor) & CO2 thermal dissociation (>4000 C)
+ * - Full solid / molten / gas state chains for isotopes & missing elements
  */
 
 (function () {
@@ -22,6 +20,21 @@
     elements[elemName].reactions[targetName] = reactionObj;
   }
 
+  function wrapTick(elemName, extraFn) {
+    const el = elements[elemName];
+    if (!el) return;
+    const prevTick = typeof el.tick === "function" ? el.tick : null;
+    el.tick = function (pixel) {
+      if (!pixel || pixel.del) return;
+      if (extraFn(pixel) === true) return; // handled & transmuted
+      if (prevTick) {
+        prevTick(pixel);
+      } else {
+        doDefaults(pixel);
+      }
+    };
+  }
+
   function registerOrEnhance(name, def) {
     const clean = {};
     for (const key of Object.keys(def)) {
@@ -30,12 +43,11 @@
       if (def[key] === undefined || def[key] === null) continue;
       clean[key] = def[key];
     }
+    if (!clean.reactions) clean.reactions = {};
 
     if (elements[name]) {
       const existing = elements[name];
-      if (clean.reactions) {
-        existing.reactions = Object.assign({}, existing.reactions || {}, clean.reactions);
-      }
+      existing.reactions = Object.assign({}, existing.reactions || {}, clean.reactions);
       for (const key of Object.keys(clean)) {
         if (key === "reactions") continue;
         if (existing[key] === undefined || def._override) {
@@ -47,9 +59,6 @@
     }
   }
 
-  /**
-   * Registers a full Solid -> Molten -> Gas state chain for a metal/solid element.
-   */
   function defineFullElement(cfg) {
     const {
       id,
@@ -83,7 +92,7 @@
       hardness,
       tempHigh: meltTemp,
       stateHigh: moltenId,
-      reactions,
+      reactions: Object.assign({}, reactions),
       desc
     }, extra);
     if (hasTick) solidDef.tick = tick;
@@ -91,7 +100,7 @@
 
     const moltenDef = {
       color: moltenColor || ["#ff7b29", "#ff9e3d", "#ffb84d"],
-      behavior: behaviors.MOLTEN,
+      behavior: behaviors.LIQUID,
       category: "states",
       state: "liquid",
       hidden: true,
@@ -103,7 +112,7 @@
       tempHigh: boilTemp,
       stateHigh: gasId,
       viscosity: 15,
-      reactions
+      reactions: Object.assign({}, reactions)
     };
     if (hasTick) moltenDef.tick = tick;
     registerOrEnhance(moltenId, moltenDef);
@@ -118,13 +127,10 @@
       temp: boilTemp + 50,
       tempLow: boilTemp,
       stateLow: moltenId,
-      reactions
+      reactions: Object.assign({}, reactions)
     });
   }
 
-  /**
-   * Registers a full Gas -> Liquid -> Solid state chain for a gas/isotope.
-   */
   function defineFullGas(cfg) {
     const {
       id,
@@ -153,7 +159,7 @@
       density,
       tempLow: boilTemp,
       stateLow: liquidId,
-      reactions,
+      reactions: Object.assign({}, reactions),
       desc
     }, extra);
     if (hasTick) gasDef.tick = tick;
@@ -171,7 +177,7 @@
       stateHigh: id,
       tempLow: meltTemp,
       stateLow: solidId,
-      reactions
+      reactions: Object.assign({}, reactions)
     };
     if (hasTick) liquidDef.tick = tick;
     registerOrEnhance(liquidId, liquidDef);
@@ -186,7 +192,7 @@
       temp: meltTemp - 5,
       tempHigh: meltTemp,
       stateHigh: liquidId,
-      reactions
+      reactions: Object.assign({}, reactions)
     };
     if (hasTick) solidDef.tick = tick;
     registerOrEnhance(solidId, solidDef);
@@ -196,7 +202,14 @@
   // 2. NUCLEAR PHYSICS ENGINE (CRASH-PROOF NEUTRON TRANSPORT & FISSION)
   // ---------------------------------------------------------------------------
 
-  const MODERATORS = new Set(["heavy_water", "water", "graphite", "ice", "heavy_ice", "paraffin"]);
+  const MODERATOR_PROB = {
+    water: 0.55,
+    ice: 0.50,
+    heavy_water: 0.45,
+    heavy_ice: 0.42,
+    graphite: 0.35,
+    paraffin: 0.52
+  };
   const REFLECTORS = new Set(["beryllium", "molten_beryllium", "tungsten", "steel"]);
   const POISONS = new Set(["boron", "molten_boron", "cadmium", "molten_cadmium", "xenon_135", "hafnium"]);
   const SHIELDING = new Set(["lead", "molten_lead", "concrete", "osmium"]);
@@ -258,16 +271,29 @@
     pixelMap[x2][y2] = p1;
   }
 
+  function findAdjacentElement(pixel, targetName) {
+    const start = Math.floor(Math.random() * adjacentCoords.length);
+    for (let i = 0; i < adjacentCoords.length; i++) {
+      const idx = (start + i) % adjacentCoords.length;
+      const nx = pixel.x + adjacentCoords[idx][0];
+      const ny = pixel.y + adjacentCoords[idx][1];
+      if (!inSafeBounds(nx, ny)) continue;
+      const other = pixelMap[nx][ny];
+      if (other && !other.del && other.element === targetName) return other;
+    }
+    return null;
+  }
+
   const FISSILE_SPECS = {
-    uranium_235: { thermalProb: 0.78, fastProb: 0.08, neutrons: [2, 3], heat: 2400, daughters: ["barium_141", "krypton_92", "xenon_135", "strontium_90"] },
+    uranium_235:        { thermalProb: 0.78, fastProb: 0.08, neutrons: [2, 3], heat: 2400, daughters: ["barium_141", "krypton_92", "xenon_135", "strontium_90"] },
     molten_uranium_235: { thermalProb: 0.72, fastProb: 0.07, neutrons: [2, 3], heat: 2400, daughters: ["barium_141", "krypton_92", "xenon_135", "strontium_90"] },
-    plutonium_239: { thermalProb: 0.82, fastProb: 0.22, neutrons: [2, 3], heat: 2700, daughters: ["barium_141", "xenon_135", "strontium_90", "cesium_135"] },
-    molten_plutonium_239: { thermalProb: 0.78, fastProb: 0.20, neutrons: [2, 3], heat: 2700, daughters: ["barium_141", "xenon_135", "strontium_90", "cesium_135"] },
-    uranium_233: { thermalProb: 0.80, fastProb: 0.14, neutrons: [2, 3], heat: 2300, daughters: ["barium_141", "krypton_92", "strontium_90"] },
+    plutonium_239:      { thermalProb: 0.82, fastProb: 0.24, neutrons: [2, 3], heat: 2700, daughters: ["barium_141", "xenon_135", "strontium_90", "cesium_135"] },
+    molten_plutonium_239:{ thermalProb: 0.78, fastProb: 0.22, neutrons: [2, 3], heat: 2700, daughters: ["barium_141", "xenon_135", "strontium_90", "cesium_135"] },
+    uranium_233:        { thermalProb: 0.80, fastProb: 0.14, neutrons: [2, 3], heat: 2300, daughters: ["barium_141", "krypton_92", "strontium_90"] },
     molten_uranium_233: { thermalProb: 0.75, fastProb: 0.12, neutrons: [2, 3], heat: 2300, daughters: ["barium_141", "krypton_92", "strontium_90"] },
-    uranium: { thermalProb: 0.35, fastProb: 0.03, neutrons: [2, 2], heat: 1600, daughters: ["barium_141", "krypton_92", "xenon_135"] },
-    plutonium: { thermalProb: 0.82, fastProb: 0.22, neutrons: [2, 3], heat: 2700, daughters: ["barium_141", "xenon_135", "strontium_90"] },
-    enriched_uranium: { thermalProb: 0.76, fastProb: 0.08, neutrons: [2, 3], heat: 2400, daughters: ["barium_141", "krypton_92", "xenon_135", "strontium_90"] }
+    uranium:            { thermalProb: 0.35, fastProb: 0.03, neutrons: [2, 2], heat: 1600, daughters: ["barium_141", "krypton_92", "xenon_135"] },
+    plutonium:          { thermalProb: 0.82, fastProb: 0.24, neutrons: [2, 3], heat: 2700, daughters: ["barium_141", "xenon_135", "strontium_90"] },
+    enriched_uranium:   { thermalProb: 0.76, fastProb: 0.08, neutrons: [2, 3], heat: 2400, daughters: ["barium_141", "krypton_92", "xenon_135", "strontium_90"] }
   };
 
   function spawnNeutronsAround(cx, cy, count, type = "fast_neutron") {
@@ -337,6 +363,7 @@
     const nCount = spec.neutrons[0] + (Math.random() < 0.5 ? (spec.neutrons[1] - spec.neutrons[0]) : 0);
     spawnNeutronsAround(tx, ty, nCount, "fast_neutron");
 
+    // Throttled prompt-critical hydrodynamic disassembly
     if (targetPixel.temp > 6000 && nearbyFissile >= 10 && (lastPhysicsTick - lastExplodeTick >= EXPLODE_COOLDOWN_TICKS)) {
       lastExplodeTick = lastPhysicsTick;
       explodeAt(tx, ty, 8, "plasma,fire,radiation,fallout");
@@ -387,10 +414,13 @@
         if (!target || target === pixel || target.del) continue;
         const tElem = target.element;
 
-        // A. Fission
+        // A. Fission (with subtle Doppler broadening at high temp for thermal neutrons)
         if (FISSILE_SPECS[tElem]) {
           const spec = FISSILE_SPECS[tElem];
-          const prob = isFast ? spec.fastProb : spec.thermalProb;
+          let prob = isFast ? spec.fastProb : spec.thermalProb;
+          if (!isFast && target.temp > 1200) {
+            prob *= Math.max(0.65, 1 - (target.temp - 1200) / 10000);
+          }
           if (Math.random() < prob) {
             triggerFission(target, spec, pixel);
             return;
@@ -405,9 +435,10 @@
           }
         }
 
-        // B. Fertile breeding
+        // B. Fertile breeding (U-238 resonance capture rises slightly with temp)
         if (tElem === "uranium_238" || tElem === "molten_uranium_238") {
-          if (Math.random() < (isFast ? 0.12 : 0.35)) {
+          const dopplerBonus = target.temp > 800 ? 0.08 : 0;
+          if (Math.random() < (isFast ? 0.12 : 0.35) + dopplerBonus) {
             safeChange(target, "neptunium_239");
             target.temp += 150;
             deletePixel(pixel.x, pixel.y);
@@ -457,27 +488,32 @@
           }
         }
 
-        // F. Moderators
-        if (MODERATORS.has(tElem)) {
+        // F. Probabilistic Moderators (steam is excluded -> natural negative void coefficient in water reactors!)
+        if (MODERATOR_PROB[tElem] !== undefined) {
           target.temp += isFast ? 35 : 5;
           if (isFast) {
-            if (tElem === "water" && Math.random() < 0.06) {
+            if (tElem === "water" && Math.random() < 0.05) {
               safeChange(target, "heavy_water");
               deletePixel(pixel.x, pixel.y);
               return;
             }
-            safeChange(pixel, "thermal_neutron");
-            const d = randomDir();
-            pixel.vx = d[0];
-            pixel.vy = d[1];
-            return;
+            if (Math.random() < MODERATOR_PROB[tElem]) {
+              safeChange(pixel, "thermal_neutron");
+              const d = randomDir();
+              pixel.vx = d[0];
+              pixel.vy = d[1];
+              return;
+            } else {
+              safeSwap(pixel, target);
+              return;
+            }
           } else {
             safeSwap(pixel, target);
             return;
           }
         }
 
-        // G. Neutron Reflectors
+        // G. Neutron Reflectors (Beryllium, Tungsten, Steel)
         if (REFLECTORS.has(tElem)) {
           pixel.vx = -pixel.vx + (Math.random() < 0.3 ? (Math.random() < 0.5 ? 1 : -1) : 0);
           pixel.vy = -pixel.vy + (Math.random() < 0.3 ? (Math.random() < 0.5 ? 1 : -1) : 0);
@@ -526,7 +562,7 @@
       }
     }
   }
-  
+
   // ---------------------------------------------------------------------------
   // 3. NEUTRON PARTICLES
   // ---------------------------------------------------------------------------
@@ -539,7 +575,7 @@
     density: 0.01,
     temp: 20,
     reactions: {},
-    desc: "High-energy (~2 MeV) neutron emitted by fission or D-T fusion. Slows down in moderators (heavy water, graphite, water) to become a thermal neutron.",
+    desc: "High-energy (~2 MeV) neutron emitted by fission or D-T fusion. Moderates in water, heavy water, or graphite into a thermal neutron.",
     tick: function (pixel) {
       neutronTick(pixel, true);
     }
@@ -553,15 +589,49 @@
     density: 0.01,
     temp: 20,
     reactions: {},
-    desc: "Moderated slow neutron (~0.025 eV). Has a very high capture cross-section for fissile isotopes (U-235, Pu-239, U-233) and control rods (Boron, Cadmium, Xe-135).",
+    desc: "Moderated slow neutron (~0.025 eV). High fission cross-section for U-235, Pu-239, U-233; absorbed by Boron, Cadmium, and Xe-135.",
     tick: function (pixel) {
       neutronTick(pixel, false);
     }
   };
 
   // ---------------------------------------------------------------------------
-  // 4. HYDROGEN & HELIUM ISOTOPES + ACCURATE FUSION
+  // 4. HYDROGEN, HELIUM & CARBON VAPOR (ACCURATE FUSION)
   // ---------------------------------------------------------------------------
+
+  // Elemental Carbon Vapor (fixes graphite -> CO2 bug!)
+  registerOrEnhance("carbon_vapor", {
+    color: ["#54545c", "#666670", "#45454d"],
+    behavior: behaviors.GAS,
+    category: "states",
+    state: "gas",
+    hidden: true,
+    density: 0.52,
+    temp: 3700,
+    tempLow: 3642,
+    stateLow: "graphite",
+    desc: "Elemental carbon gas (C-12) produced by Triple-Alpha fusion or graphite sublimation (>3,642 C). Fuses with Helium at 75,000 C to form Oxygen-16.",
+    reactions: {
+      // Alpha capture: C-12 + He-4 -> O-16 + gamma
+      helium: {
+        elem1: "oxygen",
+        elem2: "radiation",
+        tempMin: 75000,
+        chance: 0.16,
+        func: function (p1, p2) {
+          p1.temp += 5000;
+        }
+      },
+      // Only forms CO2 in combustion range (not plasma temperatures)
+      oxygen: {
+        elem1: "carbon_dioxide",
+        elem2: "fire",
+        tempMin: 750,
+        tempMax: 3500,
+        chance: 0.25
+      }
+    }
+  });
 
   // Deuterium (H-2)
   defineFullGas({
@@ -573,33 +643,27 @@
     boilTemp: -249.5,
     meltTemp: -254.4,
     density: 0.18,
-    desc: "Hydrogen-2 (1 proton, 1 neutron). Primary fusion fuel; reacts with oxygen to form heavy water (D2O).",
+    desc: "Hydrogen-2. Fuses with Tritium (10,000 C), Deuterium (25,000 C), or Helium-3 (40,000 C). Burns in oxygen to form heavy water.",
     tick: function (pixel) {
-      // D-D Fusion handled in tick to avoid Sandboxels's stale otherInfo double-reactPixels crash
+      // D-D Fusion in tick (avoids Sandboxels's stale otherInfo double-reactPixels crash)
       if (pixel.temp >= 25000 && Math.random() < 0.35) {
-        for (let i = 0; i < adjacentCoords.length; i++) {
-          const nx = pixel.x + adjacentCoords[i][0];
-          const ny = pixel.y + adjacentCoords[i][1];
-          if (!inSafeBounds(nx, ny)) continue;
-          const other = pixelMap[nx][ny];
-          if (other && !other.del && other.element === "deuterium") {
-            if (Math.random() < 0.5) {
-              safeChange(pixel, "tritium");
-              safeChange(other, "proton");
-            } else {
-              safeChange(pixel, "helium_3");
-              safeChange(other, "fast_neutron");
-            }
-            pixel.temp += 4500;
-            other.temp += 4500;
-            return;
+        const other = findAdjacentElement(pixel, "deuterium");
+        if (other) {
+          if (Math.random() < 0.5) {
+            safeChange(pixel, "tritium");
+            safeChange(other, "proton");
+          } else {
+            safeChange(pixel, "helium_3");
+            safeChange(other, "fast_neutron");
           }
+          pixel.temp += 4500;
+          other.temp += 4500;
+          return;
         }
       }
       doDefaults(pixel);
     },
     reactions: {
-      // D-T Fusion (lowest ignition threshold: 10,000 C)
       tritium: {
         elem1: "helium",
         elem2: "fast_neutron",
@@ -610,7 +674,6 @@
           p2.temp += 9000;
         }
       },
-      // D-He3 Aneutronic Fusion (40,000 C) -> He-4 + p
       helium_3: {
         elem1: "helium",
         elem2: "proton",
@@ -621,11 +684,11 @@
           p2.temp += 11000;
         }
       },
-      // Combustion with oxygen -> Heavy Water
       oxygen: {
         elem1: "heavy_steam",
         elem2: "fire",
         tempMin: 560,
+        tempMax: 3500,
         chance: 0.7
       }
     }
@@ -641,12 +704,12 @@
     boilTemp: -248.1,
     meltTemp: -252.5,
     density: 0.27,
-    desc: "Radioactive Hydrogen-3 (1 proton, 2 neutrons). Fuses easily with Deuterium at high temp; beta-decays slowly into Helium-3.",
+    desc: "Radioactive Hydrogen-3. Fuses with Deuterium at 10,000 C; beta-decays slowly into Helium-3.",
     tick: function (pixel) {
-      // Slow beta decay into Helium-3
       if (Math.random() < 0.00015) {
-        changePixel(pixel, "helium_3");
+        safeChange(pixel, "helium_3");
         pixel.temp += 5;
+        return;
       }
       doDefaults(pixel);
     }
@@ -662,11 +725,25 @@
     boilTemp: -269.9,
     meltTemp: -272.2,
     density: 0.13,
-    desc: "Light, non-radioactive Helium isotope. Enables clean aneutronic fusion with Deuterium at ~40,000 C."
+    desc: "Light Helium isotope. Aneutronic fusion with Deuterium (40,000 C) or He-3 + He-3 (45,000 C).",
+    tick: function (pixel) {
+      // He-3 + He-3 -> He-4 + 2p (modeled as helium + proton)
+      if (pixel.temp >= 45000 && Math.random() < 0.25) {
+        const other = findAdjacentElement(pixel, "helium_3");
+        if (other) {
+          safeChange(pixel, "helium");
+          safeChange(other, "proton");
+          pixel.temp += 7500;
+          other.temp += 7500;
+          return;
+        }
+      }
+      doDefaults(pixel);
+    }
   });
 
   // Heavy Water (D2O) + Heavy Ice + Heavy Steam
-  elements.heavy_water = {
+  registerOrEnhance("heavy_water", {
     color: ["#1e5ec4", "#246ad6", "#1a52ab"],
     behavior: behaviors.LIQUID,
     category: "nuclear",
@@ -677,10 +754,10 @@
     tempLow: 3.8,
     stateLow: "heavy_ice",
     conduct: 0.02,
-    desc: "Deuterium Oxide (D2O). Superior neutron moderator that slows fast neutrons without absorbing them, allowing natural uranium to go critical."
-  };
+    desc: "Deuterium Oxide (D2O). Moderates fast neutrons without absorbing them, allowing natural uranium to go critical."
+  });
 
-  elements.heavy_ice = {
+  registerOrEnhance("heavy_ice", {
     color: ["#a8d0f5", "#b8daf8"],
     behavior: behaviors.WALL,
     category: "states",
@@ -690,9 +767,9 @@
     temp: 0,
     tempHigh: 3.8,
     stateHigh: "heavy_water"
-  };
+  });
 
-  elements.heavy_steam = {
+  registerOrEnhance("heavy_steam", {
     color: ["#c7dbf0", "#d7e6f5"],
     behavior: behaviors.GAS,
     category: "states",
@@ -702,13 +779,12 @@
     temp: 110,
     tempLow: 101.4,
     stateLow: "heavy_water"
-  };
+  });
 
   // ---------------------------------------------------------------------------
-  // 5. FISSILE, FERTILE & DECAY ISOTOPES (WITH FULL SOLID/MOLTEN/GAS CHAINS)
+  // 5. FISSILE, FERTILE & DECAY ISOTOPES
   // ---------------------------------------------------------------------------
 
-  // Uranium-235 (Fissile)
   defineFullElement({
     id: "uranium_235",
     color: ["#4b7843", "#578c4e", "#3f6938"],
@@ -719,9 +795,8 @@
     boilTemp: 4131,
     density: 18950,
     conduct: 0.45,
-    desc: "Fissile Uranium-235. Splits upon capturing a thermal neutron, releasing ~200 MeV of heat, 2-3 fast neutrons, and fission products.",
+    desc: "Fissile Uranium-235. Captures thermal neutrons to release ~200 MeV heat, 2-3 fast neutrons, and fission daughters.",
     tick: function (pixel) {
-      // Rare spontaneous fission neutron to kick off supercritical assemblies
       if (Math.random() < 0.00025) {
         spawnNeutronsAround(pixel.x, pixel.y, 1, "fast_neutron");
       }
@@ -729,7 +804,6 @@
     }
   });
 
-  // Uranium-238 (Fertile)
   defineFullElement({
     id: "uranium_238",
     color: ["#3b4d3b", "#455945", "#324232"],
@@ -740,10 +814,9 @@
     boilTemp: 4131,
     density: 19100,
     conduct: 0.45,
-    desc: "Fertile Depleted Uranium (U-238). Absorbs neutrons to breed Neptunium-239, which beta-decays into fissile Plutonium-239."
+    desc: "Fertile Depleted Uranium (U-238). Absorbs neutrons to breed Neptunium-239 -> Plutonium-239."
   });
 
-  // Neptunium-239 (Intermediate Breeder Isotope)
   defineFullElement({
     id: "neptunium_239",
     color: ["#5e6e7d", "#6e8091"],
@@ -754,18 +827,18 @@
     boilTemp: 3902,
     density: 20450,
     conduct: 0.35,
-    desc: "Short-lived isotope bred from U-238 + neutron. Beta-decays into Plutonium-239.",
+    desc: "Short-lived isotope bred from U-238 + n. Beta-decays into Plutonium-239.",
     tick: function (pixel) {
       pixel.temp += 0.08;
       if (Math.random() < 0.003) {
-        changePixel(pixel, "plutonium_239");
+        safeChange(pixel, "plutonium_239");
         pixel.temp += 60;
+        return;
       }
       doDefaults(pixel);
     }
   });
 
-  // Plutonium-239 (Fissile)
   defineFullElement({
     id: "plutonium_239",
     color: ["#6b756b", "#7d8a7d", "#5c665c"],
@@ -776,9 +849,9 @@
     boilTemp: 3228,
     density: 19816,
     conduct: 0.25,
-    desc: "Fissile Plutonium-239. Higher fast-neutron fission cross-section than U-235; warm to the touch from alpha decay.",
+    desc: "Fissile Plutonium-239. High fast-neutron cross-section; self-heats via alpha decay.",
     tick: function (pixel) {
-      pixel.temp += 0.05; // Alpha decay self-heating
+      pixel.temp += 0.05;
       if (Math.random() < 0.0006) {
         spawnNeutronsAround(pixel.x, pixel.y, 1, "fast_neutron");
       }
@@ -786,7 +859,6 @@
     }
   });
 
-  // Thorium-232 (Fertile)
   defineFullElement({
     id: "thorium_232",
     color: ["#63605c", "#75726d", "#575450"],
@@ -797,10 +869,9 @@
     boilTemp: 4788,
     density: 11724,
     conduct: 0.5,
-    desc: "Fertile Thorium-232. Captures neutrons to breed Protactinium-233, which decays into fissile Uranium-233."
+    desc: "Fertile Thorium-232. Captures neutrons to breed Protactinium-233 -> fissile Uranium-233."
   });
 
-  // Protactinium-233 (Intermediate Thorium Breeder Isotope)
   defineFullElement({
     id: "protactinium_233",
     color: ["#7a7380", "#8c8494"],
@@ -811,18 +882,18 @@
     boilTemp: 4027,
     density: 15370,
     conduct: 0.4,
-    desc: "Intermediate isotope in the Thorium fuel cycle. Beta-decays into fissile Uranium-233.",
+    desc: "Intermediate Thorium breeder isotope. Beta-decays into fissile Uranium-233.",
     tick: function (pixel) {
       pixel.temp += 0.06;
       if (Math.random() < 0.002) {
-        changePixel(pixel, "uranium_233");
+        safeChange(pixel, "uranium_233");
         pixel.temp += 50;
+        return;
       }
       doDefaults(pixel);
     }
   });
 
-  // Uranium-233 (Fissile)
   defineFullElement({
     id: "uranium_233",
     color: ["#4d8066", "#5a9476", "#427058"],
@@ -833,14 +904,13 @@
     boilTemp: 4131,
     density: 18900,
     conduct: 0.45,
-    desc: "Fissile Uranium-233 bred from Thorium-232. High thermal neutron efficiency."
+    desc: "Fissile Uranium-233 bred from Thorium-232."
   });
 
   // ---------------------------------------------------------------------------
-  // 6. FISSION PRODUCTS & REACTOR POISONS
+  // 6. FISSION PRODUCTS & REACTOR POISONS (WITH DELAYED NEUTRONS)
   // ---------------------------------------------------------------------------
 
-  // Xenon-135 (Notorious Reactor Poison!)
   defineFullGas({
     id: "xenon_135",
     color: ["#9a78e3", "#b091f2"],
@@ -850,16 +920,16 @@
     boilTemp: -108.1,
     meltTemp: -111.8,
     density: 5.89,
-    desc: "Fission product with the highest known thermal neutron absorption cross-section. Poisons reactors until it burns off or decays into Cesium-135.",
+    desc: "Notorious reactor poison with huge thermal neutron capture cross-section. Decays into Cesium-135.",
     tick: function (pixel) {
       if (Math.random() < 0.0012) {
-        changePixel(pixel, "cesium_135");
+        safeChange(pixel, "cesium_135");
+        return;
       }
       doDefaults(pixel);
     }
   });
 
-  // Xenon-136 (Stable burnout product of Xe-135 + n)
   defineFullGas({
     id: "xenon_136",
     color: ["#7c6fa8", "#9183bd"],
@@ -869,10 +939,9 @@
     boilTemp: -108.1,
     meltTemp: -111.8,
     density: 5.93,
-    desc: "Virtually stable Xenon isotope formed when Xenon-135 absorbs a neutron."
+    desc: "Stable Xenon isotope formed when Xenon-135 burns off by capturing a neutron."
   });
 
-  // Krypton-92 (Fission product gas)
   defineFullGas({
     id: "krypton_92",
     color: ["#b8d4e8", "#cfe5f5"],
@@ -882,17 +951,20 @@
     boilTemp: -153.4,
     meltTemp: -157.4,
     density: 3.75,
-    desc: "Radioactive fission product gas. Decays rapidly with heat release.",
+    desc: "Short-lived fission gas. Emits decay heat and occasional delayed neutrons before decaying to Strontium-90.",
     tick: function (pixel) {
       pixel.temp += 0.15;
+      if (Math.random() < 0.0015) {
+        spawnNeutronsAround(pixel.x, pixel.y, 1, "thermal_neutron");
+      }
       if (Math.random() < 0.004) {
-        changePixel(pixel, "strontium_90");
+        safeChange(pixel, "strontium_90");
+        return;
       }
       doDefaults(pixel);
     }
   });
 
-  // Barium-141
   defineFullElement({
     id: "barium_141",
     color: ["#a3a89c", "#b5baa9"],
@@ -904,14 +976,16 @@
     density: 3510,
     conduct: 0.4,
     behavior: behaviors.POWDER,
-    desc: "Radioactive fission product of U-235. Emits decay heat.",
+    desc: "Radioactive fission product. Produces decay heat and occasional delayed neutrons.",
     tick: function (pixel) {
       pixel.temp += 0.12;
+      if (Math.random() < 0.0008) {
+        spawnNeutronsAround(pixel.x, pixel.y, 1, "thermal_neutron");
+      }
       doDefaults(pixel);
     }
   });
 
-  // Strontium-90
   defineFullElement({
     id: "strontium_90",
     color: ["#c2c7b8", "#d3d9c7"],
@@ -923,14 +997,13 @@
     density: 2640,
     conduct: 0.45,
     behavior: behaviors.POWDER,
-    desc: "Long-lived radioactive fission product (used in RTGs). Produces steady decay heat.",
+    desc: "Long-lived fission product (used in RTGs). Steady decay heat.",
     tick: function (pixel) {
       pixel.temp += 0.08;
       doDefaults(pixel);
     }
   });
 
-  // Cesium-135
   defineFullElement({
     id: "cesium_135",
     color: ["#d9c27e", "#e6cf8c"],
@@ -946,11 +1019,12 @@
   });
 
   // ---------------------------------------------------------------------------
-  // 7. REACTOR ENGINEERING MATERIALS & EXOTIC ELEMENTS (MISSING FROM CHEM.JS)
+  // 7. REACTOR ENGINEERING MATERIALS & EXOTIC ELEMENTS
   // ---------------------------------------------------------------------------
 
-  // Graphite (Moderator)
-  elements.graphite = {
+  // Graphite (Moderator) -> Sublimates to carbon_vapor, NOT carbon_dioxide!
+  registerOrEnhance("graphite", {
+    _override: true,
     color: ["#2b2b2e", "#36363a", "#232326"],
     behavior: behaviors.WALL,
     category: "nuclear",
@@ -959,14 +1033,13 @@
     conduct: 0.85,
     hardness: 0.65,
     tempHigh: 3642,
-    stateHigh: "carbon_dioxide",
-    desc: "Crystalline carbon neutron moderator and electrical conductor. Slows fast neutrons effectively; withstands extreme heat.",
+    stateHigh: "carbon_vapor",
+    desc: "Crystalline carbon neutron moderator. Sublimates into carbon vapor at 3,642 C; burns in oxygen between 750 C and 3,500 C.",
     reactions: {
-      oxygen: { elem1: "carbon_dioxide", elem2: "fire", tempMin: 750, chance: 0.15 }
+      oxygen: { elem1: "carbon_dioxide", elem2: "fire", tempMin: 750, tempMax: 3500, chance: 0.15 }
     }
-  };
+  });
 
-  // Beryllium (Neutron Reflector & Multiplier)
   defineFullElement({
     id: "beryllium",
     color: ["#8c9c94", "#9eb0a7", "#7d8c85"],
@@ -978,7 +1051,7 @@
     density: 1850,
     conduct: 0.75,
     hardness: 0.8,
-    desc: "Light, stiff metal that reflects and multiplies fast neutrons via (n, 2n). Reacts with Polonium-210 alpha particles to form a neutron source!",
+    desc: "Light metal that reflects and multiplies fast neutrons via (n, 2n). Pair with Polonium-210 for a neutron initiator.",
     reactions: {
       polonium_210: {
         chance: 0.08,
@@ -990,7 +1063,6 @@
     }
   });
 
-  // Boron (Control Rod)
   defineFullElement({
     id: "boron",
     color: ["#3a3330", "#4a413d", "#2e2826"],
@@ -1005,7 +1077,6 @@
     desc: "Hard metalloid control-rod absorber. Captures thermal neutrons to throttle or SCRAM a fission reactor."
   });
 
-  // Cadmium (Control Rod)
   defineFullElement({
     id: "cadmium",
     color: ["#9da8b8", "#adb8c9", "#8c96a6"],
@@ -1017,10 +1088,9 @@
     density: 8650,
     conduct: 0.7,
     hardness: 0.45,
-    desc: "Soft bluish-white metal with a huge thermal neutron capture cross-section. Classic control-rod material."
+    desc: "Soft metal with a huge thermal neutron capture cross-section. Classic control-rod material."
   });
 
-  // Lithium-6 (Tritium Breeder)
   defineFullElement({
     id: "lithium_6",
     color: ["#b8bcc2", "#c7cbd1"],
@@ -1032,13 +1102,12 @@
     density: 460,
     conduct: 0.6,
     hardness: 0.25,
-    desc: "Lithium-6 isotope. Absorbs neutrons to breed Tritium + Helium-4 for fusion blankets. Reacts vigorously with water.",
+    desc: "Lithium-6 isotope. Absorbs neutrons to breed Tritium + Helium-4 for fusion blankets.",
     reactions: {
       water: { elem1: "hydrogen", elem2: "fire", chance: 0.4, func: function (p1, p2) { p1.temp += 300; } }
     }
   });
 
-  // Lithium-7
   defineFullElement({
     id: "lithium_7",
     color: ["#aeb3ba", "#bfc4cc"],
@@ -1050,13 +1119,12 @@
     density: 534,
     conduct: 0.6,
     hardness: 0.25,
-    desc: "Most abundant Lithium isotope. Low neutron absorption; used in molten-salt reactor coolants.",
+    desc: "Most abundant Lithium isotope. Low neutron absorption; used in molten-salt coolants.",
     reactions: {
       water: { elem1: "hydrogen", elem2: "fire", chance: 0.4, func: function (p1, p2) { p1.temp += 300; } }
     }
   });
 
-  // Cobalt-59 & Cobalt-60 (Neutron Activation)
   defineFullElement({
     id: "cobalt",
     color: ["#587196", "#6682ab", "#4c6282"],
@@ -1068,7 +1136,7 @@
     density: 8900,
     conduct: 0.72,
     hardness: 0.78,
-    desc: "Ferromagnetic transition metal. Absorbs neutrons to become intensely radioactive Cobalt-60."
+    desc: "Ferromagnetic metal. Absorbs neutrons to become intensely radioactive Cobalt-60."
   });
 
   defineFullElement({
@@ -1089,7 +1157,7 @@
         const d = adjacentCoords[Math.floor(Math.random() * adjacentCoords.length)];
         const nx = pixel.x + d[0];
         const ny = pixel.y + d[1];
-        if (!outOfBounds(nx, ny) && isEmpty(nx, ny)) {
+        if (inSafeBounds(nx, ny) && isEmpty(nx, ny)) {
           createPixel("radiation", nx, ny);
         }
       }
@@ -1097,7 +1165,6 @@
     }
   });
 
-  // Polonium-210 (Alpha Emitter / Neutron Initiator with Beryllium)
   defineFullElement({
     id: "polonium_210",
     color: ["#8c9e99", "#9eb0ab"],
@@ -1108,14 +1175,14 @@
     boilTemp: 962,
     density: 9196,
     conduct: 0.5,
-    desc: "Intense alpha emitter (~140 W/g decay heat). Place next to Beryllium to build a real neutron initiator!",
+    desc: "Intense alpha emitter (~140 W/g decay heat). Place touching Beryllium to build a neutron initiator.",
     tick: function (pixel) {
-      pixel.temp += 0.45; // Real Po-210 glows hot from alpha decay!
+      pixel.temp += 0.45;
       if (Math.random() < 0.01) {
         const d = adjacentCoords[Math.floor(Math.random() * adjacentCoords.length)];
         const nx = pixel.x + d[0];
         const ny = pixel.y + d[1];
-        if (!outOfBounds(nx, ny) && isEmpty(nx, ny)) {
+        if (inSafeBounds(nx, ny) && isEmpty(nx, ny)) {
           createPixel("radiation", nx, ny);
         }
       }
@@ -1123,27 +1190,26 @@
     }
   });
 
-  // Radon-222 (Heavy Radioactive Noble Gas)
   defineFullGas({
     id: "radon",
     color: ["#b8e0c8", "#ccebd8"],
     liquidColor: ["#8ac2a0", "#9cd4b2"],
-    solidColor: ["#ffaa55", "#ff8844"], // Solid radon glows yellow-orange from radioluminescence!
+    solidColor: ["#ffaa55", "#ff8844"],
     category: "isotopes",
     boilTemp: -61.7,
     meltTemp: -71.0,
-    density: 9.73, // Very heavy gas — sinks!
-    desc: "Dense radioactive noble gas. Sinks in air, glows orange-yellow when frozen, and decays into Polonium-210.",
+    density: 9.73,
+    desc: "Dense radioactive noble gas. Sinks in air, glows orange-yellow when frozen, decays into Polonium-210.",
     tick: function (pixel) {
       if (Math.random() < 0.0005) {
-        changePixel(pixel, "polonium_210");
+        safeChange(pixel, "polonium_210");
         pixel.temp += 20;
+        return;
       }
       doDefaults(pixel);
     }
   });
 
-  // Cesium (Melts at 28.5 C, explodes violently with water!)
   defineFullElement({
     id: "cesium",
     color: ["#e3cf86", "#edda95", "#d4bf77"],
@@ -1156,12 +1222,12 @@
     conduct: 0.72,
     hardness: 0.1,
     behavior: behaviors.POWDER,
-    desc: "Silvery-gold alkali metal that melts just above room temperature (28.5 C). Detonates violently on contact with water or ice.",
+    desc: "Alkali metal that melts at 28.5 C and detonates violently on contact with water or ice.",
     reactions: {
       water: {
         chance: 0.9,
         func: function (p1, p2) {
-          changePixel(p1, "hydrogen");
+          safeChange(p1, "hydrogen");
           p1.temp += 1200;
           explodeAt(p1.x, p1.y, 4, "fire,hydrogen,steam");
         }
@@ -1169,7 +1235,7 @@
       ice: {
         chance: 0.7,
         func: function (p1, p2) {
-          changePixel(p1, "hydrogen");
+          safeChange(p1, "hydrogen");
           explodeAt(p1.x, p1.y, 4, "fire,hydrogen,steam");
         }
       },
@@ -1177,7 +1243,6 @@
     }
   });
 
-  // Rubidium (Melts at 39.3 C, violent water reaction)
   defineFullElement({
     id: "rubidium",
     color: ["#c9cfd6", "#d8dee6"],
@@ -1190,19 +1255,18 @@
     conduct: 0.7,
     hardness: 0.12,
     behavior: behaviors.POWDER,
-    desc: "Soft alkali metal (melts at 39.3 C). Ignites spontaneously in air and reacts explosively with water.",
+    desc: "Soft alkali metal (melts at 39.3 C). Reacts explosively with water.",
     reactions: {
       water: {
         chance: 0.85,
         func: function (p1, p2) {
-          changePixel(p1, "hydrogen");
+          safeChange(p1, "hydrogen");
           explodeAt(p1.x, p1.y, 3, "fire,hydrogen,steam");
         }
       }
     }
   });
 
-  // Gallium (Melts at 29.8 C, Liquid Metal Embrittlement on Aluminum!)
   defineFullElement({
     id: "gallium",
     color: ["#b4c2d1", "#c5d2e0", "#a4b2c2"],
@@ -1214,16 +1278,12 @@
     density: 5910,
     conduct: 0.65,
     hardness: 0.35,
-    desc: "Melts in your hand (29.8 C). Penetrates aluminum grain boundaries, turning solid aluminum into brittle powder!",
+    desc: "Melts in your hand (29.8 C). Embrittles solid aluminum into scrap.",
     reactions: {
-      aluminum: {
-        elem2: "metal_scrap",
-        chance: 0.18
-      }
+      aluminum: { elem2: "metal_scrap", chance: 0.18 }
     }
   });
 
-  // Osmium (Densest naturally occurring element!)
   defineFullElement({
     id: "osmium",
     color: ["#526075", "#5f6e85", "#465366"],
@@ -1235,7 +1295,7 @@
     density: 22590,
     conduct: 0.7,
     hardness: 0.95,
-    desc: "Densest natural element on Earth (22,590 kg/m^3). Bluish-silver, ultra-hard, and sinks through nearly every liquid."
+    desc: "Densest natural element on Earth (22,590 kg/m^3)."
   });
 
   // ---------------------------------------------------------------------------
@@ -1243,17 +1303,18 @@
   // ---------------------------------------------------------------------------
 
   runAfterLoad(function () {
-    // 1. Patch vanilla neutron so it participates in the accurate fission/moderation engine
+    // 1. Patch vanilla neutron
     if (elements.neutron) {
-      elements.neutron.desc = "Free neutron (enhanced by Nuclear & Chemistry Plus). Moderates in water/graphite and triggers accurate fission.";
+      elements.neutron.desc = "Free neutron (enhanced by Nuclear & Chemistry Plus v2).";
+      if (!elements.neutron.reactions) elements.neutron.reactions = {};
       elements.neutron.tick = function (pixel) {
         neutronTick(pixel, true);
       };
     }
 
-    // 2. Patch vanilla Uranium: remove arbitrary random explosions, keep realistic decay & neutron fission
+    // 2. Patch vanilla Uranium & Plutonium
     if (elements.uranium) {
-      elements.uranium.desc = "Natural/Low-Enriched Uranium (patched). No random explosions — requires thermal neutrons (use a moderator!) for a sustained chain reaction.";
+      elements.uranium.desc = "Natural/Low-Enriched Uranium (patched). Requires moderated thermal neutrons for sustained fission.";
       elements.uranium.tick = function (pixel) {
         if (Math.random() < 0.0001) {
           spawnNeutronsAround(pixel.x, pixel.y, 1, "fast_neutron");
@@ -1262,9 +1323,8 @@
       };
     }
 
-    // 3. Patch vanilla Plutonium if present
     if (elements.plutonium) {
-      elements.plutonium.desc = "Plutonium-239 (patched). Self-heats via alpha decay and fissions on both thermal and fast neutrons.";
+      elements.plutonium.desc = "Plutonium-239 (patched). Self-heats via alpha decay; fissions on thermal and fast neutrons.";
       elements.plutonium.tick = function (pixel) {
         pixel.temp += 0.05;
         if (Math.random() < 0.0005) {
@@ -1274,33 +1334,84 @@
       };
     }
 
-    // 4. Patch Hydrogen (Protium) for stellar p-p fusion at extreme temps (50,000 C)
+    // 3. Hydrogen p-p fusion (50,000 C) safely in tick
     if (elements.hydrogen) {
-      safeAddReaction("hydrogen", "hydrogen", {
-        elem1: "deuterium",
-        elem2: "positron",
-        tempMin: 50000,
-        chance: 0.15,
-        func: function (p1, p2) {
-          p1.temp += 4000;
+      wrapTick("hydrogen", function (pixel) {
+        if (pixel.temp >= 50000 && Math.random() < 0.15) {
+          const other = findAdjacentElement(pixel, "hydrogen");
+          if (other) {
+            safeChange(pixel, "deuterium");
+            safeChange(other, elements.positron ? "positron" : "radiation");
+            pixel.temp += 4000;
+            other.temp += 4000;
+            return true;
+          }
         }
+        return false;
       });
     }
 
-    // 5. Patch Helium for Triple-Alpha stellar fusion (65,000 C) -> Carbon / Graphite
+    // 4. Helium Triple-Alpha fusion (65,000 C) -> carbon_vapor (NOT CO2!) safely in tick
     if (elements.helium) {
-      safeAddReaction("helium", "helium", {
-        elem1: "graphite",
+      wrapTick("helium", function (pixel) {
+        if (pixel.temp >= 65000 && Math.random() < 0.14) {
+          const other = findAdjacentElement(pixel, "helium");
+          if (other) {
+            safeChange(pixel, "carbon_vapor");
+            safeChange(other, "radiation");
+            pixel.temp += 5500;
+            other.temp += 5500;
+            return true;
+          }
+        }
+        return false;
+      });
+    }
+
+    // 5. Oxygen Burning (95,000 C) -> Silicon (or molten_glass fallback) safely in tick
+    if (elements.oxygen) {
+      const siTarget = elements.silicon ? "silicon" : (elements.molten_glass ? "molten_glass" : "sand");
+      wrapTick("oxygen", function (pixel) {
+        if (pixel.temp >= 95000 && Math.random() < 0.12) {
+          const other = findAdjacentElement(pixel, "oxygen");
+          if (other) {
+            safeChange(pixel, siTarget);
+            safeChange(other, "radiation");
+            pixel.temp += 4000;
+            other.temp += 4000;
+            return true;
+          }
+        }
+        return false;
+      });
+    }
+
+    // 6. Silicon Burning (120,000 C) -> Iron-56 (end of exothermic stellar fusion!)
+    const siElem = elements.silicon ? "silicon" : null;
+    if (siElem) {
+      safeAddReaction(siElem, "helium", {
+        elem1: elements.molten_iron ? "molten_iron" : "iron",
         elem2: "radiation",
-        tempMin: 65000,
-        chance: 0.12,
+        tempMin: 120000,
+        chance: 0.10,
         func: function (p1, p2) {
-          p1.temp += 6000;
+          p1.temp += 2500;
         }
       });
     }
 
-    // 6. Patch molten Gallium to embrittle Aluminum just like solid Gallium
+    // 7. Thermal dissociation of CO2 above 4,000 C -> carbon_vapor + oxygen
+    if (elements.carbon_dioxide) {
+      wrapTick("carbon_dioxide", function (pixel) {
+        if (pixel.temp >= 4000 && Math.random() < 0.25) {
+          safeChange(pixel, Math.random() < 0.5 ? "carbon_vapor" : "oxygen");
+          return true;
+        }
+        return false;
+      });
+    }
+
+    // 8. Molten Gallium embrittles Aluminum
     if (elements.molten_gallium && elements.aluminum) {
       safeAddReaction("molten_gallium", "aluminum", {
         elem2: "metal_scrap",
@@ -1308,7 +1419,7 @@
       });
     }
 
-    // 7. Integrate with chem.js enriched_uranium / uranium_dioxide if loaded
+    // 9. Integrate with chem.js uranium_dioxide if loaded
     if (elements.uranium_dioxide) {
       FISSILE_SPECS.uranium_dioxide = {
         thermalProb: 0.45,
@@ -1317,6 +1428,20 @@
         heat: 1850,
         daughters: ["barium_141", "krypton_92", "xenon_135"]
       };
+    }
+
+    // 10. Global safety sweep: strip any non-function tick & guarantee behavior
+    for (const key in elements) {
+      const el = elements[key];
+      if (!el) continue;
+      if (el.tick !== undefined && typeof el.tick !== "function") {
+        delete el.tick;
+      }
+      if (!el.behavior && !el.tick) {
+        el.behavior = el.state === "liquid" ? behaviors.LIQUID
+          : el.state === "gas" ? behaviors.GAS
+          : behaviors.WALL;
+      }
     }
   });
 })();
