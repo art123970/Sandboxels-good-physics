@@ -1,19 +1,20 @@
 /*
- * Unified Physics & Chemistry v5 (unified_physics_chem.js)
+ * Unified Physics & Chemistry v6 (unified_physics_chem.js)
  * Complete drop-in companion add-on for Sandboxels + chem.js
  *
- * Key Systems:
- *  - Cloud-In-Cell (CIC) Multi-Body Gravity-Tile & Magnetic-Tile Precomputed Kernel Engine
- *    (zero self-force, scale-invariant across 2x2 / 4x4 / 6x6 / 8x8 tile resolutions)
- *  - State-of-Matter Compression Physics (solids resist compression without melting;
- *    liquids barely heat; gases heat adiabatically toward Virial equilibrium)
- *  - Deterministic Per-Pixel Velocity, Momentum Collisions & Circular Orbit Launcher
- *  - True N/S Magnetism, Curie Points, Bismuth Diamagnetism, Meissner Levitation & Tokamak Confinement
- *  - Complete Stellar & Reactor Fusion Ladder (D-T through Silicon -> Ni-56 -> Co-56 -> Fe -> Supernova)
- *  - Crash-Proof Neutron-Transport Fission + Alpha / Beta / Gamma Radiation + Decay Chains
- *  - External Map-Based Chemical Bond Graph (100% JSON / Undo / Save safe)
- *  - Recursive tick1/tick2 Sanitizer (prevents supernova stack overflows)
- *  - Built-In Dark-Mode Settings Panel ("Physics Settings" button or Shift+P) + betterSettings.js sync
+ * Systems:
+ *  1. Cloud-In-Cell (CIC) Multi-Body Gravity-Tile & Magnetic-Tile Engine (2x2..8x8 tiles, zero self-force)
+ *  2. Velocity-Driven State-Aware Compression:
+ *     - Solids: zero static heat; builds mechanical stress/pressure, crushes/rebounds, impact-only shock heat
+ *     - Liquids: zero static heat; Pascal lateral flow deflects blocked inward velocity sideways
+ *     - Gases/Plasma: real compression ratio (p.comp), adiabatic dT from d(comp), radiative cooling & stellar pauses
+ *  3. Deterministic Per-Pixel Velocity, Momentum Collisions & Exact Circular Orbit Launcher
+ *  4. True N/S Magnetism, Curie Points, Bismuth Diamagnetism, Meissner Levitation & Tokamak Confinement
+ *  5. Complete Stellar & Reactor Fusion Ladder (D-T -> p-p -> He -> C -> Ne/Mg -> O -> Si -> Ni56 -> Co56 -> Fe -> Supernova)
+ *  6. Crash-Proof Neutron-Transport Fission + Alpha / Beta / Gamma Radiation + Decay Chains
+ *  7. External Map-Based Chemical Bond Graph (100% JSON / Undo / Save safe)
+ *  8. Recursive tick1/tick2 Sanitizer (prevents supernova stack overflows)
+ *  9. Built-In Dark-Mode Settings Panel ("Physics Settings" button or Shift+P) + betterSettings.js sync
  */
 
 (function () {
@@ -23,7 +24,7 @@
   // 1. LIVE CUSTOMIZABLE CONFIGURATION & PERSISTENCE
   // ---------------------------------------------------------------------------
 
-  const STORAGE_KEY = "upc_v5_settings";
+  const STORAGE_KEY = "upc_v6_settings";
 
   const DEFAULT_CONFIG = {
     gravityMethod: "element",     // "element" | "star" | "com" | "wells_only" | "off"
@@ -31,6 +32,7 @@
     fieldRebuildInterval: 2,      // 1..6 ticks
     gravAccel: 0.032,             // 0..0.12
     compressionHeatScale: 1.0,    // 0..2.5
+    radiativeCooling: true,       // Enables stellar pause -> re-compression between fusion stages
     magScale: 1.0,                // 0..3.0
     maxSpeed: 2.6,                // 0.5..3.5
     starDrag: 0.996,              // 0.94..1.00
@@ -97,7 +99,7 @@
     const newBlock = Math.max(2, Math.min(8, parseInt(UPC_CONFIG.fieldTileSize, 10) || 4));
     if (newBlock !== FIELD_BLOCK) {
       FIELD_BLOCK = newBlock;
-      kernelX = null; // Force clean kernel + tile array reallocation
+      kernelX = null;
     }
     FIELD_REBUILD_INTERVAL = Math.max(1, Math.min(6, parseInt(UPC_CONFIG.fieldRebuildInterval, 10) || 2));
 
@@ -213,6 +215,14 @@
     return null;
   }
 
+  // Compression-scaled fusion multiplier (denser compressed cores fuse faster!)
+  function getFusionFactor(pixel) {
+    if (UPC_CONFIG.fusionRate <= 0) return 0;
+    const comp = pixel.comp || 1.0;
+    const compBoost = Math.min(2.6, 0.75 + Math.max(0, comp - 1.0) * 0.55);
+    return UPC_CONFIG.fusionRate * compBoost;
+  }
+
   function safeAddReaction(elemName, targetName, reactionObj) {
     if (!elements[elemName]) return;
     if (!elements[elemName].reactions) elements[elemName].reactions = {};
@@ -222,7 +232,6 @@
   function wrapTick(elemName, extraFn) {
     const el = elements[elemName];
     if (!el || el.tool) return;
-    // Hook el.tick1 safely if Sandboxels already compiled tick+behavior
     if (typeof el.tick1 === "function" && !String(el.tick1).includes("tick1")) {
       const origTick1 = el.tick1;
       el.tick1 = function (pixel) {
@@ -414,7 +423,7 @@
   // 3. EXTERNAL-GRAPH CHEMICAL BONDING ENGINE (100% JSON / UNDO / SAVE SAFE)
   // ---------------------------------------------------------------------------
 
-  const bondGraph = new Map(); // Map<Pixel, Array<{ target: Pixel, type: string, breakTemp: number }>>
+  const bondGraph = new Map();
   let totalBondEdges = 0;
 
   const RADIOLYSIS_AGENTS = new Set([
@@ -531,6 +540,7 @@
     "gravity_well", "star_gravity", "neutronium", "black_hole_core", "field_visualizer"
   ]);
 
+  // Properly detects compiled Sandboxels walls (movable === false / WALL tick)
   function isImmobileElement(elemName) {
     const el = elements[elemName];
     if (!el) return true;
@@ -720,7 +730,7 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 4. CLOUD-IN-CELL (CIC) GRAVITY + MAGNETIC TILES, STATE-AWARE COMPRESSION & VELOCITY
+  // 4. CLOUD-IN-CELL (CIC) GRAVITY + MAGNETIC TILES & VELOCITY-DRIVEN COMPRESSION
   // ---------------------------------------------------------------------------
 
   const IRON_FAMILY = new Set(["iron", "molten_iron", "iron_gas"]);
@@ -733,6 +743,24 @@
     "gold", "platinum", "lead", "thorium_232", "uranium_238", "uranium_235", "plutonium_239"
   ];
 
+  // Stellar molecular-weight progression so Helium/Carbon/Oxygen/Silicon cores
+  // naturally pull harder and contract once lighter fuel is exhausted!
+  const STELLAR_GRAV_MASS = {
+    hydrogen: 0.50,
+    deuterium: 0.58,
+    tritium: 0.64,
+    helium_3: 0.66,
+    helium: 0.74,
+    carbon_vapor: 0.96,
+    oxygen: 1.12,
+    neon: 1.18,
+    magnesium_gas: 1.28,
+    silicon_gas: 1.48,
+    nickel_56_gas: 2.05,
+    cobalt_56_gas: 2.05,
+    iron_gas: 2.15
+  };
+
   const FERROMAGNETIC_CURIE = {
     iron: 770,
     molten_iron: 770,
@@ -742,7 +770,7 @@
     cobalt_60: 1115,
     nickel: 358,
     neodymium: 310,
-    gadolinium: 20, // Magnetic switch right at room temp (20 C)!
+    gadolinium: 20,
     rust: 580,
     metal_scrap: 750
   };
@@ -780,7 +808,6 @@
     "bond_breaker", "bond_catalyst"
   ]);
 
-  // Physical-pixel softening (13.6 px^2 = 0.85 * 4^2), invariant across 2x2..8x8 tiles
   const FIELD_SOFT_PX2 = 13.6;
   const SELF_PHI_UNIT = 4 / Math.sqrt(FIELD_SOFT_PX2);
 
@@ -802,9 +829,13 @@
   let visualizerActive = false;
   let movingPixelsLastTick = 0;
 
-  function getPixelGravMass(elemName) {
-    const dens = elements[elemName]?.density || 100;
-    return Math.min(4.5, Math.max(0.5, Math.pow(dens / 250, 0.45)));
+  function getPixelGravMass(elemName, comp = 1.0) {
+    const base = STELLAR_GRAV_MASS[elemName] !== undefined
+      ? STELLAR_GRAV_MASS[elemName]
+      : Math.min(4.2, Math.max(0.5, Math.pow((elements[elemName]?.density || 100) / 250, 0.45)));
+    // Compressed gases pull slightly more strongly as their local density climbs
+    const compFactor = comp > 1.05 ? Math.min(1.55, 1 + (comp - 1) * 0.14) : 1.0;
+    return base * compFactor;
   }
 
   function isFerromagneticNow(pixel) {
@@ -815,7 +846,6 @@
 
   function ensureFieldTables() {
     if (typeof width !== "number" || typeof height !== "number") return false;
-    // +1 vertex ring so CIC bilinear deposition & sampling stay in bounds everywhere
     const mw = Math.max(3, Math.ceil((width + 1) / FIELD_BLOCK) + 1);
     const mh = Math.max(3, Math.ceil((height + 1) / FIELD_BLOCK) + 1);
     if (mw === fieldMw && mh === fieldMh && FIELD_BLOCK === activeFieldBlock && kernelX) return true;
@@ -866,7 +896,6 @@
     return true;
   }
 
-  // Cloud-In-Cell (CIC) bilinear deposition onto the 4 surrounding tile vertices
   function depositCIC(arr, x, y, val) {
     const fx = x / FIELD_BLOCK;
     const fy = y / FIELD_BLOCK;
@@ -885,7 +914,6 @@
     arr[r1 + 1] += val * tx * ty;
   }
 
-  // Matched CIC bilinear sampling -> identically zero self-force for any pixel
   function sampleField(arr, x, y) {
     if (!arr || fieldMw < 2 || fieldMh < 2) return 0;
     const fx = x / FIELD_BLOCK;
@@ -902,107 +930,147 @@
     return top + (bot - top) * ty;
   }
 
+  // Velocity-driven, state-of-matter compression engine
   function applyStateAwareCompression(p, gx, gy, phiNet) {
     const el = elements[p.element];
     const st = el?.state || "solid";
     const gMag = Math.hypot(gx, gy);
 
-    // Count confining neighbors
+    // Count confining neighbors & locate any open escape direction
     let surrounded = 0;
+    let emptyDx = 0, emptyDy = 0, emptyCount = 0;
     for (let c = 0; c < adjacentCoords.length; c++) {
-      const cx = p.x + adjacentCoords[c][0];
-      const cy = p.y + adjacentCoords[c][1];
-      if (inSafeBounds(cx, cy) && !isEmpty(cx, cy)) surrounded++;
+      const dx = adjacentCoords[c][0];
+      const dy = adjacentCoords[c][1];
+      const cx = p.x + dx;
+      const cy = p.y + dy;
+      if (!inSafeBounds(cx, cy) || !isEmpty(cx, cy)) {
+        surrounded++;
+      } else {
+        emptyDx += dx;
+        emptyDy += dy;
+        emptyCount++;
+      }
     }
 
-    // Hydrostatic overburden pressure (depends on potential depth, gravity load & density)
-    const dens = el?.density || 1000;
-    const densNorm = Math.min(3.5, Math.max(0.25, Math.sqrt(dens / 1000)));
-    p.pressure = phiNet > 4
-      ? Math.round(phiNet * (0.65 + Math.min(2.5, gMag * 0.08)) * (surrounded / 8) * densNorm * 1.4)
-      : 0;
+    // Consume blocked inward velocity impulse accumulated by collisions/gravity
+    const imp = p.inwardImpulse || 0;
+    p.inwardImpulse = imp * 0.45;
 
-    if (surrounded < 5) return;
+    const dens = el?.density || 1000;
+    const densNorm = Math.min(3.2, Math.max(0.25, Math.sqrt(dens / 1000)));
+    const pressureBase = phiNet > 4
+      ? Math.round((phiNet * (0.65 + Math.min(2.2, gMag * 0.08)) * (surrounded / 8) * densNorm + imp * 30) * 1.35)
+      : Math.round(imp * 20);
+    p.pressure = pressureBase;
 
     const heatScale = UPC_CONFIG.compressionHeatScale;
 
     if (st === "solid") {
-      // High-pressure graphite -> diamond synthesis (requires real pressure + heat)
-      if (p.element === "graphite" && p.pressure > 220 && p.temp >= 1200 && elements.diamond) {
-        safeChange(p, "diamond");
-      }
-      // Solids are virtually incompressible: zero static gravitational heating
-      return;
-    } else if (st === "liquid") {
-      // Liquids are nearly incompressible -> mild deep-core warming only, capped below boiling
-      if (heatScale > 0 && phiNet > 70 && surrounded >= 6) {
-        const boilCap = el?.tempHigh ? Math.min(el.tempHigh * 0.75, 450) : 250;
-        const targetLiq = Math.min(boilCap, 20 + (phiNet - 70) * 0.35 * heatScale);
-        if (p.temp < targetLiq) {
-          p.temp += Math.min(targetLiq - p.temp, (targetLiq - p.temp) * 0.015);
-        }
-      }
-    } else {
-      // Gases & Plasma are highly compressible -> adiabatic Virial heating
-      if (heatScale > 0 && phiNet > 36) {
-        const loadFactor = Math.min(2.2, 0.8 + gMag * 0.05);
-        const targetGas = Math.min(180000, Math.pow(phiNet - 35, 2.15) * 2.1 * heatScale * loadFactor);
-        if (p.temp < targetGas) {
-          p.temp += Math.min(targetGas - p.temp, (targetGas - p.temp) * 0.035 + 6 * heatScale);
-        }
-      }
-    }
-  }
+      // SOLIDS: Virtually incompressible — ZERO static gravitational heating!
+      // Blocked inward velocity builds elastic stress (p.stress) instead of melting the solid.
+      const targetStress = Math.min(pressureBase * 0.8 + imp * 55, 1200);
+      p.stress = Math.max(0, (p.stress || 0) * 0.88 + targetStress * 0.12);
+      p.comp = +(1.0 + Math.min(0.05, p.stress / 8000)).toFixed(3);
 
-    // Hydrostatic overburden pressure (depends on potential depth, gravity load & density)
-    const dens = el?.density || 1000;
-    const densNorm = Math.min(3.5, Math.max(0.25, Math.sqrt(dens / 1000)));
-    p.pressure = phiNet > 4
-      ? Math.round(phiNet * (0.65 + Math.min(2.5, gMag * 0.08)) * (surrounded / 8) * densNorm * 1.4)
-      : 0;
-
-    if (surrounded < 5) return;
-
-    const heatScale = UPC_CONFIG.compressionHeatScale;
-
-    if (st === "solid") {
-      // High-pressure graphite -> diamond synthesis (requires real pressure + heat)
+      // 1. High-pressure phase transitions (graphite -> diamond, pressure-melting ice)
       if (p.element === "graphite" && p.pressure > 220 && p.temp >= 1200 && elements.diamond) {
         safeChange(p, "diamond");
         return;
       }
-      // Static solids are virtually incompressible -> ZERO static gravitational heating!
-      // Only tiny plastic/tidal strain heating when actively moving under extreme compact-object gravity.
-      if (heatScale > 0 && phiNet > 320 && gMag > 25) {
-        const spd = Math.hypot(p.vx || 0, p.vy || 0);
-        if (spd > 0.35) {
-          const hardness = el?.hardness !== undefined ? el.hardness : 0.7;
-          const meltCap = el?.tempHigh ? el.tempHigh * 0.65 : 600;
-          if (p.temp < meltCap) {
-            p.temp += Math.min(meltCap - p.temp, (1 - hardness * 0.85) * spd * 1.5 * heatScale);
-          }
+      if (p.element === "ice" && p.pressure > 320 && elements.water) {
+        safeChange(p, "water");
+        return;
+      }
+
+      // 2. Structural crushing of brittle solids under extreme planetary overburden
+      if (p.pressure > 620 && (el?.hardness ?? 0.7) < 0.55) {
+        if (p.element === "stone" && elements.sand && Math.random() < 0.04) {
+          safeChange(p, "sand");
+          return;
         }
       }
-    } else if (st === "liquid") {
-      // Liquids are nearly incompressible -> mild deep-core warming only, capped below boiling
-      if (heatScale > 0 && phiNet > 70 && surrounded >= 6) {
-        const boilCap = el?.tempHigh ? Math.min(el.tempHigh * 0.75, 450) : 250;
-        const targetLiq = Math.min(boilCap, 20 + (phiNet - 70) * 0.35 * heatScale);
-        if (p.temp < targetLiq) {
-          p.temp += Math.min(targetLiq - p.temp, (targetLiq - p.temp) * 0.015);
-        }
+
+      // 3. Elastic decompression springback when confinement suddenly opens!
+      if (p.stress > 95 && emptyCount >= 3 && !isImmobileElement(p.element)) {
+        const len = Math.hypot(emptyDx, emptyDy) || 1;
+        const kick = Math.min(0.95, p.stress / 320);
+        p.vx = (p.vx || 0) + (emptyDx / len) * kick;
+        p.vy = (p.vy || 0) + (emptyDy / len) * kick;
+        p.stress *= 0.35;
       }
-    } else {
-      // Gases & Plasma are highly compressible -> adiabatic Virial heating!
-      // Small clouds stay warm; medium clouds ignite D-T; massive clouds ignite full stellar fusion.
-      if (heatScale > 0 && phiNet > 36) {
-        const loadFactor = Math.min(2.2, 0.8 + gMag * 0.05);
-        const targetGas = Math.min(180000, Math.pow(phiNet - 35, 2.15) * 2.1 * heatScale * loadFactor);
-        if (p.temp < targetGas) {
-          p.temp += Math.min(targetGas - p.temp, (targetGas - p.temp) * 0.035 + 6 * heatScale);
-        }
+      return;
+    }
+
+    if (st === "liquid") {
+      // LIQUIDS: Nearly incompressible — ZERO temperature explosion!
+      // Blocked inward velocity deflects tangentially (Pascal's Law hydrostatic leveling).
+      p.comp = +(1.0 + Math.min(0.08, pressureBase / 5000)).toFixed(3);
+      p.stress = Math.round(pressureBase * 0.4);
+
+      if (imp > 0.12 && emptyCount > 0 && gMag > 0.08) {
+        // Compute tangential vector perpendicular to local gravity, biased toward open space
+        const tx = -gy / gMag;
+        const ty = gx / gMag;
+        const sign = (tx * emptyDx + ty * emptyDy) >= 0 ? 1 : -1;
+        const flow = Math.min(0.85, imp * 0.55);
+        p.vx = (p.vx || 0) + tx * sign * flow;
+        p.vy = (p.vy || 0) + ty * sign * flow;
+      }
+      return;
+    }
+
+    // GASES & PLASMA: True compressible equation of state (p.comp = 1.0..8.0)
+    // Gravitational compression vs outward thermal pressure drives real stellar evolution stages!
+    const oldComp = p.comp || 1.0;
+
+    // Gentle stellar radiative heat loss so a core whose fuel ran out cools slightly,
+    // loses thermal pressure support, and physically re-compresses to ignite the next stage!
+    if (UPC_CONFIG.radiativeCooling && starModeActive && p.temp > 2500) {
+      const coolFactor = surrounded < 6 ? 0.0085 : 0.0022;
+      p.temp = Math.max(20, p.temp - (p.temp - 2500) * coolFactor);
+    }
+
+    // Outward thermal pressure vs inward gravitational squeeze (from phiNet + blocked velocity impulse)
+    const tempK = Math.max(200, p.temp + 273);
+    const pTherm = Math.pow(tempK, 0.74) * 0.036 * Math.sqrt(oldComp);
+    const pGrav = surrounded >= 5
+      ? Math.max(0, phiNet - 18) * (1.55 + Math.min(2.2, imp * 1.1) + Math.min(1.0, gMag * 0.04))
+      : 0;
+
+    let newComp = oldComp;
+    if (pGrav > pTherm && surrounded >= 5) {
+      // Inward gravity + blocked velocity compresses the gas!
+      const drive = Math.min(1.6, (pGrav - pTherm) / Math.max(35, pGrav));
+      const dComp = (0.025 + Math.min(0.14, imp * 0.09)) * drive * (surrounded / 8);
+      newComp = Math.min(8.0, oldComp + dComp);
+
+      // Adiabatic P dV compression heating happens ONLY while comp is actively increasing!
+      if (heatScale > 0 && dComp > 0.0005) {
+        const workHeat = (tempK * 0.58 * (dComp / oldComp) + dComp * 13500 + imp * 140) * heatScale;
+        p.temp = Math.min(200000, p.temp + workHeat);
+      }
+    } else if (oldComp > 1.0) {
+      // Over-pressurized or unconfined gas EXPANDS outward and cools adiabatically!
+      const relaxRate = surrounded < 5 ? 0.14 : 0.045;
+      const dComp = Math.min(oldComp - 1.0, (oldComp - 1.0) * relaxRate + 0.01);
+      newComp = Math.max(1.0, oldComp - dComp);
+
+      if (heatScale > 0 && dComp > 0.001 && p.temp > 20) {
+        p.temp = Math.max(20, p.temp - tempK * 0.30 * (dComp / oldComp));
+      }
+
+      // Convert decompression into outward expansion velocity (stellar flash / pressure wave!)
+      if (emptyCount > 0 && dComp > 0.01) {
+        const len = Math.hypot(emptyDx, emptyDy) || 1;
+        const push = Math.min(1.1, dComp * 3.5);
+        p.vx = (p.vx || 0) + (emptyDx / len) * push;
+        p.vy = (p.vy || 0) + (emptyDy / len) * push;
       }
     }
+
+    p.comp = +newComp.toFixed(3);
+    p.stress = Math.round(Math.max(0, pGrav - pTherm));
   }
 
   function triggerSupernova(cx, cy, formBlackHole = false) {
@@ -1050,6 +1118,7 @@
           const kick = Math.min(MAX_SPEED, 15 / dist);
           p.vx = (p.vx || 0) + (dx / dist) * kick;
           p.vy = (p.vy || 0) + (dy / dist) * kick;
+          p.comp = 1.0;
           movingPixelsLastTick = Math.max(movingPixelsLastTick, 1);
         }
       }
@@ -1081,7 +1150,6 @@
     let hasMagnets = false;
     let hasVisualizer = false;
 
-    // Pass 1: CIC-deposit mass & magnetic pole charge onto tile vertices
     for (let i = 0; i < currentPixels.length; i++) {
       const p = currentPixels[i];
       if (!p || p.del) continue;
@@ -1110,7 +1178,7 @@
         hasPointWell = true;
         depositCIC(macroMass, p.x, p.y, 210);
       } else if (!isImmobileElement(e)) {
-        depositCIC(macroMass, p.x, p.y, getPixelGravMass(e));
+        depositCIC(macroMass, p.x, p.y, getPixelGravMass(e, p.comp || 1.0));
         if (IRON_FAMILY.has(e)) {
           const bx = Math.min(fieldMw - 1, Math.max(0, Math.round(p.x / FIELD_BLOCK)));
           const by = Math.min(fieldMh - 1, Math.max(0, Math.round(p.y / FIELD_BLOCK)));
@@ -1121,7 +1189,6 @@
       }
     }
 
-    // Apply selected Gravity Method
     const mode = UPC_CONFIG.gravityMethod;
     if (mode === "off") {
       hasStarGravity = false;
@@ -1169,7 +1236,6 @@
     UPC_STATS.activeMagTiles = 0;
     if (!gravFieldActive && !magFieldActive) return;
 
-    // Pass 2: Convolve non-empty tile vertices with precomputed physical-pixel kernels
     const mw = fieldMw, mh = fieldMh, kw = fieldKw;
     for (let sy = 0; sy < mh; sy++) {
       const sRow = sy * mw;
@@ -1221,13 +1287,12 @@
       }
     }
 
-    // Pass 2b: Scale-invariant |B| and gradient for ferromagnets, Meissner & plasma confinement
     if (magFieldActive) {
       const total = mw * mh;
       for (let i = 0; i < total; i++) {
         macroBmag[i] = Math.hypot(macroBx[i], macroBy[i]) + 0.25 * macroMagPot[i];
       }
-      const gradScale = 2 / FIELD_BLOCK; // Normalized to 4px reference grid
+      const gradScale = 2 / FIELD_BLOCK;
       for (let by = 0; by < mh; by++) {
         const row = by * mw;
         const yPrev = by > 0 ? (by - 1) * mw : row;
@@ -1242,7 +1307,6 @@
       }
     }
 
-    // Pass 2c: Local hot iron-core collapse check (Supernova / Hypernova)
     if (gravFieldActive && UPC_CONFIG.supernovaEnabled) {
       for (let by = 1; by < mh - 1; by++) {
         for (let bx = 1; bx < mw - 1; bx++) {
@@ -1256,7 +1320,6 @@
               hotSum += macroHotIron[nIdx];
             }
           }
-          // Requires genuinely hot stellar iron core (cold solid iron planets never explode!)
           if (ironSum >= 18 && hotSum >= 10 && macroPhi[idx] > 45) {
             const makeBlackHole = hotSum >= 36 || macroPhi[idx] > 180;
             triggerSupernova(bx * FIELD_BLOCK, by * FIELD_BLOCK, makeBlackHole);
@@ -1278,7 +1341,7 @@
     const steps = Math.min(3, Math.max(Math.abs(remX), Math.abs(remY)));
     const pEl = elements[p.element];
     const pDens = pEl?.density || 1000;
-    const pIsSolid = (pEl?.state || "solid") === "solid";
+    const pState = pEl?.state || "solid";
 
     for (let s = 0; s < steps; s++) {
       if (p.del) return;
@@ -1325,11 +1388,14 @@
       const target = pixelMap[nx][ny];
       if (!target || target.del) break;
 
+      const blockedSpd = Math.hypot(p.vx || 0, p.vy || 0);
+
       if (!isImmobileElement(target.element)) {
         const tInfo = elements[target.element];
         const tDens = tInfo?.density || 1000;
-        const tState = tInfo?.state;
+        const tState = tInfo?.state || "solid";
 
+        // Density stratification (heavier elements sink through gases/liquids)
         if ((tState === "gas" || tState === "liquid") && pDens > tDens * 1.15) {
           safeSwap(p, target);
           p.vx *= 0.88;
@@ -1340,13 +1406,17 @@
           continue;
         }
 
-        const totalM = pDens + tDens;
         const tvx = target.vx || 0, tvy = target.vy || 0;
         const relSpd = Math.hypot(p.vx - tvx, p.vy - tvy);
 
-        // Kinetic shock heating ONLY for genuine free-flying impacts (never resting weight)
-        if ((p.freeSteps || 0) >= 2 && relSpd > 1.5) {
-          const heat = Math.min(180, Math.round((relSpd - 1.4) * 28));
+        // Record blocked inward velocity as mechanical compression impulse (instead of instant solid heating!)
+        const impAdd = Math.min(1.5, relSpd * 0.65);
+        p.inwardImpulse = Math.min(4.0, (p.inwardImpulse || 0) + impAdd);
+        target.inwardImpulse = Math.min(4.0, (target.inwardImpulse || 0) + impAdd * 0.85);
+
+        // Kinetic crater heating ONLY for genuine fast free-flying projectiles
+        if ((p.freeSteps || 0) >= 2 && relSpd > 1.55) {
+          const heat = Math.min(180, Math.round((relSpd - 1.45) * 28));
           p.temp += heat;
           target.temp += heat;
         }
@@ -1354,13 +1424,15 @@
         p.freeSteps = 0;
         target.freeSteps = 0;
 
-        if (pIsSolid && tState === "solid" && relSpd < 0.9) {
+        if (pState === "solid" && tState === "solid" && relSpd < 0.9) {
+          // Resting solid contact: transmit stress inward without phantom vibration
           if (sx !== 0) { p.vx = 0; p.rx = 0; }
           if (sy !== 0) { p.vy = 0; p.ry = 0; }
         } else {
+          const totalM = pDens + tDens;
           const newVx = (pDens * p.vx + tDens * tvx) / totalM;
           const newVy = (pDens * p.vy + tDens * tvy) / totalM;
-          const damp = (pIsSolid && tState === "solid") ? 0.55 : 0.82;
+          const damp = (pState === "solid" && tState === "solid") ? 0.55 : 0.82;
           p.vx = newVx * damp;
           p.vy = newVy * damp;
           target.vx = Math.max(-MAX_SPEED, Math.min(MAX_SPEED, tvx + (newVx - tvx) * 1.05));
@@ -1368,9 +1440,10 @@
         }
         break;
       } else {
-        if ((p.freeSteps || 0) >= 2) {
-          const spd = Math.hypot(p.vx, p.vy);
-          if (spd > 1.6) p.temp += Math.min(120, Math.round((spd - 1.5) * 22));
+        // Blocked by immobile wall: store impulse for stress/Pascal/gas compression
+        p.inwardImpulse = Math.min(4.0, (p.inwardImpulse || 0) + blockedSpd * 0.6);
+        if ((p.freeSteps || 0) >= 2 && blockedSpd > 1.65) {
+          p.temp += Math.min(120, Math.round((blockedSpd - 1.55) * 22));
         }
         p.freeSteps = 0;
         if (sx !== 0) { p.vx = Math.abs(p.vx) > 1.2 ? -p.vx * 0.25 : 0; p.rx = 0; }
@@ -1406,25 +1479,25 @@
 
       let ax = 0;
       let ay = 0;
+      let gx = 0;
+      let gy = 0;
 
-      // 1. Multi-Body CIC Gravity + State-Aware Compression
+      // 1. Multi-Body CIC Gravity (identically zero self-force)
       if (gravFieldActive) {
-        const gx = sampleField(macroGx, p.x, p.y);
-        const gy = sampleField(macroGy, p.x, p.y);
+        gx = sampleField(macroGx, p.x, p.y);
+        gy = sampleField(macroGy, p.x, p.y);
 
-        const radPressure = p.temp > 45000 ? Math.min(0.65, (p.temp - 45000) / 140000) : 0;
+        // Hot stellar radiation + thermal pressure opposes collapse (hydrostatic equilibrium!)
+        const pComp = p.comp || 1.0;
+        const radPressure = p.temp > 38000
+          ? Math.min(0.78, ((p.temp - 38000) / 115000) * Math.min(1.5, 0.7 + pComp * 0.25))
+          : 0;
         const gScale = GRAV_ACCEL * (1 - radPressure);
         ax += gx * gScale;
         ay += gy * gScale;
-
-        if (doCompressionThisTick) {
-          const selfM = starModeActive ? getPixelGravMass(p.element) : 0;
-          const phiNet = Math.max(0, sampleField(macroPhi, p.x, p.y) - selfM * SELF_PHI_UNIT);
-          applyStateAwareCompression(p, gx, gy, phiNet);
-        }
       }
 
-      // 2. Unified CIC Magnetic Field
+      // 2. Unified CIC Magnetic Field (identically zero self-force)
       if (magFieldActive) {
         const poleSign = MAGNET_POLE_MAP[p.element];
         if (poleSign !== undefined) {
@@ -1445,14 +1518,16 @@
         }
       }
 
-      // 3. Normal-force contact cancellation for solids resting against supporting solids/walls
+      // 3. Normal-force contact support for resting solids (records inward stress impulse instead of runaway speed)
       const pEl = elements[p.element];
-      if ((pEl?.state || "solid") === "solid") {
+      const pState = pEl?.state || "solid";
+      if (pState === "solid") {
         const pDens = pEl?.density || 1000;
         if (ax !== 0) {
           const sx = Math.sign(ax);
           const nx = p.x + sx;
           if (!inSafeBounds(nx, p.y)) {
+            p.inwardImpulse = Math.min(4.0, (p.inwardImpulse || 0) + Math.abs(ax));
             ax = 0;
             if (Math.sign(p.vx || 0) === sx) { p.vx = 0; p.rx = 0; }
           } else if (!isEmpty(nx, p.y)) {
@@ -1460,6 +1535,7 @@
             const nbEl = nb && elements[nb.element];
             const nbStatic = nb && (isImmobileElement(nb.element) || ((nbEl?.state || "solid") === "solid" && (nbEl?.density || 1000) >= pDens * 0.85 && ((nb.vx || 0) * sx <= 0.15)));
             if (nbStatic) {
+              p.inwardImpulse = Math.min(4.0, (p.inwardImpulse || 0) + Math.abs(ax));
               ax = 0;
               if (Math.sign(p.vx || 0) === sx) { p.vx = 0; p.rx = 0; }
               p.freeSteps = 0;
@@ -1470,6 +1546,7 @@
           const sy = Math.sign(ay);
           const ny = p.y + sy;
           if (!inSafeBounds(p.x, ny)) {
+            p.inwardImpulse = Math.min(4.0, (p.inwardImpulse || 0) + Math.abs(ay));
             ay = 0;
             if (Math.sign(p.vy || 0) === sy) { p.vy = 0; p.ry = 0; }
           } else if (!isEmpty(p.x, ny)) {
@@ -1477,12 +1554,21 @@
             const nbEl = nb && elements[nb.element];
             const nbStatic = nb && (isImmobileElement(nb.element) || ((nbEl?.state || "solid") === "solid" && (nbEl?.density || 1000) >= pDens * 0.85 && ((nb.vy || 0) * sy <= 0.15)));
             if (nbStatic) {
+              p.inwardImpulse = Math.min(4.0, (p.inwardImpulse || 0) + Math.abs(ay));
               ay = 0;
               if (Math.sign(p.vy || 0) === sy) { p.vy = 0; p.ry = 0; }
               p.freeSteps = 0;
             }
           }
         }
+      }
+
+      // 4. Velocity-driven state-aware compression (runs before movement so rebound/Pascal kicks apply cleanly)
+      if (doCompressionThisTick) {
+        const selfM = starModeActive ? getPixelGravMass(p.element, p.comp || 1.0) : 0;
+        const phiNet = Math.max(0, sampleField(macroPhi, p.x, p.y) - selfM * SELF_PHI_UNIT);
+        applyStateAwareCompression(p, gx, gy, phiNet);
+        if (p.del) continue;
       }
 
       const prevVx = p.vx || 0;
@@ -1516,6 +1602,7 @@
     movingPixelsLastTick = movingNow;
     UPC_STATS.movingPixels = movingNow;
   }
+
   function drawFieldOverlay() {
     if (!visualizerActive || (!gravFieldActive && !magFieldActive)) return;
     if (typeof ctx === "undefined" || !ctx || typeof pixelSize !== "number") return;
@@ -1998,9 +2085,8 @@
       const gy = sampleField(macroGy, pixel.x, pixel.y);
       const gMag = Math.hypot(gx, gy);
       if (gMag < 0.01) return;
-      const selfM = starModeActive ? getPixelGravMass(pixel.element) : 0;
+      const selfM = starModeActive ? getPixelGravMass(pixel.element, pixel.comp || 1.0) : 0;
       const phiNet = Math.max(0, sampleField(macroPhi, pixel.x, pixel.y) - selfM * SELF_PHI_UNIT);
-      // Scale-invariant circular velocity: v = sqrt(4 * Phi_net * GRAV_ACCEL)
       const vCirc = Math.min(MAX_SPEED * 0.92, Math.sqrt(4 * phiNet * GRAV_ACCEL));
       pixel.vx = (-gy / gMag) * vCirc;
       pixel.vy = (gx / gMag) * vCirc;
@@ -2033,14 +2119,23 @@
   registerOrEnhance("compress_tool", {
     color: ["#ab47bc", "#ce93d8"],
     category: "tools",
-    desc: "Shock Compressor: applies extreme pressure & state-aware adiabatic heat (ignites fusion or presses hot graphite into diamond!).",
+    desc: "Shock Compressor: compresses gases (raising comp & adiabatic temp) or pressurizes solids (pressing hot graphite into diamond!).",
     tool: function (pixel) {
       if (!pixel || pixel.del) return;
       pixel.pressure = (pixel.pressure || 0) + 400;
       const st = elements[pixel.element]?.state;
-      pixel.temp += st === "gas" ? 1600 : (st === "liquid" ? 180 : 90);
-      if (pixel.element === "graphite" && pixel.temp >= 1200 && elements.diamond) {
-        safeChange(pixel, "diamond");
+      if (st === "gas") {
+        pixel.comp = Math.min(8.0, (pixel.comp || 1.0) + 0.65);
+        pixel.temp += 1800;
+      } else if (st === "liquid") {
+        pixel.temp += 40;
+      } else {
+        pixel.stress = Math.min(1200, (pixel.stress || 0) + 250);
+        if (pixel.element === "graphite" && pixel.temp >= 1200 && elements.diamond) {
+          safeChange(pixel, "diamond");
+        } else if (pixel.element === "ice" && elements.water) {
+          safeChange(pixel, "water");
+        }
       }
     }
   });
@@ -2106,7 +2201,7 @@
   registerOrEnhance("inspect_tool", {
     color: ["#26c6da", "#80deea"],
     category: "tools",
-    desc: "Physics Telemetry Inspector: click any pixel to print state, temp, velocity, pressure, g-field, B-field, and active chemical bonds.",
+    desc: "Physics Telemetry Inspector: click any pixel to print state, temp, compression (comp), stress, velocity, pressure, g, B, and bonds.",
     tool: function (pixel) {
       if (!pixel || pixel.del) return;
       const now = Date.now();
@@ -2115,13 +2210,15 @@
       const st = elements[pixel.element]?.state || "?";
       const vx = (pixel.vx || 0).toFixed(2);
       const vy = (pixel.vy || 0).toFixed(2);
+      const comp = (pixel.comp || 1.0).toFixed(2);
+      const stress = Math.round(pixel.stress || 0);
       const g = gravFieldActive ? Math.hypot(sampleField(macroGx, pixel.x, pixel.y), sampleField(macroGy, pixel.x, pixel.y)).toFixed(2) : "0";
       const b = magFieldActive ? sampleField(macroBmag, pixel.x, pixel.y).toFixed(2) : "0";
       const pBonds = getBonds(pixel);
       const bondList = pBonds && pBonds.length
         ? pBonds.map(x => x.target.element + "(" + x.type + ")").join(", ")
         : "none";
-      notifyUser(`${pixel.element}[${st}] | ${Math.round(pixel.temp)}C | v=(${vx},${vy}) | P=${pixel.pressure || 0} | g=${g} | B=${b} | bonds: ${bondList}`);
+      notifyUser(`${pixel.element}[${st}] | ${Math.round(pixel.temp)}C | comp=${comp}x | P=${pixel.pressure || 0} | stress=${stress} | v=(${vx},${vy}) | g=${g} | B=${b} | bonds: ${bondList}`);
     }
   });
 
@@ -2136,7 +2233,7 @@
     state: "solid",
     density: 99999,
     hardness: 1,
-    desc: "Enables global multi-body CIC Gravity-Tile self-gravity (in Element-Based mode). Enables binary stars, solid planets, orbits, core fusion, and supernovae."
+    desc: "Enables global multi-body CIC Gravity-Tile self-gravity (in Element-Based mode). Enables binary stars, solid planets, stellar evolution pauses, and supernovae."
   });
 
   registerOrEnhance("gravity_well", {
@@ -2467,7 +2564,7 @@
   });
 
   // ---------------------------------------------------------------------------
-  // 8. FULL STELLAR & REACTOR FUSION ISOTOPES
+  // 8. FULL STELLAR & REACTOR FUSION ISOTOPES (COMPRESSION-SCALED)
   // ---------------------------------------------------------------------------
 
   defineFullGas({
@@ -2481,7 +2578,7 @@
     density: 0.18,
     desc: "Hydrogen-2. Fuses with Tritium (10,000 C), Deuterium (25,000 C), or Helium-3 (40,000 C).",
     tick: function (pixel) {
-      const fr = UPC_CONFIG.fusionRate;
+      const fr = getFusionFactor(pixel);
       if (fr > 0) {
         if (pixel.temp >= 10000 && Math.random() < 0.55 * fr) {
           const t = findAdjacentElement(pixel, "tritium");
@@ -2555,7 +2652,8 @@
     density: 0.13,
     desc: "Light Helium-3. Aneutronic fusion with Deuterium (40,000 C) or He-3 + He-3 (45,000 C).",
     tick: function (pixel) {
-      if (UPC_CONFIG.fusionRate > 0 && pixel.temp >= 45000 && Math.random() < 0.25 * UPC_CONFIG.fusionRate) {
+      const fr = getFusionFactor(pixel);
+      if (fr > 0 && pixel.temp >= 45000 && Math.random() < 0.25 * fr) {
         const other = findAdjacentElement(pixel, "helium_3");
         if (other) {
           safeChange(pixel, "helium");
@@ -2580,7 +2678,7 @@
     stateLow: "graphite",
     desc: "Elemental Carbon-12 gas (>3,642 C). Fuses with Helium (75,000 C -> Oxygen) or Carbon (82,000 C -> Neon/Magnesium).",
     tick: function (pixel) {
-      const fr = UPC_CONFIG.fusionRate;
+      const fr = getFusionFactor(pixel);
       if (fr > 0) {
         if (pixel.temp >= 75000 && Math.random() < 0.18 * fr) {
           const he = findAdjacentElement(pixel, "helium");
@@ -2642,7 +2740,8 @@
     conduct: 0.4,
     desc: "Noble gas forged by Carbon burning. Fuses with Helium at 88,000 C into Magnesium.",
     tick: function (pixel) {
-      if (UPC_CONFIG.fusionRate > 0 && pixel.temp >= 88000 && Math.random() < 0.16 * UPC_CONFIG.fusionRate) {
+      const fr = getFusionFactor(pixel);
+      if (fr > 0 && pixel.temp >= 88000 && Math.random() < 0.16 * fr) {
         const he = findAdjacentElement(pixel, "helium");
         if (he) {
           safeChange(pixel, "magnesium_gas");
@@ -2681,7 +2780,8 @@
     tickAllStates: true,
     desc: "Reactive light metal. Burns hot in oxygen (>470 C), reacts with steam, and fuses with Helium at 92,000 C into Silicon!",
     tick: function (pixel) {
-      if (UPC_CONFIG.fusionRate > 0 && pixel.temp >= 92000 && Math.random() < 0.16 * UPC_CONFIG.fusionRate) {
+      const fr = getFusionFactor(pixel);
+      if (fr > 0 && pixel.temp >= 92000 && Math.random() < 0.16 * fr) {
         const he = findAdjacentElement(pixel, "helium");
         if (he) {
           safeChange(pixel, "silicon_gas");
@@ -2713,7 +2813,8 @@
     tickAllStates: true,
     desc: "Crystalline semiconductor (Si-28). Forged by Oxygen fusion (95,000 C), Mg+He fusion (92,000 C), or smelting sand + graphite (>1,900 C). Fuses past 115,000 C into Nickel-56 -> Iron!",
     tick: function (pixel) {
-      if (UPC_CONFIG.fusionRate > 0 && pixel.temp >= 115000 && Math.random() < 0.16 * UPC_CONFIG.fusionRate) {
+      const fr = getFusionFactor(pixel);
+      if (fr > 0 && pixel.temp >= 115000 && Math.random() < 0.16 * fr) {
         const partner = findAdjacentElement(pixel, "helium") || findAdjacentElement(pixel, SILICON_STATES);
         if (partner) {
           safeChange(pixel, "nickel_56_gas");
@@ -3159,7 +3260,8 @@
     tickAllStates: true,
     desc: "Control-rod neutron absorber. Also fuels aneutronic p-B11 fusion with Hydrogen above 55,000 C -> Helium!",
     tick: function (pixel) {
-      if (UPC_CONFIG.fusionRate > 0 && pixel.temp >= 55000 && Math.random() < 0.20 * UPC_CONFIG.fusionRate) {
+      const fr = getFusionFactor(pixel);
+      if (fr > 0 && pixel.temp >= 55000 && Math.random() < 0.20 * fr) {
         const h = findAdjacentElement(pixel, "hydrogen");
         if (h) {
           safeChange(pixel, "helium");
@@ -3537,10 +3639,11 @@
         gravityMethod: "star",
         fieldTileSize: 4,
         fieldRebuildInterval: 2,
-        gravAccel: 0.042,
-        compressionHeatScale: 1.2,
+        gravAccel: 0.040,
+        compressionHeatScale: 1.1,
+        radiativeCooling: true,
         starDrag: 0.998,
-        fusionRate: 1.5,
+        fusionRate: 1.3,
         supernovaEnabled: true,
         autoBonding: false
       });
@@ -3640,7 +3743,7 @@
     });
 
     const header = document.createElement("h3");
-    header.innerHTML = '<span>Unified Physics v5</span><span style="font-size:12px;color:#7e8ba8;cursor:pointer;" id="upc-close-x">✕</span>';
+    header.innerHTML = '<span>Unified Physics v6</span><span style="font-size:12px;color:#7e8ba8;cursor:pointer;" id="upc-close-x">✕</span>';
     panelEl.appendChild(header);
 
     statsEl = document.createElement("div");
@@ -3756,7 +3859,8 @@
     ]);
     addSlider("Rebuild Every (ticks)", "fieldRebuildInterval", 1, 6, 1);
     addSlider("Gravity Strength", "gravAccel", 0, 0.12, 0.004);
-    addSlider("Compression Heating", "compressionHeatScale", 0, 2.5, 0.1);
+    addSlider("Gas Compression Heating", "compressionHeatScale", 0, 2.5, 0.1);
+    addToggle("Stellar Radiative Cooling", "radiativeCooling");
     addSlider("Max Pixel Speed", "maxSpeed", 0.5, 3.5, 0.1);
     addSlider("Orbital Drag", "starDrag", 0.94, 1.0, 0.002);
 
@@ -3791,7 +3895,7 @@
     zeroVelBtn.onclick = () => {
       for (let i = 0; i < currentPixels.length; i++) {
         const p = currentPixels[i];
-        if (p) { p.vx = 0; p.vy = 0; p.rx = 0; p.ry = 0; }
+        if (p) { p.vx = 0; p.vy = 0; p.rx = 0; p.ry = 0; p.inwardImpulse = 0; }
       }
       movingPixelsLastTick = 0;
       notifyUser("Zeroed velocity on all pixels.");
@@ -3887,7 +3991,7 @@
 
     // 2. Patch vanilla neutron, uranium, plutonium (clearing precompiled tick1/tick2 cleanly)
     if (elements.neutron) {
-      elements.neutron.desc = "Free neutron (enhanced by Unified Physics & Chemistry v5).";
+      elements.neutron.desc = "Free neutron (enhanced by Unified Physics & Chemistry v6).";
       if (!elements.neutron.reactions) elements.neutron.reactions = {};
       delete elements.neutron.tick1;
       delete elements.neutron.tick2;
@@ -3913,10 +4017,11 @@
       };
     }
 
-    // 3. Stellar Fusion Hooks on Vanilla Gases (all inside tick -> crash-proof!)
+    // 3. Stellar Fusion Hooks on Vanilla Gases (compression-scaled & crash-proof!)
     if (elements.hydrogen) {
       wrapTick("hydrogen", function (pixel) {
-        if (UPC_CONFIG.fusionRate > 0 && pixel.temp >= 50000 && Math.random() < 0.16 * UPC_CONFIG.fusionRate) {
+        const fr = getFusionFactor(pixel);
+        if (fr > 0 && pixel.temp >= 50000 && Math.random() < 0.16 * fr) {
           const other = findAdjacentElement(pixel, "hydrogen");
           if (other) {
             safeChange(pixel, "deuterium");
@@ -3931,7 +4036,8 @@
 
     if (elements.helium) {
       wrapTick("helium", function (pixel) {
-        if (UPC_CONFIG.fusionRate > 0 && pixel.temp >= 65000 && Math.random() < 0.15 * UPC_CONFIG.fusionRate) {
+        const fr = getFusionFactor(pixel);
+        if (fr > 0 && pixel.temp >= 65000 && Math.random() < 0.15 * fr) {
           const other = findAdjacentElement(pixel, "helium");
           if (other) {
             safeChange(pixel, "carbon_vapor");
@@ -3946,7 +4052,8 @@
 
     if (elements.oxygen) {
       wrapTick("oxygen", function (pixel) {
-        if (UPC_CONFIG.fusionRate > 0 && pixel.temp >= 95000 && Math.random() < 0.16 * UPC_CONFIG.fusionRate) {
+        const fr = getFusionFactor(pixel);
+        if (fr > 0 && pixel.temp >= 95000 && Math.random() < 0.16 * fr) {
           const other = findAdjacentElement(pixel, "oxygen");
           if (other) {
             if (Math.random() < 0.75) {
@@ -4109,7 +4216,7 @@
       dependOn("betterSettings.js", registerBetterSettingsTab, true);
     }
 
-    console.log("[unified_physics_chem] Loaded v5 successfully!");
+    console.log("[unified_physics_chem] Loaded v6 successfully!");
   }
 
   if (typeof runAfterLoad === "function") {
