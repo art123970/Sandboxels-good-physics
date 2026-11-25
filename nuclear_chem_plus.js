@@ -560,8 +560,32 @@
     meltTemp: -254.4,
     density: 0.18,
     desc: "Hydrogen-2 (1 proton, 1 neutron). Primary fusion fuel; reacts with oxygen to form heavy water (D2O).",
+    tick: function (pixel) {
+      // D-D Fusion handled in tick to avoid Sandboxels's stale otherInfo double-reactPixels crash
+      if (pixel.temp >= 25000 && Math.random() < 0.35) {
+        for (let i = 0; i < adjacentCoords.length; i++) {
+          const nx = pixel.x + adjacentCoords[i][0];
+          const ny = pixel.y + adjacentCoords[i][1];
+          if (!inSafeBounds(nx, ny)) continue;
+          const other = pixelMap[nx][ny];
+          if (other && !other.del && other.element === "deuterium") {
+            if (Math.random() < 0.5) {
+              safeChange(pixel, "tritium");
+              safeChange(other, "proton");
+            } else {
+              safeChange(pixel, "helium_3");
+              safeChange(other, "fast_neutron");
+            }
+            pixel.temp += 4500;
+            other.temp += 4500;
+            return;
+          }
+        }
+      }
+      doDefaults(pixel);
+    },
     reactions: {
-      // D-T Fusion (lowest ignition threshold: 10,000 C in Sandboxels scale)
+      // D-T Fusion (lowest ignition threshold: 10,000 C)
       tritium: {
         elem1: "helium",
         elem2: "fast_neutron",
@@ -572,23 +596,7 @@
           p2.temp += 9000;
         }
       },
-      // D-D Fusion (25,000 C) -> 50% T + p, 50% He-3 + n
-      deuterium: {
-        tempMin: 25000,
-        chance: 0.35,
-        func: function (p1, p2) {
-          if (Math.random() < 0.5) {
-            changePixel(p1, "tritium");
-            changePixel(p2, "proton");
-          } else {
-            changePixel(p1, "helium_3");
-            changePixel(p2, "fast_neutron");
-          }
-          p1.temp += 4500;
-          p2.temp += 4500;
-        }
-      },
-      // D-He3 Aneutronic Fusion (40,000 C) -> He-4 + p (no neutron radiation!)
+      // D-He3 Aneutronic Fusion (40,000 C) -> He-4 + p
       helium_3: {
         elem1: "helium",
         elem2: "proton",
