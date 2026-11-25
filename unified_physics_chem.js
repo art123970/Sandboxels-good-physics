@@ -1,16 +1,19 @@
 /*
- * Unified Physics & Chemistry v4 (unified_physics_chem.js)
+ * Unified Physics & Chemistry v5 (unified_physics_chem.js)
  * Complete drop-in companion add-on for Sandboxels + chem.js
  *
- * Key Architecture & Fixes:
- *  - External Map-based Chemical Bond Graph (ZERO circular references on Pixel objects; Undo/Save safe)
- *  - Built-in Dark-Mode In-Game Settings Panel ("Physics" button or Shift+P) + localStorage persistence
- *  - Optional automatic betterSettings.js tab registration
- *  - Customizable 2x2 / 4x4 / 6x6 / 8x8 Gravity-Tile & Magnetic-Tile Precomputed Kernel Engine
+ * Key Systems:
+ *  - Cloud-In-Cell (CIC) Multi-Body Gravity-Tile & Magnetic-Tile Precomputed Kernel Engine
+ *    (zero self-force, scale-invariant across 2x2 / 4x4 / 6x6 / 8x8 tile resolutions)
+ *  - State-of-Matter Compression Physics (solids resist compression without melting;
+ *    liquids barely heat; gases heat adiabatically toward Virial equilibrium)
  *  - Deterministic Per-Pixel Velocity, Momentum Collisions & Circular Orbit Launcher
  *  - True N/S Magnetism, Curie Points, Bismuth Diamagnetism, Meissner Levitation & Tokamak Confinement
- *  - Complete Stellar & Reactor Fusion Ladder (D-T through Silicon -> Ni-56 -> Co-56 -> Fe -> Supernova r-process)
- *  - Crash-Proof Neutron-Transport Fission + Distinct Alpha, Beta & Gamma Radiation + Decay Chains
+ *  - Complete Stellar & Reactor Fusion Ladder (D-T through Silicon -> Ni-56 -> Co-56 -> Fe -> Supernova)
+ *  - Crash-Proof Neutron-Transport Fission + Alpha / Beta / Gamma Radiation + Decay Chains
+ *  - External Map-Based Chemical Bond Graph (100% JSON / Undo / Save safe)
+ *  - Recursive tick1/tick2 Sanitizer (prevents supernova stack overflows)
+ *  - Built-In Dark-Mode Settings Panel ("Physics Settings" button or Shift+P) + betterSettings.js sync
  */
 
 (function () {
@@ -20,20 +23,21 @@
   // 1. LIVE CUSTOMIZABLE CONFIGURATION & PERSISTENCE
   // ---------------------------------------------------------------------------
 
-  const STORAGE_KEY = "upc_v4_settings";
+  const STORAGE_KEY = "upc_v5_settings";
 
   const DEFAULT_CONFIG = {
     gravityMethod: "element",     // "element" | "star" | "com" | "wells_only" | "off"
     fieldTileSize: 4,             // 2 | 4 | 6 | 8
     fieldRebuildInterval: 2,      // 1..6 ticks
-    gravAccel: 0.032,             // 0..0.15
+    gravAccel: 0.032,             // 0..0.12
+    compressionHeatScale: 1.0,    // 0..2.5
     magScale: 1.0,                // 0..3.0
     maxSpeed: 2.6,                // 0.5..3.5
-    starDrag: 0.996,              // 0.90..1.00
+    starDrag: 0.996,              // 0.94..1.00
     fusionRate: 1.0,              // 0..3.0
     fissionHeatScale: 1.0,        // 0.2..3.0
-    maxNeutrons: 320,             // 40..800
-    maxBonds: 700,                // 0..2000
+    maxNeutrons: 320,             // 60..800
+    maxBonds: 700,                // 0..1800
     autoBonding: true,
     showBonds: true,
     showFields: false,
@@ -68,7 +72,6 @@
 
   // Active runtime values synced from UPC_CONFIG
   let FIELD_BLOCK = 4;
-  let FIELD_SOFTENING = 0.85;
   let FIELD_REBUILD_INTERVAL = 2;
   let MAX_SPEED = 2.6;
   let GRAV_ACCEL = 0.032;
@@ -81,7 +84,6 @@
   let MAX_BONDS = 700;
   let activeFieldBlock = 0;
 
-  // Live telemetry stats for the Settings HUD
   const UPC_STATS = {
     lastTickMs: 0,
     activeGravTiles: 0,
@@ -95,14 +97,18 @@
     const newBlock = Math.max(2, Math.min(8, parseInt(UPC_CONFIG.fieldTileSize, 10) || 4));
     if (newBlock !== FIELD_BLOCK) {
       FIELD_BLOCK = newBlock;
-      kernelX = null; // Trigger clean kernel/tile reallocation
+      kernelX = null; // Force clean kernel + tile array reallocation
     }
     FIELD_REBUILD_INTERVAL = Math.max(1, Math.min(6, parseInt(UPC_CONFIG.fieldRebuildInterval, 10) || 2));
+
     GRAV_ACCEL = Math.max(0, Math.min(0.25, Number(UPC_CONFIG.gravAccel)));
     if (Number.isNaN(GRAV_ACCEL)) GRAV_ACCEL = DEFAULT_CONFIG.gravAccel;
 
-    const ms = Math.max(0, Math.min(4, Number(UPC_CONFIG.magScale)));
-    const safeMs = Number.isNaN(ms) ? 1.0 : ms;
+    const compScale = Number(UPC_CONFIG.compressionHeatScale);
+    UPC_CONFIG.compressionHeatScale = Number.isNaN(compScale) ? 1.0 : Math.max(0, Math.min(2.5, compScale));
+
+    const ms = Number(UPC_CONFIG.magScale);
+    const safeMs = Number.isNaN(ms) ? 1.0 : Math.max(0, Math.min(4.0, ms));
     MAG_POLE_ACCEL = 0.18 * safeMs;
     MAG_FERRO_ACCEL = 0.55 * safeMs;
     MAG_MEISSNER_ACCEL = 0.72 * safeMs;
@@ -113,8 +119,9 @@
     MAX_NEUTRONS = Math.max(40, Math.min(800, parseInt(UPC_CONFIG.maxNeutrons, 10) || 320));
     MAX_BONDS = Math.max(0, Math.min(2000, parseInt(UPC_CONFIG.maxBonds, 10) || 700));
     UPC_CONFIG.starDrag = Math.max(0.85, Math.min(1.0, Number(UPC_CONFIG.starDrag) || 0.996));
-    UPC_CONFIG.fusionRate = Math.max(0, Math.min(3.0, Number(UPC_CONFIG.fusionRate)));
-    if (Number.isNaN(UPC_CONFIG.fusionRate)) UPC_CONFIG.fusionRate = 1.0;
+
+    const fr = Number(UPC_CONFIG.fusionRate);
+    UPC_CONFIG.fusionRate = Number.isNaN(fr) ? 1.0 : Math.max(0, Math.min(3.0, fr));
     UPC_CONFIG.fissionHeatScale = Math.max(0.2, Math.min(3.0, Number(UPC_CONFIG.fissionHeatScale) || 1.0));
 
     lastFieldTick = -100;
@@ -215,6 +222,16 @@
   function wrapTick(elemName, extraFn) {
     const el = elements[elemName];
     if (!el || el.tool) return;
+    // Hook el.tick1 safely if Sandboxels already compiled tick+behavior
+    if (typeof el.tick1 === "function" && !String(el.tick1).includes("tick1")) {
+      const origTick1 = el.tick1;
+      el.tick1 = function (pixel) {
+        if (!pixel || pixel.del) return;
+        if (extraFn(pixel) === true) return;
+        if (!pixel.del) origTick1(pixel);
+      };
+      return;
+    }
     const prevTick = typeof el.tick === "function" ? el.tick : null;
     el.tick = function (pixel) {
       if (!pixel || pixel.del) return;
@@ -394,11 +411,9 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 3. EXTERNAL-GRAPH CHEMICAL BONDING ENGINE (100% JSON / UNDO / SAVE SAFE!)
+  // 3. EXTERNAL-GRAPH CHEMICAL BONDING ENGINE (100% JSON / UNDO / SAVE SAFE)
   // ---------------------------------------------------------------------------
 
-  // Stored completely OUTSIDE Pixel instances so JSON.stringify() in generateSave/historyLog
-  // never encounters a circular reference.
   const bondGraph = new Map(); // Map<Pixel, Array<{ target: Pixel, type: string, breakTemp: number }>>
   let totalBondEdges = 0;
 
@@ -593,23 +608,17 @@
 
           const dist = Math.max(Math.abs(p.x - t.x), Math.abs(p.y - t.y));
 
-          // 1. Mechanical shear
           if (dist > 3) { breakBondBetween(p, t, true); continue; }
-          // 2. Thermal cleavage
           if (p.temp > bond.breakTemp || t.temp > bond.breakTemp) { breakBondBetween(p, t, true); continue; }
-          // 3. Electrolysis / electrical cleavage
           if ((p.charge && p.charge > 0) || (t.charge && t.charge > 0)) {
             if (bond.type === "ionic" || bond.type === "polar" || Math.random() < 0.4) {
               breakBondBetween(p, t, true);
               continue;
             }
           }
-          // 4. Radiolysis
           if (hitRad && Math.random() < 0.35) { breakBondBetween(p, t, true); continue; }
-          // 5. Ionic solvation in water
           if (bond.type === "ionic" && hitWater && Math.random() < 0.18) { breakBondBetween(p, t, true); continue; }
 
-          // Heat conduction & shared velocity across the bond
           const avgT = (p.temp + t.temp) * 0.5;
           p.temp += (avgT - p.temp) * 0.25;
           t.temp += (avgT - t.temp) * 0.25;
@@ -640,7 +649,6 @@
       }
     }
 
-    // Automatic chemical bond formation sampling (respects live UPC_CONFIG.autoBonding)
     if (UPC_CONFIG.autoBonding && totalBondEdges < MAX_BONDS && currentPixels && currentPixels.length > 0) {
       const samples = Math.min(85, currentPixels.length);
       for (let s = 0; s < samples; s++) {
@@ -707,7 +715,7 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 4. UNIFIED GRAVITY-TILE & MAGNETIC-TILE ENGINE + PER-PIXEL VELOCITY
+  // 4. CLOUD-IN-CELL (CIC) GRAVITY + MAGNETIC TILES, STATE-AWARE COMPRESSION & VELOCITY
   // ---------------------------------------------------------------------------
 
   const IRON_FAMILY = new Set(["iron", "molten_iron", "iron_gas"]);
@@ -767,6 +775,10 @@
     "bond_breaker", "bond_catalyst"
   ]);
 
+  // Physical-pixel softening (13.6 px^2 = 0.85 * 4^2), invariant across 2x2..8x8 tiles
+  const FIELD_SOFT_PX2 = 13.6;
+  const SELF_PHI_UNIT = 4 / Math.sqrt(FIELD_SOFT_PX2);
+
   let fieldMw = 0, fieldMh = 0, fieldKw = 0;
   let kernelX = null, kernelY = null, kernelPhi = null;
 
@@ -785,6 +797,11 @@
   let visualizerActive = false;
   let movingPixelsLastTick = 0;
 
+  function getPixelGravMass(elemName) {
+    const dens = elements[elemName]?.density || 100;
+    return Math.min(4.5, Math.max(0.5, Math.pow(dens / 250, 0.45)));
+  }
+
   function isFerromagneticNow(pixel) {
     const curie = FERROMAGNETIC_CURIE[pixel.element];
     if (curie === undefined) return false;
@@ -793,8 +810,9 @@
 
   function ensureFieldTables() {
     if (typeof width !== "number" || typeof height !== "number") return false;
-    const mw = Math.max(2, Math.ceil((width + 1) / FIELD_BLOCK));
-    const mh = Math.max(2, Math.ceil((height + 1) / FIELD_BLOCK));
+    // +1 vertex ring so CIC bilinear deposition & sampling stay in bounds everywhere
+    const mw = Math.max(3, Math.ceil((width + 1) / FIELD_BLOCK) + 1);
+    const mh = Math.max(3, Math.ceil((height + 1) / FIELD_BLOCK) + 1);
     if (mw === fieldMw && mh === fieldMh && FIELD_BLOCK === activeFieldBlock && kernelX) return true;
 
     activeFieldBlock = FIELD_BLOCK;
@@ -808,17 +826,19 @@
     kernelY = new Float32Array(kw * kh);
     kernelPhi = new Float32Array(kw * kh);
 
-    // Precompute unit-source pull vectors & potential once per tile resolution
+    // Precompute scale-invariant antisymmetric physical-pixel kernels
     for (let dy = -(mh - 1); dy <= mh - 1; dy++) {
       const rowOff = (dy + mh - 1) * kw;
+      const dyPx = dy * FIELD_BLOCK;
       for (let dx = -(mw - 1); dx <= mw - 1; dx++) {
         const idx = rowOff + (dx + mw - 1);
-        const r2 = dx * dx + dy * dy + FIELD_SOFTENING;
+        const dxPx = dx * FIELD_BLOCK;
+        const r2 = dxPx * dxPx + dyPx * dyPx + FIELD_SOFT_PX2;
         const invR = 1 / Math.sqrt(r2);
         const invR3 = invR * invR * invR;
-        kernelX[idx] = -dx * invR3;
-        kernelY[idx] = -dy * invR3;
-        kernelPhi[idx] = invR;
+        kernelX[idx] = -16 * dxPx * invR3;
+        kernelY[idx] = -16 * dyPx * invR3;
+        kernelPhi[idx] = 4 * invR;
       }
     }
 
@@ -841,10 +861,30 @@
     return true;
   }
 
+  // Cloud-In-Cell (CIC) bilinear deposition onto the 4 surrounding tile vertices
+  function depositCIC(arr, x, y, val) {
+    const fx = x / FIELD_BLOCK;
+    const fy = y / FIELD_BLOCK;
+    const x0 = Math.max(0, Math.min(fieldMw - 2, Math.floor(fx)));
+    const y0 = Math.max(0, Math.min(fieldMh - 2, Math.floor(fy)));
+    const tx = Math.max(0, Math.min(1, fx - x0));
+    const ty = Math.max(0, Math.min(1, fy - y0));
+    const ix = 1 - tx;
+    const iy = 1 - ty;
+
+    const r0 = y0 * fieldMw + x0;
+    const r1 = r0 + fieldMw;
+    arr[r0]     += val * ix * iy;
+    arr[r0 + 1] += val * tx * iy;
+    arr[r1]     += val * ix * ty;
+    arr[r1 + 1] += val * tx * ty;
+  }
+
+  // Matched CIC bilinear sampling -> identically zero self-force for any pixel
   function sampleField(arr, x, y) {
     if (!arr || fieldMw < 2 || fieldMh < 2) return 0;
-    const fx = x / FIELD_BLOCK - 0.5;
-    const fy = y / FIELD_BLOCK - 0.5;
+    const fx = x / FIELD_BLOCK;
+    const fy = y / FIELD_BLOCK;
     const x0 = Math.max(0, Math.min(fieldMw - 2, Math.floor(fx)));
     const y0 = Math.max(0, Math.min(fieldMh - 2, Math.floor(fy)));
     const tx = Math.max(0, Math.min(1, fx - x0));
@@ -857,28 +897,68 @@
     return top + (bot - top) * ty;
   }
 
-  function sampleFieldMinusSelf(arr, x, y, selfBx, selfBy, selfCoeff, kArr) {
-    if (!arr || !kArr || fieldMw < 2 || fieldMh < 2) return 0;
-    const fx = x / FIELD_BLOCK - 0.5;
-    const fy = y / FIELD_BLOCK - 0.5;
-    const x0 = Math.max(0, Math.min(fieldMw - 2, Math.floor(fx)));
-    const y0 = Math.max(0, Math.min(fieldMh - 2, Math.floor(fy)));
-    const tx = Math.max(0, Math.min(1, fx - x0));
-    const ty = Math.max(0, Math.min(1, fy - y0));
+  function applyStateAwareCompression(p, gx, gy, phiNet) {
+    const el = elements[p.element];
+    const st = el?.state || "solid";
+    const gMag = Math.hypot(gx, gy);
 
-    const r0 = y0 * fieldMw + x0;
-    const r1 = r0 + fieldMw;
-    const kRow0 = (y0 - selfBy + fieldMh - 1) * fieldKw + (x0 - selfBx + fieldMw - 1);
-    const kRow1 = kRow0 + fieldKw;
+    // Count confining neighbors
+    let surrounded = 0;
+    for (let c = 0; c < adjacentCoords.length; c++) {
+      const cx = p.x + adjacentCoords[c][0];
+      const cy = p.y + adjacentCoords[c][1];
+      if (inSafeBounds(cx, cy) && !isEmpty(cx, cy)) surrounded++;
+    }
 
-    const v00 = arr[r0]     + selfCoeff * kArr[kRow0];
-    const v10 = arr[r0 + 1] + selfCoeff * kArr[kRow0 + 1];
-    const v01 = arr[r1]     + selfCoeff * kArr[kRow1];
-    const v11 = arr[r1 + 1] + selfCoeff * kArr[kRow1 + 1];
+    // Hydrostatic overburden pressure (depends on potential depth, gravity load & density)
+    const dens = el?.density || 1000;
+    const densNorm = Math.min(3.5, Math.max(0.25, Math.sqrt(dens / 1000)));
+    p.pressure = phiNet > 4
+      ? Math.round(phiNet * (0.65 + Math.min(2.5, gMag * 0.08)) * (surrounded / 8) * densNorm * 1.4)
+      : 0;
 
-    const top = v00 + (v10 - v00) * tx;
-    const bot = v01 + (v11 - v01) * tx;
-    return top + (bot - top) * ty;
+    if (surrounded < 5) return;
+
+    const heatScale = UPC_CONFIG.compressionHeatScale;
+
+    if (st === "solid") {
+      // High-pressure graphite -> diamond synthesis (requires real pressure + heat)
+      if (p.element === "graphite" && p.pressure > 220 && p.temp >= 1200 && elements.diamond) {
+        safeChange(p, "diamond");
+        return;
+      }
+      // Static solids are virtually incompressible -> ZERO static gravitational heating!
+      // Only tiny plastic/tidal strain heating when actively moving under extreme compact-object gravity.
+      if (heatScale > 0 && phiNet > 320 && gMag > 25) {
+        const spd = Math.hypot(p.vx || 0, p.vy || 0);
+        if (spd > 0.35) {
+          const hardness = el?.hardness !== undefined ? el.hardness : 0.7;
+          const meltCap = el?.tempHigh ? el.tempHigh * 0.65 : 600;
+          if (p.temp < meltCap) {
+            p.temp += Math.min(meltCap - p.temp, (1 - hardness * 0.85) * spd * 1.5 * heatScale);
+          }
+        }
+      }
+    } else if (st === "liquid") {
+      // Liquids are nearly incompressible -> mild deep-core warming only, capped below boiling
+      if (heatScale > 0 && phiNet > 70 && surrounded >= 6) {
+        const boilCap = el?.tempHigh ? Math.min(el.tempHigh * 0.75, 450) : 250;
+        const targetLiq = Math.min(boilCap, 20 + (phiNet - 70) * 0.35 * heatScale);
+        if (p.temp < targetLiq) {
+          p.temp += Math.min(targetLiq - p.temp, (targetLiq - p.temp) * 0.015);
+        }
+      }
+    } else {
+      // Gases & Plasma are highly compressible -> adiabatic Virial heating!
+      // Small clouds stay warm; medium clouds ignite D-T; massive clouds ignite full stellar fusion.
+      if (heatScale > 0 && phiNet > 36) {
+        const loadFactor = Math.min(2.2, 0.8 + gMag * 0.05);
+        const targetGas = Math.min(180000, Math.pow(phiNet - 35, 2.15) * 2.1 * heatScale * loadFactor);
+        if (p.temp < targetGas) {
+          p.temp += Math.min(targetGas - p.temp, (targetGas - p.temp) * 0.035 + 6 * heatScale);
+        }
+      }
+    }
   }
 
   function triggerSupernova(cx, cy, formBlackHole = false) {
@@ -957,7 +1037,7 @@
     let hasMagnets = false;
     let hasVisualizer = false;
 
-    // Pass 1: Sum mass & magnetic pole strength into each tile
+    // Pass 1: CIC-deposit mass & magnetic pole charge onto tile vertices
     for (let i = 0; i < currentPixels.length; i++) {
       const p = currentPixels[i];
       if (!p || p.del) continue;
@@ -966,41 +1046,38 @@
       if (e === "star_gravity") { hasStarGravity = true; continue; }
       if (e === "field_visualizer") { hasVisualizer = true; continue; }
 
-      const bx = (p.x / FIELD_BLOCK) | 0;
-      const by = (p.y / FIELD_BLOCK) | 0;
-      if (bx < 0 || bx >= fieldMw || by < 0 || by >= fieldMh) continue;
-      const bIdx = by * fieldMw + bx;
-
       const magStr = MAGNET_STRENGTH[e];
       if (magStr !== undefined) {
         const isElectro = e === "electromagnet_north" || e === "electromagnet_south";
         if (!isElectro || (p.charge && p.charge > 0)) {
-          macroPole[bIdx] += magStr;
-          macroMagAbs[bIdx] += Math.abs(magStr);
+          depositCIC(macroPole, p.x, p.y, magStr);
+          depositCIC(macroMagAbs, p.x, p.y, Math.abs(magStr));
           hasMagnets = true;
         }
       }
 
       if (e === "gravity_well") {
         hasPointWell = true;
-        macroMass[bIdx] += 48;
+        depositCIC(macroMass, p.x, p.y, 48);
       } else if (e === "neutronium") {
         hasPointWell = true;
-        macroMass[bIdx] += 105;
+        depositCIC(macroMass, p.x, p.y, 105);
       } else if (e === "black_hole_core") {
         hasPointWell = true;
-        macroMass[bIdx] += 210;
+        depositCIC(macroMass, p.x, p.y, 210);
       } else if (!isImmobileElement(e)) {
-        const dens = elements[e]?.density || 100;
-        macroMass[bIdx] += Math.min(12, Math.max(0.35, dens / 1000));
+        depositCIC(macroMass, p.x, p.y, getPixelGravMass(e));
         if (IRON_FAMILY.has(e)) {
+          const bx = Math.min(fieldMw - 1, Math.max(0, Math.round(p.x / FIELD_BLOCK)));
+          const by = Math.min(fieldMh - 1, Math.max(0, Math.round(p.y / FIELD_BLOCK)));
+          const bIdx = by * fieldMw + bx;
           macroIron[bIdx]++;
           if (p.temp > 85000) macroHotIron[bIdx]++;
         }
       }
     }
 
-    // Apply user-selected Gravity Method
+    // Apply selected Gravity Method
     const mode = UPC_CONFIG.gravityMethod;
     if (mode === "off") {
       hasStarGravity = false;
@@ -1040,11 +1117,7 @@
         if (!p || p.del) continue;
         const e = p.element;
         if (e !== "gravity_well" && e !== "neutronium" && e !== "black_hole_core") continue;
-        const bx = (p.x / FIELD_BLOCK) | 0;
-        const by = (p.y / FIELD_BLOCK) | 0;
-        if (bx >= 0 && bx < fieldMw && by >= 0 && by < fieldMh) {
-          macroMass[by * fieldMw + bx] += e === "black_hole_core" ? 210 : (e === "neutronium" ? 105 : 48);
-        }
+        depositCIC(macroMass, p.x, p.y, e === "black_hole_core" ? 210 : (e === "neutronium" ? 105 : 48));
       }
     }
 
@@ -1052,24 +1125,21 @@
     UPC_STATS.activeMagTiles = 0;
     if (!gravFieldActive && !magFieldActive) return;
 
-    // Normalize pull strength when tile resolution changes so gravity feels consistent at 2x2..8x8
-    const tileScale = (FIELD_BLOCK * FIELD_BLOCK) / 16;
-
-    // Pass 2: Convolve non-empty tiles with precomputed lookup kernels
+    // Pass 2: Convolve non-empty tile vertices with precomputed physical-pixel kernels
     const mw = fieldMw, mh = fieldMh, kw = fieldKw;
     for (let sy = 0; sy < mh; sy++) {
       const sRow = sy * mw;
       for (let sx = 0; sx < mw; sx++) {
         const sIdx = sRow + sx;
-        const m = gravFieldActive ? macroMass[sIdx] * tileScale : 0;
-        const q = magFieldActive ? macroPole[sIdx] * tileScale : 0;
-        const qAbs = magFieldActive ? macroMagAbs[sIdx] * tileScale : 0;
-        if (m > 0) UPC_STATS.activeGravTiles++;
-        if (qAbs > 0) UPC_STATS.activeMagTiles++;
-        if (m <= 0 && q === 0 && qAbs <= 0) continue;
+        const m = gravFieldActive ? macroMass[sIdx] : 0;
+        const q = magFieldActive ? macroPole[sIdx] : 0;
+        const qAbs = magFieldActive ? macroMagAbs[sIdx] : 0;
+        if (m > 0.001) UPC_STATS.activeGravTiles++;
+        if (qAbs > 0.001) UPC_STATS.activeMagTiles++;
+        if (m <= 0.001 && Math.abs(q) <= 0.001 && qAbs <= 0.001) continue;
 
         const kxBase = mw - 1 - sx;
-        if (m > 0 && qAbs > 0) {
+        if (m > 0.001 && qAbs > 0.001) {
           for (let ty = 0; ty < mh; ty++) {
             let gIdx = ty * mw;
             let kIdx = (ty - sy + mh - 1) * kw + kxBase;
@@ -1083,7 +1153,7 @@
               macroMagPot[gIdx] += qAbs * kp;
             }
           }
-        } else if (m > 0) {
+        } else if (m > 0.001) {
           for (let ty = 0; ty < mh; ty++) {
             let gIdx = ty * mw;
             let kIdx = (ty - sy + mh - 1) * kw + kxBase;
@@ -1107,12 +1177,13 @@
       }
     }
 
-    // Pass 2b: |B| and gradient for ferromagnets, Meissner & plasma confinement
+    // Pass 2b: Scale-invariant |B| and gradient for ferromagnets, Meissner & plasma confinement
     if (magFieldActive) {
       const total = mw * mh;
       for (let i = 0; i < total; i++) {
         macroBmag[i] = Math.hypot(macroBx[i], macroBy[i]) + 0.25 * macroMagPot[i];
       }
+      const gradScale = 2 / FIELD_BLOCK; // Normalized to 4px reference grid
       for (let by = 0; by < mh; by++) {
         const row = by * mw;
         const yPrev = by > 0 ? (by - 1) * mw : row;
@@ -1121,13 +1192,13 @@
           const idx = row + bx;
           const xPrev = bx > 0 ? bx - 1 : bx;
           const xNext = bx < mw - 1 ? bx + 1 : bx;
-          macroGradBx[idx] = (macroBmag[row + xNext] - macroBmag[row + xPrev]) * 0.5;
-          macroGradBy[idx] = (macroBmag[yNext + bx] - macroBmag[yPrev + bx]) * 0.5;
+          macroGradBx[idx] = (macroBmag[row + xNext] - macroBmag[row + xPrev]) * gradScale;
+          macroGradBy[idx] = (macroBmag[yNext + bx] - macroBmag[yPrev + bx]) * gradScale;
         }
       }
     }
 
-    // Pass 2c: Local iron-core collapse check (Supernova / Hypernova)
+    // Pass 2c: Local hot iron-core collapse check (Supernova / Hypernova)
     if (gravFieldActive && UPC_CONFIG.supernovaEnabled) {
       for (let by = 1; by < mh - 1; by++) {
         for (let bx = 1; bx < mw - 1; bx++) {
@@ -1141,9 +1212,10 @@
               hotSum += macroHotIron[nIdx];
             }
           }
-          if ((ironSum >= 18 && hotSum >= 8) || (ironSum >= 28 && macroPhi[idx] > 40)) {
-            const makeBlackHole = ironSum >= 45 || macroPhi[idx] > 140;
-            triggerSupernova(bx * FIELD_BLOCK + (FIELD_BLOCK >> 1), by * FIELD_BLOCK + (FIELD_BLOCK >> 1), makeBlackHole);
+          // Requires genuinely hot stellar iron core (cold solid iron planets never explode!)
+          if (ironSum >= 18 && hotSum >= 10 && macroPhi[idx] > 45) {
+            const makeBlackHole = hotSum >= 36 || macroPhi[idx] > 180;
+            triggerSupernova(bx * FIELD_BLOCK, by * FIELD_BLOCK, makeBlackHole);
             return;
           }
         }
@@ -1217,11 +1289,12 @@
           continue;
         }
 
+        // Momentum-conserving inelastic impact + kinetic shock heating on fast impacts
         const totalM = pDens + tDens;
         const tvx = target.vx || 0, tvy = target.vy || 0;
         const relSpd = Math.hypot(p.vx - tvx, p.vy - tvy);
-        if (relSpd > 1.2) {
-          const heat = Math.round(relSpd * 35);
+        if (relSpd > 1.35) {
+          const heat = Math.round((relSpd - 1.1) * 42);
           p.temp += heat;
           target.temp += heat;
         }
@@ -1256,8 +1329,7 @@
       return;
     }
 
-    const tileScale = (FIELD_BLOCK * FIELD_BLOCK) / 16;
-    const subtractSelfGrav = starModeActive && UPC_CONFIG.gravityMethod !== "com";
+    const doCompressionThisTick = gravFieldActive && ((t & 1) === 0);
     let movingNow = 0;
 
     for (let i = 0; i < currentPixels.length; i++) {
@@ -1267,55 +1339,30 @@
 
       let ax = 0;
       let ay = 0;
-      const selfBx = (p.x / FIELD_BLOCK) | 0;
-      const selfBy = (p.y / FIELD_BLOCK) | 0;
 
-      // 1. Multi-Body Gravity + Adiabatic Compression Heating
+      // 1. Multi-Body CIC Gravity (identically zero self-force) + State-Aware Compression
       if (gravFieldActive) {
-        const selfM = subtractSelfGrav
-          ? Math.min(12, Math.max(0.35, (elements[p.element]?.density || 100) / 1000)) * tileScale
-          : 0;
-        const gx = selfM > 0
-          ? sampleFieldMinusSelf(macroGx, p.x, p.y, selfBx, selfBy, -selfM, kernelX)
-          : sampleField(macroGx, p.x, p.y);
-        const gy = selfM > 0
-          ? sampleFieldMinusSelf(macroGy, p.x, p.y, selfBx, selfBy, -selfM, kernelY)
-          : sampleField(macroGy, p.x, p.y);
+        const gx = sampleField(macroGx, p.x, p.y);
+        const gy = sampleField(macroGy, p.x, p.y);
 
         const radPressure = p.temp > 45000 ? Math.min(0.65, (p.temp - 45000) / 140000) : 0;
         const gScale = GRAV_ACCEL * (1 - radPressure);
         ax += gx * gScale;
         ay += gy * gScale;
 
-        if ((t & 1) === 0) {
-          const phi = sampleField(macroPhi, p.x, p.y);
-          if (phi > 12) {
-            let surrounded = 0;
-            for (let c = 0; c < adjacentCoords.length; c++) {
-              const cx = p.x + adjacentCoords[c][0];
-              const cy = p.y + adjacentCoords[c][1];
-              if (inSafeBounds(cx, cy) && !isEmpty(cx, cy)) surrounded++;
-            }
-            p.pressure = Math.round(phi * surrounded * 0.65);
-            if (surrounded >= 5) {
-              p.temp += phi * surrounded * 0.38;
-              if (p.element === "graphite" && p.pressure > 260 && p.temp > 1500 && elements.diamond) {
-                safeChange(p, "diamond");
-              }
-            }
-          }
+        if (doCompressionThisTick) {
+          const selfM = starModeActive ? getPixelGravMass(p.element) : 0;
+          const phiNet = Math.max(0, sampleField(macroPhi, p.x, p.y) - selfM * SELF_PHI_UNIT);
+          applyStateAwareCompression(p, gx, gy, phiNet);
         }
       }
 
-      // 2. Unified Magnetic Field
+      // 2. Unified CIC Magnetic Field (identically zero self-force)
       if (magFieldActive) {
         const poleSign = MAGNET_POLE_MAP[p.element];
         if (poleSign !== undefined) {
-          const selfQ = (MAGNET_STRENGTH[p.element] || 0) * tileScale;
-          const bxVal = sampleFieldMinusSelf(macroBx, p.x, p.y, selfBx, selfBy, selfQ, kernelX);
-          const byVal = sampleFieldMinusSelf(macroBy, p.x, p.y, selfBx, selfBy, selfQ, kernelY);
-          ax += poleSign * bxVal * MAG_POLE_ACCEL;
-          ay += poleSign * byVal * MAG_POLE_ACCEL;
+          ax += poleSign * sampleField(macroBx, p.x, p.y) * MAG_POLE_ACCEL;
+          ay += poleSign * sampleField(macroBy, p.x, p.y) * MAG_POLE_ACCEL;
         } else if (isFerromagneticNow(p)) {
           ax += sampleField(macroGradBx, p.x, p.y) * MAG_FERRO_ACCEL;
           ay += sampleField(macroGradBy, p.x, p.y) * MAG_FERRO_ACCEL;
@@ -1371,11 +1418,11 @@
     ctx.lineWidth = Math.max(1, pixelSize * 0.22);
 
     const stepPx = FIELD_BLOCK * pixelSize;
-    for (let by = 0; by < fieldMh; by++) {
-      for (let bx = 0; bx < fieldMw; bx++) {
+    for (let by = 0; by < fieldMh - 1; by++) {
+      for (let bx = 0; bx < fieldMw - 1; bx++) {
         const idx = by * fieldMw + bx;
-        const cx = (bx + 0.5) * stepPx;
-        const cy = (by + 0.5) * stepPx;
+        const cx = bx * stepPx;
+        const cy = by * stepPx;
 
         if (magFieldActive) {
           const bvx = macroBx[idx], bvy = macroBy[idx];
@@ -1450,15 +1497,15 @@
   }
 
   const FISSILE_SPECS = {
-    uranium_235:         { thermalProb: 0.78, fastProb: 0.08, neutrons: [2, 3], heat: 2400, daughters: ["barium_141", "krypton_92", "xenon_135", "strontium_90"] },
-    molten_uranium_235:  { thermalProb: 0.72, fastProb: 0.07, neutrons: [2, 3], heat: 2400, daughters: ["barium_141", "krypton_92", "xenon_135", "strontium_90"] },
-    plutonium_239:       { thermalProb: 0.82, fastProb: 0.24, neutrons: [2, 3], heat: 2700, daughters: ["barium_141", "xenon_135", "strontium_90", "cesium_135"] },
-    molten_plutonium_239:{ thermalProb: 0.78, fastProb: 0.22, neutrons: [2, 3], heat: 2700, daughters: ["barium_141", "xenon_135", "strontium_90", "cesium_135"] },
-    uranium_233:         { thermalProb: 0.80, fastProb: 0.14, neutrons: [2, 3], heat: 2300, daughters: ["barium_141", "krypton_92", "strontium_90"] },
-    molten_uranium_233:  { thermalProb: 0.75, fastProb: 0.12, neutrons: [2, 3], heat: 2300, daughters: ["barium_141", "krypton_92", "strontium_90"] },
-    uranium:             { thermalProb: 0.35, fastProb: 0.03, neutrons: [2, 2], heat: 1600, daughters: ["barium_141", "krypton_92", "xenon_135"] },
-    plutonium:           { thermalProb: 0.82, fastProb: 0.24, neutrons: [2, 3], heat: 2700, daughters: ["barium_141", "xenon_135", "strontium_90"] },
-    enriched_uranium:    { thermalProb: 0.76, fastProb: 0.08, neutrons: [2, 3], heat: 2400, daughters: ["barium_141", "krypton_92", "xenon_135", "strontium_90"] }
+    uranium_235:          { thermalProb: 0.78, fastProb: 0.08, neutrons: [2, 3], heat: 2400, daughters: ["barium_141", "krypton_92", "xenon_135", "strontium_90"] },
+    molten_uranium_235:   { thermalProb: 0.72, fastProb: 0.07, neutrons: [2, 3], heat: 2400, daughters: ["barium_141", "krypton_92", "xenon_135", "strontium_90"] },
+    plutonium_239:        { thermalProb: 0.82, fastProb: 0.24, neutrons: [2, 3], heat: 2700, daughters: ["barium_141", "xenon_135", "strontium_90", "cesium_135"] },
+    molten_plutonium_239: { thermalProb: 0.78, fastProb: 0.22, neutrons: [2, 3], heat: 2700, daughters: ["barium_141", "xenon_135", "strontium_90", "cesium_135"] },
+    uranium_233:          { thermalProb: 0.80, fastProb: 0.14, neutrons: [2, 3], heat: 2300, daughters: ["barium_141", "krypton_92", "strontium_90"] },
+    molten_uranium_233:   { thermalProb: 0.75, fastProb: 0.12, neutrons: [2, 3], heat: 2300, daughters: ["barium_141", "krypton_92", "strontium_90"] },
+    uranium:              { thermalProb: 0.35, fastProb: 0.03, neutrons: [2, 2], heat: 1600, daughters: ["barium_141", "krypton_92", "xenon_135"] },
+    plutonium:            { thermalProb: 0.82, fastProb: 0.24, neutrons: [2, 3], heat: 2700, daughters: ["barium_141", "xenon_135", "strontium_90"] },
+    enriched_uranium:     { thermalProb: 0.76, fastProb: 0.08, neutrons: [2, 3], heat: 2400, daughters: ["barium_141", "krypton_92", "xenon_135", "strontium_90"] }
   };
 
   function spawnParticle(cx, cy, elemName, count = 1) {
@@ -1836,7 +1883,7 @@
   registerOrEnhance("orbit_launch", {
     color: ["#ffcf40", "#ffe082"],
     category: "tools",
-    desc: "Brush over moons, planets, or gas clouds to give exact circular orbital velocity perpendicular to local gravity!",
+    desc: "Brush over moons, planets, or clouds to give exact circular orbital velocity perpendicular to local gravity!",
     tool: function (pixel) {
       if (!pixel || pixel.del || isImmobileElement(pixel.element) || VELOCITY_EXEMPT.has(pixel.element)) return;
       if (!gravFieldActive) rebuildFields();
@@ -1845,8 +1892,10 @@
       const gy = sampleField(macroGy, pixel.x, pixel.y);
       const gMag = Math.hypot(gx, gy);
       if (gMag < 0.01) return;
-      const phi = Math.max(0, sampleField(macroPhi, pixel.x, pixel.y));
-      const vCirc = Math.min(MAX_SPEED * 0.92, Math.sqrt(phi * GRAV_ACCEL * FIELD_BLOCK));
+      const selfM = starModeActive ? getPixelGravMass(pixel.element) : 0;
+      const phiNet = Math.max(0, sampleField(macroPhi, pixel.x, pixel.y) - selfM * SELF_PHI_UNIT);
+      // Scale-invariant circular velocity: v = sqrt(4 * Phi_net * GRAV_ACCEL)
+      const vCirc = Math.min(MAX_SPEED * 0.92, Math.sqrt(4 * phiNet * GRAV_ACCEL));
       pixel.vx = (-gy / gMag) * vCirc;
       pixel.vy = (gx / gMag) * vCirc;
       movingPixelsLastTick = Math.max(movingPixelsLastTick, 1);
@@ -1878,12 +1927,13 @@
   registerOrEnhance("compress_tool", {
     color: ["#ab47bc", "#ce93d8"],
     category: "tools",
-    desc: "Shock Compressor: applies extreme pressure & adiabatic heat (ignites fusion or presses hot graphite into diamond!).",
+    desc: "Shock Compressor: applies extreme pressure & state-aware adiabatic heat (ignites fusion or presses hot graphite into diamond!).",
     tool: function (pixel) {
       if (!pixel || pixel.del) return;
       pixel.pressure = (pixel.pressure || 0) + 400;
-      pixel.temp += 1400;
-      if (pixel.element === "graphite" && pixel.temp >= 1500 && elements.diamond) {
+      const st = elements[pixel.element]?.state;
+      pixel.temp += st === "gas" ? 1600 : (st === "liquid" ? 180 : 90);
+      if (pixel.element === "graphite" && pixel.temp >= 1200 && elements.diamond) {
         safeChange(pixel, "diamond");
       }
     }
@@ -1950,12 +2000,13 @@
   registerOrEnhance("inspect_tool", {
     color: ["#26c6da", "#80deea"],
     category: "tools",
-    desc: "Physics Telemetry Inspector: click any pixel to print temp, velocity, pressure, g-field, B-field, and active chemical bonds.",
+    desc: "Physics Telemetry Inspector: click any pixel to print state, temp, velocity, pressure, g-field, B-field, and active chemical bonds.",
     tool: function (pixel) {
       if (!pixel || pixel.del) return;
       const now = Date.now();
       if (now - lastInspectTime < 250) return;
       lastInspectTime = now;
+      const st = elements[pixel.element]?.state || "?";
       const vx = (pixel.vx || 0).toFixed(2);
       const vy = (pixel.vy || 0).toFixed(2);
       const g = gravFieldActive ? Math.hypot(sampleField(macroGx, pixel.x, pixel.y), sampleField(macroGy, pixel.x, pixel.y)).toFixed(2) : "0";
@@ -1964,7 +2015,7 @@
       const bondList = pBonds && pBonds.length
         ? pBonds.map(x => x.target.element + "(" + x.type + ")").join(", ")
         : "none";
-      notifyUser(`${pixel.element} | ${Math.round(pixel.temp)}C | v=(${vx},${vy}) | P=${pixel.pressure || 0} | g=${g} | B=${b} | bonds: ${bondList}`);
+      notifyUser(`${pixel.element}[${st}] | ${Math.round(pixel.temp)}C | v=(${vx},${vy}) | P=${pixel.pressure || 0} | g=${g} | B=${b} | bonds: ${bondList}`);
     }
   });
 
@@ -1979,7 +2030,7 @@
     state: "solid",
     density: 99999,
     hardness: 1,
-    desc: "Enables global multi-body Gravity-Tile self-gravity (in Element-Based mode). Enables binary stars, orbits, core fusion, and supernovae."
+    desc: "Enables global multi-body CIC Gravity-Tile self-gravity (in Element-Based mode). Enables binary stars, solid planets, orbits, core fusion, and supernovae."
   });
 
   registerOrEnhance("gravity_well", {
@@ -2169,6 +2220,7 @@
     category: "magnets",
     state: "solid",
     density: 7400,
+    hardness: 0.75,
     tempHigh: 770,
     stateHigh: "iron_filings",
     desc: "Movable North-pole magnetic bead."
@@ -2180,6 +2232,7 @@
     category: "magnets",
     state: "solid",
     density: 7400,
+    hardness: 0.75,
     tempHigh: 770,
     stateHigh: "iron_filings",
     desc: "Movable South-pole magnetic bead."
@@ -2192,6 +2245,7 @@
     state: "solid",
     density: 7870,
     conduct: 0.7,
+    hardness: 0.72,
     tempHigh: 1538,
     stateHigh: "molten_iron",
     desc: "Ferromagnetic iron powder. Pulled along grad|B| toward both poles below 770 C."
@@ -3378,6 +3432,7 @@
         fieldTileSize: 4,
         fieldRebuildInterval: 2,
         gravAccel: 0.042,
+        compressionHeatScale: 1.2,
         starDrag: 0.998,
         fusionRate: 1.5,
         supernovaEnabled: true,
@@ -3423,7 +3478,7 @@
       #upc-settings-btn:hover { background: #232838; border-color: #66b2ff; }
       #upc-settings-panel {
         position: fixed; top: 44px; right: 12px; z-index: 99999;
-        width: 325px; max-height: calc(100vh - 64px); overflow-y: auto;
+        width: 330px; max-height: calc(100vh - 64px); overflow-y: auto;
         background: rgba(18, 20, 27, 0.96); color: #e2e8f5;
         border: 1px solid #343d54; border-radius: 9px; padding: 12px 14px;
         font: 12px/1.4 system-ui, -apple-system, sans-serif;
@@ -3460,7 +3515,7 @@
       #upc-stats-bar {
         background: #11131a; border: 1px solid #272e40; border-radius: 5px;
         padding: 6px 8px; font: 11px/1.45 ui-monospace, Consolas, monospace; color: #9ad1b8;
-        margin-bottom: 6px;
+        margin-bottom: 6px; white-space: pre-line;
       }
     `;
     document.head.appendChild(style);
@@ -3474,21 +3529,19 @@
     panelEl = document.createElement("div");
     panelEl.id = "upc-settings-panel";
 
-    // Prevent clicks/keys inside panel from painting on canvas or triggering game hotkeys
     ["mousedown", "mouseup", "click", "wheel", "keydown", "keyup", "touchstart"].forEach(ev => {
       panelEl.addEventListener(ev, e => e.stopPropagation());
     });
 
     const header = document.createElement("h3");
-    header.innerHTML = '<span>Unified Physics v4</span><span style="font-size:11px;color:#7e8ba8;cursor:pointer;" id="upc-close-x">✕</span>';
+    header.innerHTML = '<span>Unified Physics v5</span><span style="font-size:12px;color:#7e8ba8;cursor:pointer;" id="upc-close-x">✕</span>';
     panelEl.appendChild(header);
 
     statsEl = document.createElement("div");
     statsEl.id = "upc-stats-bar";
-    statsEl.textContent = "Tick: 0.00 ms | Bonds: 0 | Neutrons: 0";
+    statsEl.textContent = "Tick: 0.00 ms | Moving: 0\nTiles G:0 B:0 | Bonds:0 | n:0";
     panelEl.appendChild(statsEl);
 
-    // Quick Presets
     const presetRow = document.createElement("div");
     presetRow.className = "upc-presets";
     [
@@ -3581,10 +3634,10 @@
       panelEl.appendChild(row);
     }
 
-    addSection("Gravity & Tile Engine");
+    addSection("Gravity & CIC Tile Engine");
     addSelect("Gravity Method", "gravityMethod", [
       ["element", "Element-Based (star_gravity / wells)"],
-      ["star", "Multi-Body Tiles (Always On)"],
+      ["star", "Multi-Body CIC Tiles (Always On)"],
       ["com", "Fast Single Center-of-Mass"],
       ["wells_only", "Gravity Wells / Cores Only"],
       ["off", "Off (Vanilla Only)"]
@@ -3597,6 +3650,7 @@
     ]);
     addSlider("Rebuild Every (ticks)", "fieldRebuildInterval", 1, 6, 1);
     addSlider("Gravity Strength", "gravAccel", 0, 0.12, 0.004);
+    addSlider("Compression Heating", "compressionHeatScale", 0, 2.5, 0.1);
     addSlider("Max Pixel Speed", "maxSpeed", 0.5, 3.5, 0.1);
     addSlider("Orbital Drag", "starDrag", 0.94, 1.0, 0.002);
 
@@ -3618,7 +3672,6 @@
     addToggle("Render Bond Lines", "showBonds");
     addSlider("Max Bond Edges", "maxBonds", 0, 1800, 50);
 
-    // Action buttons
     const actRow = document.createElement("div");
     actRow.className = "upc-presets";
     const clearBondBtn = document.createElement("button");
@@ -3662,7 +3715,6 @@
       }
     });
 
-    // Lightweight 2Hz telemetry refresh only while panel is open
     setInterval(function () {
       if (!panelEl || panelEl.style.display !== "block" || !statsEl) return;
       statsEl.textContent =
@@ -3677,7 +3729,7 @@
       const tab = new SettingsTab("Unified Physics");
       const gravMode = new SelectSetting("Gravity Method", "upc_grav_method", [
         ["element", "Element-Based"],
-        ["star", "Multi-Body Always On"],
+        ["star", "Multi-Body CIC Always On"],
         ["com", "Fast Center-of-Mass"],
         ["wells_only", "Wells/Cores Only"],
         ["off", "Off"]
@@ -3698,19 +3750,17 @@
         bind(new Setting("Show Field Vectors", "upc_show_fields", settingType.BOOLEAN, false, UPC_CONFIG.showFields), "showFields");
       }
       settingsManager.registerTab(tab);
-    } catch (err) {
-      // Built-in Physics Settings panel still works independently
-    }
+    } catch (err) {}
   }
 
   // ---------------------------------------------------------------------------
-  // 12. PATCH VANILLA & CHEM.JS + HOOK GLOBAL ENGINE
+  // 12. PATCH VANILLA & CHEM.JS + RECURSIVE TICK SANITIZER + GLOBAL HOOKS
   // ---------------------------------------------------------------------------
 
   function initUnifiedPhysics() {
     applyUPCConfig(false);
 
-    // 1. Iron gas state for stellar cores
+    // 1. Iron gas state for hot stellar cores
     if (!elements.iron_gas) {
       registerOrEnhance("iron_gas", {
         color: ["#ffb870", "#ffc98f"],
@@ -3729,14 +3779,18 @@
       elements.molten_iron.stateHigh = "iron_gas";
     }
 
-    // 2. Patch vanilla neutron, uranium, plutonium
+    // 2. Patch vanilla neutron, uranium, plutonium (clearing precompiled tick1/tick2 cleanly)
     if (elements.neutron) {
-      elements.neutron.desc = "Free neutron (enhanced by Unified Physics & Chemistry v4).";
+      elements.neutron.desc = "Free neutron (enhanced by Unified Physics & Chemistry v5).";
       if (!elements.neutron.reactions) elements.neutron.reactions = {};
+      delete elements.neutron.tick1;
+      delete elements.neutron.tick2;
       elements.neutron.tick = function (pixel) { neutronTick(pixel, true); };
     }
     if (elements.uranium) {
       elements.uranium.desc = "Natural/Low-Enriched Uranium (patched). Requires moderated thermal neutrons for sustained fission.";
+      delete elements.uranium.tick1;
+      delete elements.uranium.tick2;
       elements.uranium.tick = function (pixel) {
         if (Math.random() < 0.0001) spawnNeutronsAround(pixel.x, pixel.y, 1, "fast_neutron");
         doDefaults(pixel);
@@ -3744,6 +3798,8 @@
     }
     if (elements.plutonium) {
       elements.plutonium.desc = "Plutonium-239 (patched). Self-heats via alpha decay; fissions on thermal & fast neutrons.";
+      delete elements.plutonium.tick1;
+      delete elements.plutonium.tick2;
       elements.plutonium.tick = function (pixel) {
         pixel.temp += 0.05;
         if (Math.random() < 0.0005) spawnNeutronsAround(pixel.x, pixel.y, 1, "fast_neutron");
@@ -3895,20 +3951,49 @@
       window.drawPixels = wrappedDraw;
     }
 
-    // 9. Global safety sweep (preserves tools; strips any non-function tick)
-    for (const key in elements) {
-      const el = elements[key];
-      if (!el || el.tool) continue;
-      if (el.tick !== undefined && typeof el.tick !== "function") {
-        delete el.tick;
+    // 9. Global safety sweep + supernova recursive tick1/tick2 cycle breaker
+    function sanitizeElementTicks() {
+      const fixed = [];
+      for (const key in elements) {
+        const el = elements[key];
+        if (!el || el.tool) continue;
+
+        if (el.tick !== undefined && typeof el.tick !== "function") {
+          delete el.tick;
+        }
+
+        const badTick1 = typeof el.tick1 === "function" &&
+          (el.tick1 === el.tick || String(el.tick1).includes("tick1"));
+        const badTick2 = typeof el.tick2 === "function" &&
+          (el.tick2 === el.tick || String(el.tick2).includes("tick1") || String(el.tick2).includes("tick2"));
+
+        if (badTick1 || badTick2) {
+          fixed.push(key);
+          if (!badTick2 && typeof el.tick2 === "function") {
+            el.tick = el.tick2;
+          } else if (!badTick1 && typeof el.tick1 === "function") {
+            el.tick = el.tick1;
+          } else {
+            delete el.tick;
+          }
+          delete el.tick1;
+          delete el.tick2;
+        }
+
+        if (!el.reactions) el.reactions = {};
+        if (!el.behavior && !el.tick) {
+          el.behavior = el.state === "liquid" ? behaviors.LIQUID
+            : el.state === "gas" ? behaviors.GAS
+            : behaviors.WALL;
+        }
       }
-      if (!el.reactions) el.reactions = {};
-      if (!el.behavior && !el.tick) {
-        el.behavior = el.state === "liquid" ? behaviors.LIQUID
-          : el.state === "gas" ? behaviors.GAS
-          : behaviors.WALL;
+      if (fixed.length > 0) {
+        console.warn("[unified_physics_chem] Broke recursive tick1 loop on:", fixed);
       }
     }
+
+    sanitizeElementTicks();
+    setTimeout(sanitizeElementTicks, 250);
 
     // 10. Mount built-in Settings Panel & optional betterSettings.js tab
     createSettingsUI();
@@ -3918,7 +4003,7 @@
       dependOn("betterSettings.js", registerBetterSettingsTab, true);
     }
 
-    console.log("[unified_physics_chem] Loaded v4 successfully!");
+    console.log("[unified_physics_chem] Loaded v5 successfully!");
   }
 
   if (typeof runAfterLoad === "function") {
