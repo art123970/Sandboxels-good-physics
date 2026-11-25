@@ -1,27 +1,135 @@
 /*
- * Unified Physics & Chemistry v3 (unified_physics_chem.js)
+ * Unified Physics & Chemistry v4 (unified_physics_chem.js)
  * Complete drop-in companion add-on for Sandboxels + chem.js
  *
- * Systems:
- *  1. 4x4 Gravity-Tile & Magnetic-Tile Field Engine (mass-summed tiles + precomputed kernels)
- *  2. Deterministic Per-Pixel Velocity, Momentum Collisions & Exact Circular Orbit Launcher
- *  3. True North/South Magnetism, Curie Demagnetization, Diamagnetism (Bismuth),
- *     Superconductor Meissner Levitation & Lorentz Tokamak Plasma Confinement
- *  4. Complete Stellar & Reactor Fusion Ladder (D-T, D-D, D-He3, He3-He3, p-B11, p-p,
- *     Triple-Alpha, C+He->O, C+C->Ne/Mg, Ne+He->Mg, Mg+He->Si, O+O->Si/S, Si->Ni56->Co56->Fe)
- *  5. Supernova Core Collapse (Neutronium, Black Hole Singularity, r-process heavy elements)
- *  6. Crash-Proof Neutron-Transport Fission + Distinct Alpha, Beta & Gamma Radiation
- *  7. Persistent 2-Pixel Chemical Bonding (visible bond lines + 6 physical break mechanisms)
- *  8. Real-World High/Low-Heat Chemistry (Thermite, Smelting, Diamond Synthesis, Cryogenics)
- *  9. 9 Interactive Physics Tools (Orbit Kick, Kinetic Launch, Brake, Compress, Bond, Cleave,
- *     Magnetize, Neutron Pulse, Telemetry Inspector)
+ * Key Architecture & Fixes:
+ *  - External Map-based Chemical Bond Graph (ZERO circular references on Pixel objects; Undo/Save safe)
+ *  - Built-in Dark-Mode In-Game Settings Panel ("Physics" button or Shift+P) + localStorage persistence
+ *  - Optional automatic betterSettings.js tab registration
+ *  - Customizable 2x2 / 4x4 / 6x6 / 8x8 Gravity-Tile & Magnetic-Tile Precomputed Kernel Engine
+ *  - Deterministic Per-Pixel Velocity, Momentum Collisions & Circular Orbit Launcher
+ *  - True N/S Magnetism, Curie Points, Bismuth Diamagnetism, Meissner Levitation & Tokamak Confinement
+ *  - Complete Stellar & Reactor Fusion Ladder (D-T through Silicon -> Ni-56 -> Co-56 -> Fe -> Supernova r-process)
+ *  - Crash-Proof Neutron-Transport Fission + Distinct Alpha, Beta & Gamma Radiation + Decay Chains
  */
 
 (function () {
   "use strict";
 
   // ---------------------------------------------------------------------------
-  // 1. CORE SAFETY UTILITIES & FULL STATE-CHAIN BUILDERS
+  // 1. LIVE CUSTOMIZABLE CONFIGURATION & PERSISTENCE
+  // ---------------------------------------------------------------------------
+
+  const STORAGE_KEY = "upc_v4_settings";
+
+  const DEFAULT_CONFIG = {
+    gravityMethod: "element",     // "element" | "star" | "com" | "wells_only" | "off"
+    fieldTileSize: 4,             // 2 | 4 | 6 | 8
+    fieldRebuildInterval: 2,      // 1..6 ticks
+    gravAccel: 0.032,             // 0..0.15
+    magScale: 1.0,                // 0..3.0
+    maxSpeed: 2.6,                // 0.5..3.5
+    starDrag: 0.996,              // 0.90..1.00
+    fusionRate: 1.0,              // 0..3.0
+    fissionHeatScale: 1.0,        // 0.2..3.0
+    maxNeutrons: 320,             // 40..800
+    maxBonds: 700,                // 0..2000
+    autoBonding: true,
+    showBonds: true,
+    showFields: false,
+    plasmaConfinement: true,
+    supernovaEnabled: true,
+    curieDemagnetize: true,
+    delayedNeutrons: true
+  };
+
+  const UPC_CONFIG = Object.assign({}, DEFAULT_CONFIG);
+
+  function loadSavedConfig() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      for (const k of Object.keys(DEFAULT_CONFIG)) {
+        if (parsed[k] !== undefined && parsed[k] !== null) {
+          UPC_CONFIG[k] = parsed[k];
+        }
+      }
+    } catch (e) {}
+  }
+
+  function saveConfig() {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(UPC_CONFIG));
+    } catch (e) {}
+  }
+
+  loadSavedConfig();
+
+  // Active runtime values synced from UPC_CONFIG
+  let FIELD_BLOCK = 4;
+  let FIELD_SOFTENING = 0.85;
+  let FIELD_REBUILD_INTERVAL = 2;
+  let MAX_SPEED = 2.6;
+  let GRAV_ACCEL = 0.032;
+  let MAG_POLE_ACCEL = 0.18;
+  let MAG_FERRO_ACCEL = 0.55;
+  let MAG_MEISSNER_ACCEL = 0.72;
+  let MAG_DIAMAG_ACCEL = 0.14;
+  let MAG_PLASMA_ACCEL = 0.45;
+  let MAX_NEUTRONS = 320;
+  let MAX_BONDS = 700;
+  let activeFieldBlock = 0;
+
+  // Live telemetry stats for the Settings HUD
+  const UPC_STATS = {
+    lastTickMs: 0,
+    activeGravTiles: 0,
+    activeMagTiles: 0,
+    movingPixels: 0,
+    activeNeutrons: 0,
+    activeBonds: 0
+  };
+
+  function applyUPCConfig(persist = true) {
+    const newBlock = Math.max(2, Math.min(8, parseInt(UPC_CONFIG.fieldTileSize, 10) || 4));
+    if (newBlock !== FIELD_BLOCK) {
+      FIELD_BLOCK = newBlock;
+      kernelX = null; // Trigger clean kernel/tile reallocation
+    }
+    FIELD_REBUILD_INTERVAL = Math.max(1, Math.min(6, parseInt(UPC_CONFIG.fieldRebuildInterval, 10) || 2));
+    GRAV_ACCEL = Math.max(0, Math.min(0.25, Number(UPC_CONFIG.gravAccel)));
+    if (Number.isNaN(GRAV_ACCEL)) GRAV_ACCEL = DEFAULT_CONFIG.gravAccel;
+
+    const ms = Math.max(0, Math.min(4, Number(UPC_CONFIG.magScale)));
+    const safeMs = Number.isNaN(ms) ? 1.0 : ms;
+    MAG_POLE_ACCEL = 0.18 * safeMs;
+    MAG_FERRO_ACCEL = 0.55 * safeMs;
+    MAG_MEISSNER_ACCEL = 0.72 * safeMs;
+    MAG_DIAMAG_ACCEL = 0.14 * safeMs;
+    MAG_PLASMA_ACCEL = 0.45 * safeMs;
+
+    MAX_SPEED = Math.max(0.5, Math.min(3.5, Number(UPC_CONFIG.maxSpeed) || 2.6));
+    MAX_NEUTRONS = Math.max(40, Math.min(800, parseInt(UPC_CONFIG.maxNeutrons, 10) || 320));
+    MAX_BONDS = Math.max(0, Math.min(2000, parseInt(UPC_CONFIG.maxBonds, 10) || 700));
+    UPC_CONFIG.starDrag = Math.max(0.85, Math.min(1.0, Number(UPC_CONFIG.starDrag) || 0.996));
+    UPC_CONFIG.fusionRate = Math.max(0, Math.min(3.0, Number(UPC_CONFIG.fusionRate)));
+    if (Number.isNaN(UPC_CONFIG.fusionRate)) UPC_CONFIG.fusionRate = 1.0;
+    UPC_CONFIG.fissionHeatScale = Math.max(0.2, Math.min(3.0, Number(UPC_CONFIG.fissionHeatScale) || 1.0));
+
+    lastFieldTick = -100;
+    if (persist) saveConfig();
+    if (typeof syncSettingsUI === "function") syncSettingsUI();
+  }
+
+  if (typeof window !== "undefined") {
+    window.UPC_CONFIG = UPC_CONFIG;
+    window.UPC_STATS = UPC_STATS;
+    window.applyUPCConfig = applyUPCConfig;
+  }
+
+  // ---------------------------------------------------------------------------
+  // 2. CORE SAFETY UTILITIES & FULL STATE-CHAIN BUILDERS
   // ---------------------------------------------------------------------------
 
   const NON_ZERO_DIRS = [
@@ -47,8 +155,7 @@
   }
 
   function safeChange(pixel, elemName) {
-    if (!pixel || pixel.del) return false;
-    if (!elements[elemName]) return false;
+    if (!pixel || pixel.del || !elements[elemName]) return false;
     changePixel(pixel, elemName);
     return true;
   }
@@ -113,11 +220,8 @@
       if (!pixel || pixel.del) return;
       if (extraFn(pixel) === true) return;
       if (pixel.del) return;
-      if (prevTick) {
-        prevTick(pixel);
-      } else {
-        doDefaults(pixel);
-      }
+      if (prevTick) prevTick(pixel);
+      else doDefaults(pixel);
     };
   }
 
@@ -290,11 +394,12 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 2. PERSISTENT 2-PIXEL CHEMICAL BONDING ENGINE
+  // 3. EXTERNAL-GRAPH CHEMICAL BONDING ENGINE (100% JSON / UNDO / SAVE SAFE!)
   // ---------------------------------------------------------------------------
 
-  const MAX_BONDS = 700;
-  const bondedPixels = new Set();
+  // Stored completely OUTSIDE Pixel instances so JSON.stringify() in generateSave/historyLog
+  // never encounters a circular reference.
+  const bondGraph = new Map(); // Map<Pixel, Array<{ target: Pixel, type: string, breakTemp: number }>>
   let totalBondEdges = 0;
 
   const RADIOLYSIS_AGENTS = new Set([
@@ -323,10 +428,20 @@
     return e1 < e2 ? e1 + "|" + e2 : e2 + "|" + e1;
   }
 
+  function getBonds(p) {
+    return bondGraph.get(p) || null;
+  }
+
+  function getBondCount(p) {
+    const arr = bondGraph.get(p);
+    return arr ? arr.length : 0;
+  }
+
   function hasBondBetween(p1, p2) {
-    if (!p1 || !p1.bonds) return false;
-    for (let i = 0; i < p1.bonds.length; i++) {
-      if (p1.bonds[i].target === p2) return true;
+    const arr = bondGraph.get(p1);
+    if (!arr) return false;
+    for (let i = 0; i < arr.length; i++) {
+      if (arr[i].target === p2) return true;
     }
     return false;
   }
@@ -336,14 +451,15 @@
     if (totalBondEdges >= MAX_BONDS) return false;
     if (hasBondBetween(p1, p2)) return false;
 
-    if (!p1.bonds) p1.bonds = [];
-    if (!p2.bonds) p2.bonds = [];
-    if (p1.bonds.length >= 4 || p2.bonds.length >= 4) return false;
+    let b1 = bondGraph.get(p1);
+    let b2 = bondGraph.get(p2);
+    if ((b1 && b1.length >= 4) || (b2 && b2.length >= 4)) return false;
 
-    p1.bonds.push({ target: p2, type, breakTemp });
-    p2.bonds.push({ target: p1, type, breakTemp });
-    bondedPixels.add(p1);
-    bondedPixels.add(p2);
+    if (!b1) { b1 = []; bondGraph.set(p1, b1); }
+    if (!b2) { b2 = []; bondGraph.set(p2, b2); }
+
+    b1.push({ target: p2, type, breakTemp });
+    b2.push({ target: p1, type, breakTemp });
     totalBondEdges++;
 
     p1.temp += 18;
@@ -353,23 +469,25 @@
 
   function breakBondBetween(p1, p2, endothermic = true) {
     let removed = false;
-    if (p1 && p1.bonds) {
-      for (let i = p1.bonds.length - 1; i >= 0; i--) {
-        if (p1.bonds[i].target === p2) {
-          p1.bonds.splice(i, 1);
+    const b1 = bondGraph.get(p1);
+    if (b1) {
+      for (let i = b1.length - 1; i >= 0; i--) {
+        if (b1[i].target === p2) {
+          b1.splice(i, 1);
           removed = true;
         }
       }
-      if (p1.bonds.length === 0) bondedPixels.delete(p1);
+      if (b1.length === 0) bondGraph.delete(p1);
     }
-    if (p2 && p2.bonds) {
-      for (let i = p2.bonds.length - 1; i >= 0; i--) {
-        if (p2.bonds[i].target === p1) {
-          p2.bonds.splice(i, 1);
+    const b2 = bondGraph.get(p2);
+    if (b2) {
+      for (let i = b2.length - 1; i >= 0; i--) {
+        if (b2[i].target === p1) {
+          b2.splice(i, 1);
           removed = true;
         }
       }
-      if (p2.bonds.length === 0) bondedPixels.delete(p2);
+      if (b2.length === 0) bondGraph.delete(p2);
     }
     if (removed) {
       totalBondEdges = Math.max(0, totalBondEdges - 1);
@@ -381,11 +499,17 @@
   }
 
   function breakAllBonds(pixel) {
-    if (!pixel || !pixel.bonds) return;
-    const copy = pixel.bonds.slice();
+    const arr = bondGraph.get(pixel);
+    if (!arr) return;
+    const copy = arr.slice();
     for (let i = 0; i < copy.length; i++) {
       breakBondBetween(pixel, copy[i].target, false);
     }
+  }
+
+  function clearAllBonds() {
+    bondGraph.clear();
+    totalBondEdges = 0;
   }
 
   const IMMOBILE_SPECIAL = new Set([
@@ -428,13 +552,14 @@
   }
 
   function updateBondsTick() {
-    if (bondedPixels.size > 0) {
-      const toVisit = Array.from(bondedPixels);
+    if (bondGraph.size > 0) {
+      const toVisit = Array.from(bondGraph.keys());
       for (let i = 0; i < toVisit.length; i++) {
         const p = toVisit[i];
-        if (!p || p.del || !inSafeBounds(p.x, p.y) || pixelMap[p.x][p.y] !== p || !p.bonds || p.bonds.length === 0) {
+        const pBonds = bondGraph.get(p);
+        if (!p || p.del || !pBonds || pBonds.length === 0 || !inSafeBounds(p.x, p.y) || pixelMap[p.x][p.y] !== p) {
           breakAllBonds(p);
-          bondedPixels.delete(p);
+          bondGraph.delete(p);
           continue;
         }
 
@@ -457,8 +582,8 @@
           continue;
         }
 
-        for (let j = p.bonds.length - 1; j >= 0; j--) {
-          const bond = p.bonds[j];
+        for (let j = pBonds.length - 1; j >= 0; j--) {
+          const bond = pBonds[j];
           const t = bond.target;
 
           if (!t || t.del || !inSafeBounds(t.x, t.y) || pixelMap[t.x][t.y] !== t) {
@@ -484,7 +609,7 @@
           // 5. Ionic solvation in water
           if (bond.type === "ionic" && hitWater && Math.random() < 0.18) { breakBondBetween(p, t, true); continue; }
 
-          // Thermal conduction & shared velocity across the chemical bond
+          // Heat conduction & shared velocity across the bond
           const avgT = (p.temp + t.temp) * 0.5;
           p.temp += (avgT - p.temp) * 0.25;
           t.temp += (avgT - t.temp) * 0.25;
@@ -515,19 +640,19 @@
       }
     }
 
-    // Automatic chemical bond formation sampling (O(1) capped)
-    if (totalBondEdges < MAX_BONDS && currentPixels && currentPixels.length > 0) {
+    // Automatic chemical bond formation sampling (respects live UPC_CONFIG.autoBonding)
+    if (UPC_CONFIG.autoBonding && totalBondEdges < MAX_BONDS && currentPixels && currentPixels.length > 0) {
       const samples = Math.min(85, currentPixels.length);
       for (let s = 0; s < samples; s++) {
         if (totalBondEdges >= MAX_BONDS) break;
         const p = currentPixels[Math.floor(Math.random() * currentPixels.length)];
-        if (!p || p.del || (p.bonds && p.bonds.length >= 3)) continue;
+        if (!p || p.del || getBondCount(p) >= 3) continue;
 
         const dir = adjacentCoords[Math.floor(Math.random() * adjacentCoords.length)];
         const nx = p.x + dir[0], ny = p.y + dir[1];
         if (!inSafeBounds(nx, ny)) continue;
         const q = pixelMap[nx][ny];
-        if (!q || q.del || (q.bonds && q.bonds.length >= 3)) continue;
+        if (!q || q.del || getBondCount(q) >= 3) continue;
 
         const key = getBondKey(p.element, q.element);
         const rule = AUTO_BOND_RULES[key];
@@ -539,27 +664,29 @@
         const firstIsA = p.element <= q.element;
         const maxA = firstIsA ? rule.maxValenceA : rule.maxValenceB;
         const maxB = firstIsA ? rule.maxValenceB : rule.maxValenceA;
-        if ((p.bonds?.length || 0) >= maxA || (q.bonds?.length || 0) >= maxB) continue;
+        if (getBondCount(p) >= maxA || getBondCount(q) >= maxB) continue;
 
         if (Math.random() < rule.prob) {
           createBond(p, q, rule.type, rule.breakTemp);
         }
       }
     }
+
+    UPC_STATS.activeBonds = totalBondEdges;
   }
 
   function drawActiveBonds() {
-    if (bondedPixels.size === 0) return;
+    if (!UPC_CONFIG.showBonds || bondGraph.size === 0) return;
     if (typeof ctx === "undefined" || !ctx || typeof pixelSize !== "number") return;
 
     ctx.save();
     ctx.lineWidth = Math.max(1, pixelSize * 0.26);
     ctx.lineCap = "round";
 
-    bondedPixels.forEach(function (p) {
-      if (!p || p.del || !p.bonds) return;
-      for (let i = 0; i < p.bonds.length; i++) {
-        const bond = p.bonds[i];
+    bondGraph.forEach(function (bonds, p) {
+      if (!p || p.del || !bonds) return;
+      for (let i = 0; i < bonds.length; i++) {
+        const bond = bonds[i];
         const t = bond.target;
         if (!t || t.del) continue;
         if (p.x > t.x || (p.x === t.x && p.y >= t.y)) continue;
@@ -580,7 +707,7 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 3. UNIFIED 4x4 GRAVITY-TILE & MAGNETIC-TILE ENGINE + PER-PIXEL VELOCITY
+  // 4. UNIFIED GRAVITY-TILE & MAGNETIC-TILE ENGINE + PER-PIXEL VELOCITY
   // ---------------------------------------------------------------------------
 
   const IRON_FAMILY = new Set(["iron", "molten_iron", "iron_gas"]);
@@ -602,7 +729,7 @@
     cobalt_60: 1115,
     nickel: 358,
     neodymium: 310,
-    gadolinium: 20, // Switches off right at room temp (20 C)!
+    gadolinium: 20, // Magnetic switch right at room temp (20 C)!
     rust: 580,
     metal_scrap: 750
   };
@@ -640,25 +767,12 @@
     "bond_breaker", "bond_catalyst"
   ]);
 
-  const FIELD_BLOCK = 4;             // 4x4 Gravity/Magnetic Tile size (256x faster)
-  const FIELD_SOFTENING = 0.85;      // Prevents 1/r^2 singularity at r = 0
-  const FIELD_REBUILD_INTERVAL = 2;  // Recompute tile fields every 2 ticks
-  const MAX_SPEED = 2.6;
-  const GRAV_ACCEL = 0.032;
-  const MAG_POLE_ACCEL = 0.18;
-  const MAG_FERRO_ACCEL = 0.55;
-  const MAG_MEISSNER_ACCEL = 0.72;
-  const MAG_DIAMAG_ACCEL = 0.14;     // Bismuth room-temp diamagnetism
-  const MAG_PLASMA_ACCEL = 0.45;     // Tokamak / magnetic-bottle confinement
-
   let fieldMw = 0, fieldMh = 0, fieldKw = 0;
   let kernelX = null, kernelY = null, kernelPhi = null;
 
-  // Gravity tiles (summed mass per 4x4 tile + resulting field & potential)
   let macroMass = null, macroGx = null, macroGy = null, macroPhi = null;
   let macroIron = null, macroHotIron = null;
 
-  // Magnetic tiles (summed pole charge per 4x4 tile + resulting B-field & gradient)
   let macroPole = null, macroMagAbs = null;
   let macroBx = null, macroBy = null, macroMagPot = null, macroBmag = null;
   let macroGradBx = null, macroGradBy = null;
@@ -673,14 +787,17 @@
 
   function isFerromagneticNow(pixel) {
     const curie = FERROMAGNETIC_CURIE[pixel.element];
-    return curie !== undefined && pixel.temp <= curie;
+    if (curie === undefined) return false;
+    return !UPC_CONFIG.curieDemagnetize || pixel.temp <= curie;
   }
 
   function ensureFieldTables() {
+    if (typeof width !== "number" || typeof height !== "number") return false;
     const mw = Math.max(2, Math.ceil((width + 1) / FIELD_BLOCK));
     const mh = Math.max(2, Math.ceil((height + 1) / FIELD_BLOCK));
-    if (mw === fieldMw && mh === fieldMh && kernelX) return;
+    if (mw === fieldMw && mh === fieldMh && FIELD_BLOCK === activeFieldBlock && kernelX) return true;
 
+    activeFieldBlock = FIELD_BLOCK;
     fieldMw = mw;
     fieldMh = mh;
     const kw = 2 * mw - 1;
@@ -691,6 +808,7 @@
     kernelY = new Float32Array(kw * kh);
     kernelPhi = new Float32Array(kw * kh);
 
+    // Precompute unit-source pull vectors & potential once per tile resolution
     for (let dy = -(mh - 1); dy <= mh - 1; dy++) {
       const rowOff = (dy + mh - 1) * kw;
       for (let dx = -(mw - 1); dx <= mw - 1; dx++) {
@@ -720,10 +838,11 @@
     macroBmag = new Float32Array(total);
     macroGradBx = new Float32Array(total);
     macroGradBy = new Float32Array(total);
+    return true;
   }
 
   function sampleField(arr, x, y) {
-    if (!arr) return 0;
+    if (!arr || fieldMw < 2 || fieldMh < 2) return 0;
     const fx = x / FIELD_BLOCK - 0.5;
     const fy = y / FIELD_BLOCK - 0.5;
     const x0 = Math.max(0, Math.min(fieldMw - 2, Math.floor(fx)));
@@ -738,9 +857,8 @@
     return top + (bot - top) * ty;
   }
 
-  // Bilinear sample subtracting a moving pixel's own tile contribution (zero self-force)
   function sampleFieldMinusSelf(arr, x, y, selfBx, selfBy, selfCoeff, kArr) {
-    if (!arr || !kArr) return 0;
+    if (!arr || !kArr || fieldMw < 2 || fieldMh < 2) return 0;
     const fx = x / FIELD_BLOCK - 0.5;
     const fy = y / FIELD_BLOCK - 0.5;
     const x0 = Math.max(0, Math.min(fieldMw - 2, Math.floor(fx)));
@@ -770,7 +888,6 @@
 
     const coreElem = formBlackHole ? "black_hole_core" : "neutronium";
 
-    // 1. Core collapses into degenerate Neutronium or Black Hole Singularity
     for (let dx = -2; dx <= 2; dx++) {
       for (let dy = -2; dy <= 2; dy++) {
         if (dx * dx + dy * dy > 5) continue;
@@ -787,7 +904,6 @@
       }
     }
 
-    // 2. Supernova shockwave + r-process heavy-element synthesis + radial velocity kick
     const shockR = 17;
     for (let dx = -shockR; dx <= shockR; dx++) {
       for (let dy = -shockR; dy <= shockR; dy++) {
@@ -821,7 +937,7 @@
   }
 
   function rebuildFields() {
-    ensureFieldTables();
+    if (!ensureFieldTables()) return;
 
     macroMass.fill(0);
     macroGx.fill(0);
@@ -841,7 +957,7 @@
     let hasMagnets = false;
     let hasVisualizer = false;
 
-    // Pass 1: Sum pixel mass & magnetic pole charge into 4x4 tiles
+    // Pass 1: Sum mass & magnetic pole strength into each tile
     for (let i = 0; i < currentPixels.length; i++) {
       const p = currentPixels[i];
       if (!p || p.del) continue;
@@ -884,13 +1000,40 @@
       }
     }
 
-    starModeActive = hasStarGravity;
-    gravFieldActive = hasStarGravity || hasPointWell;
-    magFieldActive = hasMagnets;
-    visualizerActive = hasVisualizer;
+    // Apply user-selected Gravity Method
+    const mode = UPC_CONFIG.gravityMethod;
+    if (mode === "off") {
+      hasStarGravity = false;
+      hasPointWell = false;
+      macroMass.fill(0);
+    } else if (mode === "star") {
+      hasStarGravity = true;
+    } else if (mode === "wells_only") {
+      hasStarGravity = false;
+    } else if (mode === "com") {
+      let totalM = 0, sumX = 0, sumY = 0;
+      for (let by = 0; by < fieldMh; by++) {
+        const row = by * fieldMw;
+        for (let bx = 0; bx < fieldMw; bx++) {
+          const m = macroMass[row + bx];
+          if (m > 0) { totalM += m; sumX += bx * m; sumY += by * m; }
+        }
+      }
+      macroMass.fill(0);
+      if (totalM > 0) {
+        const cx = Math.min(fieldMw - 1, Math.max(0, Math.round(sumX / totalM)));
+        const cy = Math.min(fieldMh - 1, Math.max(0, Math.round(sumY / totalM)));
+        macroMass[cy * fieldMw + cx] = totalM;
+        hasStarGravity = true;
+      }
+    }
 
-    // Without star_gravity, only explicit gravity anchors exert pull
-    if (!hasStarGravity && hasPointWell) {
+    starModeActive = hasStarGravity;
+    gravFieldActive = (hasStarGravity || hasPointWell) && GRAV_ACCEL > 0;
+    magFieldActive = hasMagnets && MAG_POLE_ACCEL > 0;
+    visualizerActive = hasVisualizer || !!UPC_CONFIG.showFields;
+
+    if (mode !== "off" && mode !== "com" && !hasStarGravity && hasPointWell) {
       macroMass.fill(0);
       for (let i = 0; i < currentPixels.length; i++) {
         const p = currentPixels[i];
@@ -905,17 +1048,24 @@
       }
     }
 
+    UPC_STATS.activeGravTiles = 0;
+    UPC_STATS.activeMagTiles = 0;
     if (!gravFieldActive && !magFieldActive) return;
 
-    // Pass 2: Convolve non-empty 4x4 tiles with precomputed lookup kernels
+    // Normalize pull strength when tile resolution changes so gravity feels consistent at 2x2..8x8
+    const tileScale = (FIELD_BLOCK * FIELD_BLOCK) / 16;
+
+    // Pass 2: Convolve non-empty tiles with precomputed lookup kernels
     const mw = fieldMw, mh = fieldMh, kw = fieldKw;
     for (let sy = 0; sy < mh; sy++) {
       const sRow = sy * mw;
       for (let sx = 0; sx < mw; sx++) {
         const sIdx = sRow + sx;
-        const m = gravFieldActive ? macroMass[sIdx] : 0;
-        const q = magFieldActive ? macroPole[sIdx] : 0;
-        const qAbs = magFieldActive ? macroMagAbs[sIdx] : 0;
+        const m = gravFieldActive ? macroMass[sIdx] * tileScale : 0;
+        const q = magFieldActive ? macroPole[sIdx] * tileScale : 0;
+        const qAbs = magFieldActive ? macroMagAbs[sIdx] * tileScale : 0;
+        if (m > 0) UPC_STATS.activeGravTiles++;
+        if (qAbs > 0) UPC_STATS.activeMagTiles++;
         if (m <= 0 && q === 0 && qAbs <= 0) continue;
 
         const kxBase = mw - 1 - sx;
@@ -957,7 +1107,7 @@
       }
     }
 
-    // Pass 2b: Magnetic field strength |B| and gradient (for ferromagnets, Meissner & plasma confinement)
+    // Pass 2b: |B| and gradient for ferromagnets, Meissner & plasma confinement
     if (magFieldActive) {
       const total = mw * mh;
       for (let i = 0; i < total; i++) {
@@ -977,8 +1127,8 @@
       }
     }
 
-    // Pass 2c: Local iron-core collapse check (Supernova -> Neutronium or Hypernova -> Black Hole)
-    if (gravFieldActive) {
+    // Pass 2c: Local iron-core collapse check (Supernova / Hypernova)
+    if (gravFieldActive && UPC_CONFIG.supernovaEnabled) {
       for (let by = 1; by < mh - 1; by++) {
         for (let bx = 1; bx < mw - 1; bx++) {
           const idx = by * mw + bx;
@@ -993,7 +1143,7 @@
           }
           if ((ironSum >= 18 && hotSum >= 8) || (ironSum >= 28 && macroPhi[idx] > 40)) {
             const makeBlackHole = ironSum >= 45 || macroPhi[idx] > 140;
-            triggerSupernova(bx * FIELD_BLOCK + 2, by * FIELD_BLOCK + 2, makeBlackHole);
+            triggerSupernova(bx * FIELD_BLOCK + (FIELD_BLOCK >> 1), by * FIELD_BLOCK + (FIELD_BLOCK >> 1), makeBlackHole);
             return;
           }
         }
@@ -1058,7 +1208,6 @@
         const tDens = tInfo?.density || 1000;
         const tState = tInfo?.state;
 
-        // Buoyancy / density stratification (heavier elements sink to planetary/stellar cores)
         if ((tState === "gas" || tState === "liquid") && pDens > tDens * 1.15) {
           safeSwap(p, target);
           p.vx *= 0.88;
@@ -1068,7 +1217,6 @@
           continue;
         }
 
-        // Momentum-conserving inelastic impact + kinetic shock heating
         const totalM = pDens + tDens;
         const tvx = target.vx || 0, tvy = target.vy || 0;
         const relSpd = Math.hypot(p.vx - tvx, p.vy - tvy);
@@ -1103,8 +1251,13 @@
       rebuildFields();
     }
 
-    if (!gravFieldActive && !magFieldActive && movingPixelsLastTick === 0) return;
+    if (!gravFieldActive && !magFieldActive && movingPixelsLastTick === 0) {
+      UPC_STATS.movingPixels = 0;
+      return;
+    }
 
+    const tileScale = (FIELD_BLOCK * FIELD_BLOCK) / 16;
+    const subtractSelfGrav = starModeActive && UPC_CONFIG.gravityMethod !== "com";
     let movingNow = 0;
 
     for (let i = 0; i < currentPixels.length; i++) {
@@ -1117,9 +1270,11 @@
       const selfBx = (p.x / FIELD_BLOCK) | 0;
       const selfBy = (p.y / FIELD_BLOCK) | 0;
 
-      // 1. Multi-body Gravity + Adiabatic Compression Heating
+      // 1. Multi-Body Gravity + Adiabatic Compression Heating
       if (gravFieldActive) {
-        const selfM = starModeActive ? Math.min(12, Math.max(0.35, (elements[p.element]?.density || 100) / 1000)) : 0;
+        const selfM = subtractSelfGrav
+          ? Math.min(12, Math.max(0.35, (elements[p.element]?.density || 100) / 1000)) * tileScale
+          : 0;
         const gx = selfM > 0
           ? sampleFieldMinusSelf(macroGx, p.x, p.y, selfBx, selfBy, -selfM, kernelX)
           : sampleField(macroGx, p.x, p.y);
@@ -1132,7 +1287,6 @@
         ax += gx * gScale;
         ay += gy * gScale;
 
-        // Potential-driven compression every 2nd tick (peaks at star/planet center)
         if ((t & 1) === 0) {
           const phi = sampleField(macroPhi, p.x, p.y);
           if (phi > 12) {
@@ -1145,7 +1299,6 @@
             p.pressure = Math.round(phi * surrounded * 0.65);
             if (surrounded >= 5) {
               p.temp += phi * surrounded * 0.38;
-              // High-pressure graphite -> diamond synthesis!
               if (p.element === "graphite" && p.pressure > 260 && p.temp > 1500 && elements.diamond) {
                 safeChange(p, "diamond");
               }
@@ -1154,11 +1307,11 @@
         }
       }
 
-      // 2. Unified Magnetic Field (Poles, Ferromagnets, Meissner, Diamagnetism, Plasma Bottle)
+      // 2. Unified Magnetic Field
       if (magFieldActive) {
         const poleSign = MAGNET_POLE_MAP[p.element];
         if (poleSign !== undefined) {
-          const selfQ = MAGNET_STRENGTH[p.element] || 0;
+          const selfQ = (MAGNET_STRENGTH[p.element] || 0) * tileScale;
           const bxVal = sampleFieldMinusSelf(macroBx, p.x, p.y, selfBx, selfBy, selfQ, kernelX);
           const byVal = sampleFieldMinusSelf(macroBy, p.x, p.y, selfBx, selfBy, selfQ, kernelY);
           ax += poleSign * bxVal * MAG_POLE_ACCEL;
@@ -1172,8 +1325,7 @@
         } else if (p.element === "bismuth") {
           ax -= sampleField(macroGradBx, p.x, p.y) * MAG_DIAMAG_ACCEL;
           ay -= sampleField(macroGradBy, p.x, p.y) * MAG_DIAMAG_ACCEL;
-        } else if (p.temp >= 6000 && PLASMA_CONFINABLE.has(p.element)) {
-          // Magnetic mirror confinement keeps hot fusion plasma away from tokamak walls!
+        } else if (UPC_CONFIG.plasmaConfinement && p.temp >= 6000 && PLASMA_CONFINABLE.has(p.element)) {
           ax -= sampleField(macroGradBx, p.x, p.y) * MAG_PLASMA_ACCEL;
           ay -= sampleField(macroGradBy, p.x, p.y) * MAG_PLASMA_ACCEL;
         }
@@ -1183,7 +1335,7 @@
       const prevVy = p.vy || 0;
       if (ax === 0 && ay === 0 && prevVx === 0 && prevVy === 0) continue;
 
-      const drag = starModeActive ? 0.996 : 0.94;
+      const drag = starModeActive ? UPC_CONFIG.starDrag : 0.94;
       let vx = (prevVx + ax) * drag;
       let vy = (prevVy + ay) * drag;
 
@@ -1208,6 +1360,7 @@
     }
 
     movingPixelsLastTick = movingNow;
+    UPC_STATS.movingPixels = movingNow;
   }
 
   function drawFieldOverlay() {
@@ -1256,7 +1409,7 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 4. NUCLEAR FISSION & IONIZING RADIATION ENGINE (ALPHA, BETA, GAMMA, NEUTRONS)
+  // 5. NUCLEAR FISSION & IONIZING RADIATION ENGINE
   // ---------------------------------------------------------------------------
 
   const MODERATOR_PROB = {
@@ -1272,7 +1425,6 @@
   const HIGH_Z_SHIELD = new Set(["lead", "molten_lead", "tungsten", "osmium", "uranium_238", "concrete"]);
   const BETA_SHIELD = new Set(["aluminum", "iron", "steel", "copper", "glass", "lead", "tungsten", "osmium", "concrete", "titanium"]);
 
-  const MAX_NEUTRONS = 320;
   const MAX_SPAWN_PER_TICK = 40;
   const MAX_IONIZING = 220;
   const EXPLODE_COOLDOWN_TICKS = 8;
@@ -1289,6 +1441,7 @@
     const t = typeof pixelTicks === "number" ? pixelTicks : 0;
     if (t !== lastPhysicsTick) {
       prevTickNeutrons = neutronsThisTick;
+      UPC_STATS.activeNeutrons = neutronsThisTick;
       neutronsThisTick = 0;
       spawnedThisTick = 0;
       ionizingThisTick = 0;
@@ -1377,7 +1530,8 @@
     const daughter = spec.daughters[Math.floor(Math.random() * spec.daughters.length)];
     safeChange(targetPixel, daughter);
 
-    targetPixel.temp += spec.heat;
+    const heatAmt = Math.round(spec.heat * UPC_CONFIG.fissionHeatScale);
+    targetPixel.temp += heatAmt;
     let nearbyFissile = 0;
     for (let dx = -2; dx <= 2; dx++) {
       for (let dy = -2; dy <= 2; dy++) {
@@ -1385,7 +1539,7 @@
         if (!inSafeBounds(nx, ny)) continue;
         const p = pixelMap[nx][ny];
         if (p && !p.del) {
-          p.temp += Math.round(spec.heat * 0.18);
+          p.temp += Math.round(heatAmt * 0.18);
           if (FISSILE_SPECS[p.element]) nearbyFissile++;
         }
       }
@@ -1423,11 +1577,8 @@
     pixel.life--;
 
     if (pixel.life <= 0) {
-      if (kind === "alpha" && Math.random() < 0.35 && elements.helium) {
-        safeChange(pixel, "helium");
-      } else {
-        deletePixel(pixel.x, pixel.y);
-      }
+      if (kind === "alpha" && Math.random() < 0.35 && elements.helium) safeChange(pixel, "helium");
+      else deletePixel(pixel.x, pixel.y);
       return;
     }
 
@@ -1445,7 +1596,6 @@
       const tState = elements[tElem]?.state;
 
       if (kind === "alpha") {
-        // Real (alpha, n) reaction on Beryllium!
         if (tElem === "beryllium" || tElem === "molten_beryllium") {
           spawnNeutronsAround(target.x, target.y, 1, "fast_neutron");
           target.temp += 80;
@@ -1456,7 +1606,6 @@
           safeSwap(pixel, target);
           target.temp += 5;
         } else {
-          // Alpha is blocked by even thin solids/liquids -> deposits local heat & picks up electrons to become He
           target.temp += 45;
           if (Math.random() < 0.25 && elements.helium) safeChange(pixel, "helium");
           else deletePixel(pixel.x, pixel.y);
@@ -1471,7 +1620,6 @@
         target.temp += 6;
         safeSwap(pixel, target);
       } else {
-        // Gamma ray: penetrates almost anything, attenuated by high-Z dense shielding
         if (HIGH_Z_SHIELD.has(tElem) && Math.random() < 0.55) {
           target.temp += 35;
           deletePixel(pixel.x, pixel.y);
@@ -1527,7 +1675,7 @@
         if (!target || target === pixel || target.del) continue;
         const tElem = target.element;
 
-        // A. Fission (with Doppler broadening negative temperature feedback)
+        // A. Fission + Doppler feedback
         if (FISSILE_SPECS[tElem]) {
           const spec = FISSILE_SPECS[tElem];
           let prob = isFast ? spec.fastProb : spec.thermalProb;
@@ -1544,7 +1692,7 @@
           }
         }
 
-        // B. Supernova r-process neutron capture on Iron/Nickel/Cobalt
+        // B. Supernova r-process neutron capture
         if (isFast && target.temp > 75000 && SUPER_R_PROCESS_TARGETS.has(tElem) && Math.random() < 0.40) {
           const heavy = R_PROCESS_PRODUCTS[Math.floor(Math.random() * R_PROCESS_PRODUCTS.length)];
           safeChange(target, heavy);
@@ -1606,7 +1754,7 @@
           }
         }
 
-        // G. Probabilistic Moderators (steam excluded -> negative void coefficient)
+        // G. Moderators
         if (MODERATOR_PROB[tElem] !== undefined) {
           target.temp += isFast ? 35 : 5;
           if (isFast) {
@@ -1631,7 +1779,7 @@
           }
         }
 
-        // H. Reflectors & Beryllium (n, 2n) multiplication
+        // H. Reflectors & Beryllium (n, 2n)
         if (REFLECTORS.has(tElem)) {
           pixel.vx = -pixel.vx + (Math.random() < 0.3 ? (Math.random() < 0.5 ? 1 : -1) : 0);
           pixel.vy = -pixel.vy + (Math.random() < 0.3 ? (Math.random() < 0.5 ? 1 : -1) : 0);
@@ -1649,7 +1797,7 @@
           return;
         }
 
-        // I. High-Z Shielding
+        // I. Shielding
         if (HIGH_Z_SHIELD.has(tElem)) {
           target.temp += 15;
           if (Math.random() < 0.45) {
@@ -1682,13 +1830,13 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 5. INTERACTIVE PHYSICS TOOLS (IN THE "tools" CATEGORY)
+  // 6. INTERACTIVE PHYSICS TOOLS ("tools" CATEGORY)
   // ---------------------------------------------------------------------------
 
   registerOrEnhance("orbit_launch", {
     color: ["#ffcf40", "#ffe082"],
     category: "tools",
-    desc: "Brush over planets, moons, or clouds to give them exact circular orbital velocity perpendicular to the local gravity-tile field!",
+    desc: "Brush over moons, planets, or gas clouds to give exact circular orbital velocity perpendicular to local gravity!",
     tool: function (pixel) {
       if (!pixel || pixel.del || isImmobileElement(pixel.element) || VELOCITY_EXEMPT.has(pixel.element)) return;
       if (!gravFieldActive) rebuildFields();
@@ -1698,7 +1846,6 @@
       const gMag = Math.hypot(gx, gy);
       if (gMag < 0.01) return;
       const phi = Math.max(0, sampleField(macroPhi, pixel.x, pixel.y));
-      // Exact circular orbit velocity from potential & tile scale: v = sqrt(Phi * GRAV_ACCEL * FIELD_BLOCK)
       const vCirc = Math.min(MAX_SPEED * 0.92, Math.sqrt(phi * GRAV_ACCEL * FIELD_BLOCK));
       pixel.vx = (-gy / gMag) * vCirc;
       pixel.vy = (gx / gMag) * vCirc;
@@ -1709,7 +1856,7 @@
   registerOrEnhance("kinetic_launch", {
     color: ["#ff6e40", "#ff9e80"],
     category: "tools",
-    desc: "Kinetic accelerator brush: launches brushed matter rapidly to the right & slightly upward (great for railguns, slingshots, and collisions).",
+    desc: "Kinetic launcher brush: fires brushed matter rapidly right & slightly upward.",
     tool: function (pixel) {
       if (!pixel || pixel.del || isImmobileElement(pixel.element) || VELOCITY_EXEMPT.has(pixel.element)) return;
       pixel.vx = MAX_SPEED * 0.88;
@@ -1724,17 +1871,14 @@
     desc: "Inertial damper: cancels all velocity (vx, vy) on brushed pixels immediately.",
     tool: function (pixel) {
       if (!pixel || pixel.del) return;
-      pixel.vx = 0;
-      pixel.vy = 0;
-      pixel.rx = 0;
-      pixel.ry = 0;
+      pixel.vx = 0; pixel.vy = 0; pixel.rx = 0; pixel.ry = 0;
     }
   });
 
   registerOrEnhance("compress_tool", {
     color: ["#ab47bc", "#ce93d8"],
     category: "tools",
-    desc: "Shock Compressor: applies intense adiabatic pressure & heat (ignites inertial fusion, or turns hot graphite into diamond!).",
+    desc: "Shock Compressor: applies extreme pressure & adiabatic heat (ignites fusion or presses hot graphite into diamond!).",
     tool: function (pixel) {
       if (!pixel || pixel.del) return;
       pixel.pressure = (pixel.pressure || 0) + 400;
@@ -1748,9 +1892,9 @@
   registerOrEnhance("bond_tool", {
     color: ["#69f0ae", "#b9f6ca"],
     category: "tools",
-    desc: "Direct Bond Tool: links adjacent pixels under the brush with persistent chemical bonds (keeping both elements intact).",
+    desc: "Direct Bond Tool: links adjacent pixels with persistent chemical bonds (keeping both elements intact).",
     tool: function (pixel) {
-      if (!pixel || pixel.del || (pixel.bonds && pixel.bonds.length >= 3)) return;
+      if (!pixel || pixel.del || getBondCount(pixel) >= 3) return;
       for (let i = 0; i < adjacentCoords.length; i++) {
         const nx = pixel.x + adjacentCoords[i][0];
         const ny = pixel.y + adjacentCoords[i][1];
@@ -1776,7 +1920,7 @@
   registerOrEnhance("magnetize_tool", {
     color: ["#e53935", "#1e88e5"],
     category: "tools",
-    desc: "Magnetizer Tool: turns ferromagnetic iron/steel/neodymium into magnets, or flips North <-> South poles on existing magnets!",
+    desc: "Magnetizer Tool: turns iron/steel/neodymium into magnets, or flips North <-> South poles!",
     tool: function (pixel) {
       if (!pixel || pixel.del) return;
       const e = pixel.element;
@@ -1795,12 +1939,10 @@
   registerOrEnhance("neutron_pulse", {
     color: ["#ff6d00", "#ffd180"],
     category: "tools",
-    desc: "Neutron Pulse Trigger: emits fast neutrons around brushed pixels to jump-start fission reactors, breeders, or tritium blankets.",
+    desc: "Neutron Pulse Trigger: emits fast neutrons around brushed pixels to jump-start fission or breeding.",
     tool: function (pixel) {
       if (!pixel || pixel.del) return;
-      if (Math.random() < 0.35) {
-        spawnNeutronsAround(pixel.x, pixel.y, 1, "fast_neutron");
-      }
+      if (Math.random() < 0.35) spawnNeutronsAround(pixel.x, pixel.y, 1, "fast_neutron");
     }
   });
 
@@ -1808,7 +1950,7 @@
   registerOrEnhance("inspect_tool", {
     color: ["#26c6da", "#80deea"],
     category: "tools",
-    desc: "Physics Telemetry Inspector: click any pixel to print its exact temp, velocity, pressure, local g-field, B-field, and active chemical bonds.",
+    desc: "Physics Telemetry Inspector: click any pixel to print temp, velocity, pressure, g-field, B-field, and active chemical bonds.",
     tool: function (pixel) {
       if (!pixel || pixel.del) return;
       const now = Date.now();
@@ -1818,15 +1960,16 @@
       const vy = (pixel.vy || 0).toFixed(2);
       const g = gravFieldActive ? Math.hypot(sampleField(macroGx, pixel.x, pixel.y), sampleField(macroGy, pixel.x, pixel.y)).toFixed(2) : "0";
       const b = magFieldActive ? sampleField(macroBmag, pixel.x, pixel.y).toFixed(2) : "0";
-      const bondList = pixel.bonds && pixel.bonds.length
-        ? pixel.bonds.map(x => x.target.element + "(" + x.type + ")").join(", ")
+      const pBonds = getBonds(pixel);
+      const bondList = pBonds && pBonds.length
+        ? pBonds.map(x => x.target.element + "(" + x.type + ")").join(", ")
         : "none";
       notifyUser(`${pixel.element} | ${Math.round(pixel.temp)}C | v=(${vx},${vy}) | P=${pixel.pressure || 0} | g=${g} | B=${b} | bonds: ${bondList}`);
     }
   });
 
   // ---------------------------------------------------------------------------
-  // 6. ASTROPHYSICS, BONDING, MAGNETS & RADIATION ELEMENTS
+  // 7. ASTROPHYSICS, BONDING, MAGNETS & RADIATION ELEMENTS
   // ---------------------------------------------------------------------------
 
   registerOrEnhance("star_gravity", {
@@ -1836,7 +1979,7 @@
     state: "solid",
     density: 99999,
     hardness: 1,
-    desc: "Place 1 pixel in a corner to enable global 4x4 Gravity-Tile self-gravity! Enables binary stars, orbits, adiabatic core fusion, and supernovae."
+    desc: "Enables global multi-body Gravity-Tile self-gravity (in Element-Based mode). Enables binary stars, orbits, core fusion, and supernovae."
   });
 
   registerOrEnhance("gravity_well", {
@@ -1846,7 +1989,7 @@
     state: "solid",
     density: 99999,
     hardness: 1,
-    desc: "Localized planetary/stellar gravity anchor. Use orbit_launch on nearby matter to put moons and rings into stable orbits!"
+    desc: "Localized planetary/stellar gravity anchor. Use orbit_launch on nearby matter to form orbits and rings!"
   });
 
   registerOrEnhance("neutronium", {
@@ -1857,7 +2000,7 @@
     density: 999999,
     hardness: 1,
     conduct: 1,
-    desc: "Degenerate neutron-star core forged by Supernova collapse. Exerts massive gravity and radiates fast neutrons.",
+    desc: "Degenerate neutron-star core forged by Supernova collapse. Exerts extreme gravity and emits fast neutrons.",
     tick: function (pixel) {
       if (Math.random() < 0.004) spawnNeutronsAround(pixel.x, pixel.y, 1, "fast_neutron");
       doDefaults(pixel);
@@ -1871,7 +2014,7 @@
     state: "solid",
     density: 9999999,
     hardness: 1,
-    desc: "Event-horizon singularity (forged by hypernova collapse or placed manually). Exerts extreme gravity, devours infalling matter, and emits relativistic gamma/plasma jets!",
+    desc: "Event-horizon singularity. Devours infalling matter and emits relativistic gamma jets!",
     tick: function (pixel) {
       for (let i = 0; i < adjacentCoords.length; i++) {
         const nx = pixel.x + adjacentCoords[i][0];
@@ -1879,6 +2022,7 @@
         if (!inSafeBounds(nx, ny)) continue;
         const victim = pixelMap[nx][ny];
         if (!victim || victim.del || IMMOBILE_SPECIAL.has(victim.element)) continue;
+        breakAllBonds(victim);
         deletePixel(nx, ny);
         if (Math.random() < 0.25) spawnParticle(pixel.x, pixel.y, "gamma_ray", 1);
       }
@@ -1892,7 +2036,7 @@
     category: "astrophysics",
     state: "solid",
     density: 1000,
-    desc: "Place 1 pixel anywhere to render live Magnetic (cyan) and Gravity (gold) field vectors across every 4x4 tile!"
+    desc: "Place 1 pixel anywhere to draw live Magnetic (cyan) and Gravity (gold) field vectors on every tile!"
   });
 
   registerOrEnhance("bond_catalyst", {
@@ -1901,7 +2045,7 @@
     category: "chemistry",
     state: "solid",
     density: 10,
-    desc: "Drop onto any two adjacent elements to form a persistent chemical bond (keeping both pixels intact).",
+    desc: "Drop onto any two adjacent elements to link them with a persistent chemical bond (keeping both pixels intact).",
     tick: function (pixel) {
       const neighbors = [];
       for (let i = 0; i < adjacentCoords.length; i++) {
@@ -1955,7 +2099,7 @@
     hardness: 0.8,
     tempHigh: 770,
     stateHigh: "iron",
-    desc: "North magnetic pole (Curie temp: 770 C). Pulls ferromagnetics & South poles; repels North poles; confines hot fusion plasma!"
+    desc: "North magnetic pole (Curie temp: 770 C). Pulls ferromagnetics & South poles; repels North poles; confines hot plasma."
   });
 
   registerOrEnhance("magnet_south", {
@@ -1981,7 +2125,7 @@
     hardness: 0.75,
     tempHigh: 310,
     stateHigh: "neodymium",
-    desc: "Strong Neodymium North pole (2.2x field, 310 C Curie point). Great for tokamak bottles and railguns."
+    desc: "Strong Neodymium North pole (2.2x field, 310 C Curie point)."
   });
 
   registerOrEnhance("neodymium_south", {
@@ -2005,7 +2149,7 @@
     density: 8400,
     conduct: 1,
     hardness: 0.8,
-    desc: "Switchable North Electromagnet. Inactive until powered with shock/battery; generates a strong North field while electrified."
+    desc: "Switchable North Electromagnet. Inactive until powered with shock/battery."
   });
 
   registerOrEnhance("electromagnet_south", {
@@ -2016,7 +2160,7 @@
     density: 8400,
     conduct: 1,
     hardness: 0.8,
-    desc: "Switchable South Electromagnet. Generates a strong South field only while electrified."
+    desc: "Switchable South Electromagnet. Inactive until powered with shock/battery."
   });
 
   registerOrEnhance("magnet_bead_n", {
@@ -2027,7 +2171,7 @@
     density: 7400,
     tempHigh: 770,
     stateHigh: "iron_filings",
-    desc: "Movable North-pole magnetic bead. Accelerates toward South poles and launches away from North poles."
+    desc: "Movable North-pole magnetic bead."
   });
 
   registerOrEnhance("magnet_bead_s", {
@@ -2038,7 +2182,7 @@
     density: 7400,
     tempHigh: 770,
     stateHigh: "iron_filings",
-    desc: "Movable South-pole magnetic bead. Accelerates toward North poles and launches away from South poles."
+    desc: "Movable South-pole magnetic bead."
   });
 
   registerOrEnhance("iron_filings", {
@@ -2050,7 +2194,7 @@
     conduct: 0.7,
     tempHigh: 1538,
     stateHigh: "molten_iron",
-    desc: "Ferromagnetic iron powder. Pulled along grad|B| toward both North and South poles below 770 C."
+    desc: "Ferromagnetic iron powder. Pulled along grad|B| toward both poles below 770 C."
   });
 
   registerOrEnhance("superconductor", {
@@ -2061,10 +2205,10 @@
     density: 6300,
     conduct: 1,
     hardness: 0.7,
-    desc: "YBCO Superconductor. Chill below -180 C (e.g. liquid_nitrogen) to trigger Meissner levitation over any magnet!"
+    desc: "YBCO Superconductor. Chill below -180 C for Meissner levitation over any magnet!"
   });
 
-  // --- Radiation & Neutron Particles ---
+  // --- Radiation & Neutrons ---
   registerOrEnhance("fast_neutron", {
     color: ["#ff4444", "#ff7744", "#ffaa44"],
     behavior: behaviors.WALL,
@@ -2072,7 +2216,7 @@
     state: "gas",
     density: 0.01,
     temp: 20,
-    desc: "Fast ~2 MeV neutron. Moderates in water/heavy water/graphite into thermal neutrons.",
+    desc: "Fast ~2 MeV neutron. Moderates in water, heavy water, or graphite into thermal neutrons.",
     tick: function (pixel) { neutronTick(pixel, true); }
   });
 
@@ -2083,7 +2227,7 @@
     state: "gas",
     density: 0.01,
     temp: 20,
-    desc: "Moderated slow ~0.025 eV neutron. High fission cross-section for U-235, Pu-239, U-233; absorbed by control rods.",
+    desc: "Moderated slow ~0.025 eV neutron. High fission cross-section; absorbed by control rods.",
     tick: function (pixel) { neutronTick(pixel, false); }
   });
 
@@ -2093,7 +2237,7 @@
     category: "nuclear",
     state: "gas",
     density: 0.01,
-    desc: "Alpha particle (He-4 nucleus). Stopped by thin solids/liquids; reacts with Beryllium to emit fast neutrons; becomes Helium when stopped.",
+    desc: "Alpha particle (He-4 nucleus). Stopped by thin solids; knocks neutrons out of Beryllium.",
     tick: function (pixel) { ionizingParticleTick(pixel, "alpha"); }
   });
 
@@ -2103,7 +2247,7 @@
     category: "nuclear",
     state: "gas",
     density: 0.01,
-    desc: "High-energy Beta electron. Penetrates gases and thin matter; stopped by Aluminum, Glass, or metals.",
+    desc: "High-energy Beta electron. Stopped by Aluminum, Glass, or metals.",
     tick: function (pixel) { ionizingParticleTick(pixel, "beta"); }
   });
 
@@ -2113,11 +2257,10 @@
     category: "nuclear",
     state: "gas",
     density: 0.01,
-    desc: "High-energy Gamma photon. Penetrates most materials and breaks chemical bonds; attenuated by Lead, Tungsten, Osmium, U-238, or Concrete.",
+    desc: "High-energy Gamma photon. Breaks chemical bonds; attenuated by Lead, Tungsten, Osmium, U-238, or Concrete.",
     tick: function (pixel) { ionizingParticleTick(pixel, "gamma"); }
   });
 
-  // --- Heavy Water Chain ---
   registerOrEnhance("heavy_water", {
     color: ["#1e5ec4", "#246ad6", "#1a52ab"],
     behavior: behaviors.LIQUID,
@@ -2164,7 +2307,7 @@
   });
 
   // ---------------------------------------------------------------------------
-  // 7. FULL STELLAR & REACTOR FUSION ISOTOPES
+  // 8. FULL STELLAR & REACTOR FUSION ISOTOPES
   // ---------------------------------------------------------------------------
 
   defineFullGas({
@@ -2178,39 +2321,39 @@
     density: 0.18,
     desc: "Hydrogen-2. Fuses with Tritium (10,000 C), Deuterium (25,000 C), or Helium-3 (40,000 C).",
     tick: function (pixel) {
-      if (pixel.temp >= 10000 && Math.random() < 0.55) {
-        const t = findAdjacentElement(pixel, "tritium");
-        if (t) {
-          safeChange(pixel, "helium");
-          safeChange(t, "fast_neutron");
-          pixel.temp += 9000;
-          t.temp += 9000;
-          return;
-        }
-      }
-      if (pixel.temp >= 25000 && Math.random() < 0.35) {
-        const other = findAdjacentElement(pixel, "deuterium");
-        if (other) {
-          if (Math.random() < 0.5) {
-            safeChange(pixel, "tritium");
-            safeChangeAny(other, ["proton", "hydrogen"]);
-          } else {
-            safeChange(pixel, "helium_3");
-            safeChange(other, "fast_neutron");
+      const fr = UPC_CONFIG.fusionRate;
+      if (fr > 0) {
+        if (pixel.temp >= 10000 && Math.random() < 0.55 * fr) {
+          const t = findAdjacentElement(pixel, "tritium");
+          if (t) {
+            safeChange(pixel, "helium");
+            safeChange(t, "fast_neutron");
+            pixel.temp += 9000; t.temp += 9000;
+            return;
           }
-          pixel.temp += 4500;
-          other.temp += 4500;
-          return;
         }
-      }
-      if (pixel.temp >= 40000 && Math.random() < 0.45) {
-        const he3 = findAdjacentElement(pixel, "helium_3");
-        if (he3) {
-          safeChange(pixel, "helium");
-          safeChangeAny(he3, ["proton", "hydrogen"]);
-          pixel.temp += 11000;
-          he3.temp += 11000;
-          return;
+        if (pixel.temp >= 25000 && Math.random() < 0.35 * fr) {
+          const other = findAdjacentElement(pixel, "deuterium");
+          if (other) {
+            if (Math.random() < 0.5) {
+              safeChange(pixel, "tritium");
+              safeChangeAny(other, ["proton", "hydrogen"]);
+            } else {
+              safeChange(pixel, "helium_3");
+              safeChange(other, "fast_neutron");
+            }
+            pixel.temp += 4500; other.temp += 4500;
+            return;
+          }
+        }
+        if (pixel.temp >= 40000 && Math.random() < 0.45 * fr) {
+          const he3 = findAdjacentElement(pixel, "helium_3");
+          if (he3) {
+            safeChange(pixel, "helium");
+            safeChangeAny(he3, ["proton", "hydrogen"]);
+            pixel.temp += 11000; he3.temp += 11000;
+            return;
+          }
         }
       }
       doDefaults(pixel);
@@ -2252,13 +2395,12 @@
     density: 0.13,
     desc: "Light Helium-3. Aneutronic fusion with Deuterium (40,000 C) or He-3 + He-3 (45,000 C).",
     tick: function (pixel) {
-      if (pixel.temp >= 45000 && Math.random() < 0.25) {
+      if (UPC_CONFIG.fusionRate > 0 && pixel.temp >= 45000 && Math.random() < 0.25 * UPC_CONFIG.fusionRate) {
         const other = findAdjacentElement(pixel, "helium_3");
         if (other) {
           safeChange(pixel, "helium");
           safeChangeAny(other, ["proton", "hydrogen"]);
-          pixel.temp += 7500;
-          other.temp += 7500;
+          pixel.temp += 7500; other.temp += 7500;
           return;
         }
       }
@@ -2278,22 +2420,25 @@
     stateLow: "graphite",
     desc: "Elemental Carbon-12 gas (>3,642 C). Fuses with Helium (75,000 C -> Oxygen) or Carbon (82,000 C -> Neon/Magnesium).",
     tick: function (pixel) {
-      if (pixel.temp >= 75000 && Math.random() < 0.18) {
-        const he = findAdjacentElement(pixel, "helium");
-        if (he) {
-          safeChange(pixel, "oxygen");
-          safeChange(he, "gamma_ray");
-          pixel.temp += 5000;
-          return;
+      const fr = UPC_CONFIG.fusionRate;
+      if (fr > 0) {
+        if (pixel.temp >= 75000 && Math.random() < 0.18 * fr) {
+          const he = findAdjacentElement(pixel, "helium");
+          if (he) {
+            safeChange(pixel, "oxygen");
+            safeChange(he, "gamma_ray");
+            pixel.temp += 5000;
+            return;
+          }
         }
-      }
-      if (pixel.temp >= 82000 && Math.random() < 0.15) {
-        const other = findAdjacentElement(pixel, "carbon_vapor");
-        if (other) {
-          safeChange(pixel, Math.random() < 0.55 ? "neon" : "magnesium_gas");
-          safeChange(other, "gamma_ray");
-          pixel.temp += 4500;
-          return;
+        if (pixel.temp >= 82000 && Math.random() < 0.15 * fr) {
+          const other = findAdjacentElement(pixel, "carbon_vapor");
+          if (other) {
+            safeChange(pixel, Math.random() < 0.55 ? "neon" : "magnesium_gas");
+            safeChange(other, "gamma_ray");
+            pixel.temp += 4500;
+            return;
+          }
         }
       }
       doDefaults(pixel);
@@ -2314,7 +2459,7 @@
     density: 2260,
     conduct: 0.7,
     behavior: behaviors.POWDER,
-    desc: "Radioactive Carbon-14 formed by thermal neutrons hitting Nitrogen-14. Beta-decays back into Nitrogen.",
+    desc: "Radioactive Carbon-14 formed by thermal neutrons hitting Nitrogen-14.",
     tick: function (pixel) {
       if (Math.random() < 0.0001) {
         safeChange(pixel, "nitrogen");
@@ -2337,7 +2482,7 @@
     conduct: 0.4,
     desc: "Noble gas forged by Carbon burning. Fuses with Helium at 88,000 C into Magnesium.",
     tick: function (pixel) {
-      if (pixel.temp >= 88000 && Math.random() < 0.16) {
+      if (UPC_CONFIG.fusionRate > 0 && pixel.temp >= 88000 && Math.random() < 0.16 * UPC_CONFIG.fusionRate) {
         const he = findAdjacentElement(pixel, "helium");
         if (he) {
           safeChange(pixel, "magnesium_gas");
@@ -2359,7 +2504,7 @@
     boilTemp: -185.8,
     meltTemp: -189.3,
     density: 1.78,
-    desc: "Dense inert noble shielding gas. Sinks in air to protect reactive metals (Cesium, White Phosphorus) from oxygen."
+    desc: "Dense inert noble shielding gas. Sinks in air to protect Cesium or White Phosphorus from oxygen."
   });
 
   defineFullElement({
@@ -2374,9 +2519,9 @@
     conduct: 0.78,
     hardness: 0.5,
     tickAllStates: true,
-    desc: "Reactive light metal. Burns blindingly hot in oxygen (>470 C), reacts with steam, and fuses with Helium at 92,000 C into Silicon!",
+    desc: "Reactive light metal. Burns hot in oxygen (>470 C), reacts with steam, and fuses with Helium at 92,000 C into Silicon!",
     tick: function (pixel) {
-      if (pixel.temp >= 92000 && Math.random() < 0.16) {
+      if (UPC_CONFIG.fusionRate > 0 && pixel.temp >= 92000 && Math.random() < 0.16 * UPC_CONFIG.fusionRate) {
         const he = findAdjacentElement(pixel, "helium");
         if (he) {
           safeChange(pixel, "silicon_gas");
@@ -2408,7 +2553,7 @@
     tickAllStates: true,
     desc: "Crystalline semiconductor (Si-28). Forged by Oxygen fusion (95,000 C), Mg+He fusion (92,000 C), or smelting sand + graphite (>1,900 C). Fuses past 115,000 C into Nickel-56 -> Iron!",
     tick: function (pixel) {
-      if (pixel.temp >= 115000 && Math.random() < 0.16) {
+      if (UPC_CONFIG.fusionRate > 0 && pixel.temp >= 115000 && Math.random() < 0.16 * UPC_CONFIG.fusionRate) {
         const partner = findAdjacentElement(pixel, "helium") || findAdjacentElement(pixel, SILICON_STATES);
         if (partner) {
           safeChange(pixel, "nickel_56_gas");
@@ -2435,7 +2580,7 @@
     density: 8908,
     conduct: 0.7,
     tickAllStates: true,
-    desc: "Radioactive Nickel-56 forged by Silicon burning. Decays into Cobalt-56 -> Iron-56, powering supernova afterglows.",
+    desc: "Radioactive Nickel-56 forged by Silicon burning. Decays into Cobalt-56 -> Iron-56.",
     tick: function (pixel) {
       pixel.temp += 0.35;
       if (Math.random() < 0.008) {
@@ -2475,7 +2620,7 @@
   });
 
   // ---------------------------------------------------------------------------
-  // 8. FISSILE, FERTILE, BREEDER & RADIOACTIVE DECAY-CHAIN ISOTOPES
+  // 9. FISSILE, FERTILE, BREEDER & DECAY-CHAIN ISOTOPES
   // ---------------------------------------------------------------------------
 
   defineFullElement({
@@ -2505,7 +2650,7 @@
     boilTemp: 4131,
     density: 19100,
     conduct: 0.45,
-    desc: "Fertile Depleted Uranium (U-238). Ultra-dense gamma shield; breeds Neptunium-239 -> Plutonium-239 under neutron flux."
+    desc: "Fertile Depleted Uranium (U-238). Dense gamma shield; breeds Neptunium-239 -> Plutonium-239."
   });
 
   defineFullElement({
@@ -2541,7 +2686,7 @@
     boilTemp: 3228,
     density: 19816,
     conduct: 0.25,
-    desc: "Fissile Plutonium-239. High fast-neutron fission cross-section; self-heats via alpha decay.",
+    desc: "Fissile Plutonium-239. High fast-neutron cross-section; self-heats via alpha decay.",
     tick: function (pixel) {
       pixel.temp += 0.05;
       if (Math.random() < 0.0006) spawnNeutronsAround(pixel.x, pixel.y, 1, "fast_neutron");
@@ -2608,7 +2753,7 @@
     boilTemp: 1470,
     density: 15100,
     conduct: 0.4,
-    desc: "Intense spontaneous-fission neutron source! Continuously emits fast neutrons to ignite reactors or breed tritium.",
+    desc: "Spontaneous-fission neutron source! Continuously emits fast neutrons.",
     tick: function (pixel) {
       pixel.temp += 0.35;
       if (Math.random() < 0.03) spawnNeutronsAround(pixel.x, pixel.y, 1, "fast_neutron");
@@ -2626,7 +2771,7 @@
     boilTemp: 2607,
     density: 13670,
     conduct: 0.45,
-    desc: "Smoke-detector isotope. Steady emitter of alpha particles (place next to Beryllium for an Am-Be neutron source!).",
+    desc: "Steady alpha emitter (pair with Beryllium for an Am-Be neutron gun).",
     tick: function (pixel) {
       pixel.temp += 0.12;
       if (Math.random() < 0.015) spawnParticle(pixel.x, pixel.y, "alpha_particle", 1);
@@ -2644,14 +2789,11 @@
     boilTemp: 1737,
     density: 5500,
     conduct: 0.5,
-    desc: "Radioluminescent alkaline-earth metal. Alpha-decays into Radon gas -> Polonium-210 -> stable Lead!",
+    desc: "Radioluminescent metal. Alpha-decays into Radon -> Polonium-210 -> Lead.",
     tick: function (pixel) {
       pixel.temp += 0.12;
       if (Math.random() < 0.008) spawnParticle(pixel.x, pixel.y, "alpha_particle", 1);
-      if (Math.random() < 0.0004) {
-        safeChange(pixel, "radon");
-        return;
-      }
+      if (Math.random() < 0.0004) { safeChange(pixel, "radon"); return; }
       doDefaults(pixel);
     }
   });
@@ -2665,7 +2807,7 @@
     boilTemp: -61.7,
     meltTemp: -71.0,
     density: 9.73,
-    desc: "Dense radioactive noble gas. Sinks in air, glows orange when frozen, alpha-decays into Polonium-210.",
+    desc: "Dense radioactive noble gas. Sinks in air, glows orange when frozen, decays to Polonium-210.",
     tick: function (pixel) {
       if (Math.random() < 0.0005) {
         safeChange(pixel, "polonium_210");
@@ -2687,14 +2829,11 @@
     boilTemp: 962,
     density: 9196,
     conduct: 0.5,
-    desc: "Intense alpha emitter (~140 W/g). Place next to Beryllium for a Po-Be neutron initiator; decays into stable Lead.",
+    desc: "Intense alpha emitter (~140 W/g). Pair with Beryllium for a Po-Be neutron initiator; decays to Lead.",
     tick: function (pixel) {
       pixel.temp += 0.45;
       if (Math.random() < 0.02) spawnParticle(pixel.x, pixel.y, "alpha_particle", 1);
-      if (Math.random() < 0.00025 && elements.lead) {
-        safeChange(pixel, "lead");
-        return;
-      }
+      if (Math.random() < 0.00025 && elements.lead) { safeChange(pixel, "lead"); return; }
       doDefaults(pixel);
     }
   });
@@ -2708,7 +2847,7 @@
     boilTemp: -108.1,
     meltTemp: -111.8,
     density: 5.89,
-    desc: "Reactor poison with massive thermal neutron capture cross-section. Burns to Xe-136 or beta-decays to Cs-135.",
+    desc: "Reactor poison with huge thermal neutron capture cross-section. Burns to Xe-136 or decays to Cs-135.",
     tick: function (pixel) {
       if (Math.random() < 0.0012) {
         safeChange(pixel, "cesium_135");
@@ -2743,7 +2882,9 @@
     desc: "Fission gas that emits delayed thermal neutrons before decaying to Strontium-90.",
     tick: function (pixel) {
       pixel.temp += 0.15;
-      if (Math.random() < 0.0015) spawnNeutronsAround(pixel.x, pixel.y, 1, "thermal_neutron");
+      if (UPC_CONFIG.delayedNeutrons && Math.random() < 0.0015) {
+        spawnNeutronsAround(pixel.x, pixel.y, 1, "thermal_neutron");
+      }
       if (Math.random() < 0.004) { safeChange(pixel, "strontium_90"); return; }
       doDefaults(pixel);
     }
@@ -2763,7 +2904,9 @@
     desc: "Fission daughter with decay heat and delayed neutron emission.",
     tick: function (pixel) {
       pixel.temp += 0.12;
-      if (Math.random() < 0.0008) spawnNeutronsAround(pixel.x, pixel.y, 1, "thermal_neutron");
+      if (UPC_CONFIG.delayedNeutrons && Math.random() < 0.0008) {
+        spawnNeutronsAround(pixel.x, pixel.y, 1, "thermal_neutron");
+      }
       doDefaults(pixel);
     }
   });
@@ -2802,7 +2945,7 @@
   });
 
   // ---------------------------------------------------------------------------
-  // 9. REACTOR, MAGNETIC & EXOTIC CHEMICAL ELEMENTS (FULL STATE CHAINS)
+  // 10. REACTOR, MAGNETIC & EXOTIC CHEMICAL ELEMENTS
   // ---------------------------------------------------------------------------
 
   registerOrEnhance("graphite", {
@@ -2816,7 +2959,7 @@
     hardness: 0.65,
     tempHigh: 3642,
     stateHigh: "carbon_vapor",
-    desc: "Crystalline carbon moderator. Sublimates to carbon_vapor (>3,642 C); smelts sand -> silicon (>1,900 C) & rust -> iron (>1,100 C); compresses into diamond under extreme pressure!",
+    desc: "Crystalline carbon moderator. Sublimates to carbon_vapor (>3,642 C); smelts sand -> silicon (>1,900 C) & rust -> iron (>1,100 C); compresses into diamond!",
     reactions: {
       oxygen: { elem1: "carbon_dioxide", elem2: "fire", tempMin: 750, tempMax: 3500, chance: 0.15 },
       sand:   { elem1: "carbon_dioxide", elem2: "molten_silicon", tempMin: 1900, tempMax: 3500, chance: 0.22 },
@@ -2837,8 +2980,8 @@
     hardness: 0.8,
     desc: "Neutron reflector & (n, 2n) multiplier. Pair with Polonium-210 or Americium-241 for an alpha-beryllium neutron gun.",
     reactions: {
-      polonium_210: { chance: 0.08, func: function (p1) { spawnNeutronsAround(p1.x, p1.y, 1, "fast_neutron"); p1.temp += 15; } },
-      americium_241:{ chance: 0.05, func: function (p1) { spawnNeutronsAround(p1.x, p1.y, 1, "fast_neutron"); p1.temp += 10; } }
+      polonium_210:  { chance: 0.08, func: function (p1) { spawnNeutronsAround(p1.x, p1.y, 1, "fast_neutron"); p1.temp += 15; } },
+      americium_241: { chance: 0.05, func: function (p1) { spawnNeutronsAround(p1.x, p1.y, 1, "fast_neutron"); p1.temp += 10; } }
     }
   });
 
@@ -2854,16 +2997,14 @@
     conduct: 0.15,
     hardness: 0.92,
     tickAllStates: true,
-    desc: "Control-rod neutron absorber. Also fuels clean aneutronic p-B11 fusion with Hydrogen above 55,000 C -> Helium!",
+    desc: "Control-rod neutron absorber. Also fuels aneutronic p-B11 fusion with Hydrogen above 55,000 C -> Helium!",
     tick: function (pixel) {
-      // Aneutronic p + B-11 -> 3 He-4 (no neutrons!)
-      if (pixel.temp >= 55000 && Math.random() < 0.20) {
+      if (UPC_CONFIG.fusionRate > 0 && pixel.temp >= 55000 && Math.random() < 0.20 * UPC_CONFIG.fusionRate) {
         const h = findAdjacentElement(pixel, "hydrogen");
         if (h) {
           safeChange(pixel, "helium");
           safeChange(h, "helium");
-          pixel.temp += 9500;
-          h.temp += 9500;
+          pixel.temp += 9500; h.temp += 9500;
           return;
         }
       }
@@ -2882,7 +3023,7 @@
     density: 8650,
     conduct: 0.7,
     hardness: 0.45,
-    desc: "Control-rod metal with huge thermal neutron capture cross-section."
+    desc: "Control-rod metal with massive thermal neutron cross-section."
   });
 
   defineFullElement({
@@ -2896,7 +3037,7 @@
     density: 13310,
     conduct: 0.55,
     hardness: 0.88,
-    desc: "High-temp submarine-reactor control rod absorber."
+    desc: "Refractory submarine-reactor control rod absorber."
   });
 
   defineFullElement({
@@ -2988,7 +3129,7 @@
     density: 8900,
     conduct: 0.72,
     hardness: 0.78,
-    desc: "Neutron-activated Cobalt-60. Intense gamma-ray source.",
+    desc: "Neutron-activated Cobalt-60. Intense gamma-ray emitter.",
     tick: function (pixel) {
       pixel.temp += 0.25;
       if (Math.random() < 0.015) spawnParticle(pixel.x, pixel.y, "gamma_ray", 1);
@@ -3008,7 +3149,7 @@
     conduct: 0.5,
     hardness: 0.65,
     behavior: behaviors.POWDER,
-    desc: "Rare-earth magnetic metal (Curie temp: 310 C). Use magnetize_tool to turn into Neodymium magnets."
+    desc: "Rare-earth magnetic metal (Curie temp: 310 C)."
   });
 
   defineFullElement({
@@ -3023,7 +3164,7 @@
     conduct: 0.45,
     hardness: 0.6,
     behavior: behaviors.POWDER,
-    desc: "Magnetic thermal switch! Ferromagnetic below 20 C, completely non-magnetic above 20 C."
+    desc: "Magnetic thermal switch: ferromagnetic below 20 C, non-magnetic above 20 C."
   });
 
   defineFullElement({
@@ -3038,7 +3179,7 @@
     conduct: 0.25,
     hardness: 0.4,
     behavior: behaviors.POWDER,
-    desc: "Iridescent crystal metal and the strongest room-temp diamagnet — weakly repelled by BOTH North and South poles!"
+    desc: "Strongest room-temp diamagnet — weakly repelled by both North and South poles."
   });
 
   defineFullElement({
@@ -3091,7 +3232,7 @@
     conduct: 0.72,
     hardness: 0.1,
     behavior: behaviors.POWDER,
-    desc: "Melts at 28.5 C; detonates violently on contact with water or ice. Store under Argon!",
+    desc: "Melts at 28.5 C; detonates violently on contact with water or ice.",
     reactions: {
       water:  { chance: 0.9, func: function (p1) { safeChange(p1, "hydrogen"); p1.temp += 1200; explodeAt(p1.x, p1.y, 4, "fire,hydrogen,steam"); } },
       ice:    { chance: 0.7, func: function (p1) { safeChange(p1, "hydrogen"); explodeAt(p1.x, p1.y, 4, "fire,hydrogen,steam"); } },
@@ -3128,7 +3269,7 @@
     density: 5910,
     conduct: 0.65,
     hardness: 0.35,
-    desc: "Melts in your hand (29.8 C). Liquid-metal embrittlement turns solid aluminum into brittle scrap.",
+    desc: "Melts in your hand (29.8 C). Embrittles solid aluminum into scrap.",
     reactions: {
       aluminum: { elem2: "metal_scrap", chance: 0.25 }
     }
@@ -3146,13 +3287,10 @@
     conduct: 0.05,
     hardness: 0.2,
     behavior: behaviors.POWDER,
-    desc: "Pyrophoric White Phosphorus. Auto-ignites in oxygen (>30 C). Heat >250 C without oxygen to convert into stable Red Phosphorus!",
+    desc: "Pyrophoric White Phosphorus. Auto-ignites in oxygen (>30 C); heat >250 C without oxygen to form Red Phosphorus.",
     tick: function (pixel) {
       if (pixel.temp >= 250 && pixel.temp < 400 && Math.random() < 0.04) {
-        if (!findAdjacentElement(pixel, "oxygen")) {
-          safeChange(pixel, "phosphorus_red");
-          return;
-        }
+        if (!findAdjacentElement(pixel, "oxygen")) { safeChange(pixel, "phosphorus_red"); return; }
       }
       doDefaults(pixel);
     },
@@ -3173,7 +3311,7 @@
     conduct: 0.05,
     hardness: 0.35,
     behavior: behaviors.POWDER,
-    desc: "Stable polymeric Red Phosphorus (matchbox striker). Ignites in oxygen only above 260 C.",
+    desc: "Stable polymeric Red Phosphorus. Ignites in oxygen above 260 C.",
     reactions: {
       oxygen: { elem1: "fire", elem2: "smoke", tempMin: 260, chance: 0.35, func: function (p1) { p1.temp += 700; } }
     }
@@ -3191,7 +3329,7 @@
     conduct: 0.1,
     hardness: 0.9,
     behavior: behaviors.POWDER,
-    desc: "Aluminum Oxide (Al2O3) ceramic slag produced by Thermite reactions (rust + aluminum > 1,200 C)."
+    desc: "Aluminum Oxide (Al2O3) ceramic slag produced by Thermite (rust + aluminum > 1,200 C)."
   });
 
   defineFullElement({
@@ -3205,15 +3343,374 @@
     density: 22590,
     conduct: 0.7,
     hardness: 0.95,
-    desc: "Densest naturally occurring element on Earth (22,590 kg/m^3). Exceptional gamma shield."
+    desc: "Densest natural element on Earth (22,590 kg/m^3). Exceptional gamma shield."
   });
 
   // ---------------------------------------------------------------------------
-  // 10. PATCH VANILLA & CHEM.JS + HOOK GLOBAL ENGINE & VISUALS
+  // 11. BUILT-IN DARK-MODE IN-GAME SETTINGS PANEL + BETTERSETTINGS SYNC
+  // ---------------------------------------------------------------------------
+
+  const uiControls = {};
+  let statsEl = null;
+  let panelEl = null;
+
+  function syncSettingsUI() {
+    for (const key of Object.keys(uiControls)) {
+      const ctrl = uiControls[key];
+      if (!ctrl) continue;
+      if (ctrl.type === "checkbox") {
+        ctrl.checked = !!UPC_CONFIG[key];
+      } else {
+        ctrl.value = String(UPC_CONFIG[key]);
+      }
+      if (ctrl._valLabel) {
+        ctrl._valLabel.textContent = String(UPC_CONFIG[key]);
+      }
+    }
+  }
+
+  function applyPreset(name) {
+    if (name === "default") {
+      Object.assign(UPC_CONFIG, DEFAULT_CONFIG);
+    } else if (name === "stellar") {
+      Object.assign(UPC_CONFIG, {
+        gravityMethod: "star",
+        fieldTileSize: 4,
+        fieldRebuildInterval: 2,
+        gravAccel: 0.042,
+        starDrag: 0.998,
+        fusionRate: 1.5,
+        supernovaEnabled: true,
+        autoBonding: false
+      });
+    } else if (name === "reactor") {
+      Object.assign(UPC_CONFIG, {
+        gravityMethod: "element",
+        fieldTileSize: 4,
+        fieldRebuildInterval: 2,
+        fissionHeatScale: 1.0,
+        maxNeutrons: 480,
+        delayedNeutrons: true,
+        plasmaConfinement: true,
+        autoBonding: true
+      });
+    } else if (name === "fast") {
+      Object.assign(UPC_CONFIG, {
+        gravityMethod: "com",
+        fieldTileSize: 6,
+        fieldRebuildInterval: 4,
+        maxNeutrons: 200,
+        maxBonds: 300,
+        showFields: false
+      });
+    }
+    applyUPCConfig(true);
+    notifyUser("Unified Physics preset applied: " + name);
+  }
+
+  function createSettingsUI() {
+    if (typeof document === "undefined" || document.getElementById("upc-settings-btn")) return;
+
+    const style = document.createElement("style");
+    style.id = "upc-settings-style";
+    style.textContent = `
+      #upc-settings-btn {
+        position: fixed; top: 10px; right: 12px; z-index: 99998;
+        background: #181a22; color: #e6ecff; border: 1px solid #3c4663;
+        border-radius: 6px; padding: 6px 11px; font: 600 12px/1 system-ui, sans-serif;
+        cursor: pointer; box-shadow: 0 2px 10px rgba(0,0,0,0.45);
+      }
+      #upc-settings-btn:hover { background: #232838; border-color: #66b2ff; }
+      #upc-settings-panel {
+        position: fixed; top: 44px; right: 12px; z-index: 99999;
+        width: 325px; max-height: calc(100vh - 64px); overflow-y: auto;
+        background: rgba(18, 20, 27, 0.96); color: #e2e8f5;
+        border: 1px solid #343d54; border-radius: 9px; padding: 12px 14px;
+        font: 12px/1.4 system-ui, -apple-system, sans-serif;
+        box-shadow: 0 10px 28px rgba(0,0,0,0.65); display: none;
+      }
+      #upc-settings-panel h3 {
+        margin: 0 0 8px 0; font-size: 14px; color: #7cc4ff;
+        display: flex; justify-content: space-between; align-items: center;
+      }
+      #upc-settings-panel .upc-sec {
+        margin: 10px 0 5px 0; padding-top: 7px; border-top: 1px solid #2b3245;
+        font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: #8c9bbd;
+      }
+      #upc-settings-panel .upc-row {
+        display: flex; align-items: center; justify-content: space-between;
+        gap: 8px; margin: 5px 0;
+      }
+      #upc-settings-panel label { flex: 1; color: #d5ddf0; }
+      #upc-settings-panel select, #upc-settings-panel input[type="range"] {
+        width: 140px; background: #101218; color: #eef3ff;
+        border: 1px solid #39435e; border-radius: 4px; padding: 2px 4px; font-size: 11.5px;
+      }
+      #upc-settings-panel .upc-val {
+        width: 38px; text-align: right; color: #8cd1ff; font-variant-numeric: tabular-nums;
+      }
+      #upc-settings-panel .upc-presets {
+        display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin: 6px 0 8px 0;
+      }
+      #upc-settings-panel button.upc-act {
+        background: #23293a; color: #dce6ff; border: 1px solid #3a4563;
+        border-radius: 5px; padding: 5px 7px; font-size: 11px; cursor: pointer;
+      }
+      #upc-settings-panel button.upc-act:hover { background: #2e3852; border-color: #7cc4ff; }
+      #upc-stats-bar {
+        background: #11131a; border: 1px solid #272e40; border-radius: 5px;
+        padding: 6px 8px; font: 11px/1.45 ui-monospace, Consolas, monospace; color: #9ad1b8;
+        margin-bottom: 6px;
+      }
+    `;
+    document.head.appendChild(style);
+
+    const btn = document.createElement("button");
+    btn.id = "upc-settings-btn";
+    btn.textContent = "Physics Settings";
+    btn.title = "Open Unified Physics & Chemistry Settings (Shift+P)";
+    document.body.appendChild(btn);
+
+    panelEl = document.createElement("div");
+    panelEl.id = "upc-settings-panel";
+
+    // Prevent clicks/keys inside panel from painting on canvas or triggering game hotkeys
+    ["mousedown", "mouseup", "click", "wheel", "keydown", "keyup", "touchstart"].forEach(ev => {
+      panelEl.addEventListener(ev, e => e.stopPropagation());
+    });
+
+    const header = document.createElement("h3");
+    header.innerHTML = '<span>Unified Physics v4</span><span style="font-size:11px;color:#7e8ba8;cursor:pointer;" id="upc-close-x">✕</span>';
+    panelEl.appendChild(header);
+
+    statsEl = document.createElement("div");
+    statsEl.id = "upc-stats-bar";
+    statsEl.textContent = "Tick: 0.00 ms | Bonds: 0 | Neutrons: 0";
+    panelEl.appendChild(statsEl);
+
+    // Quick Presets
+    const presetRow = document.createElement("div");
+    presetRow.className = "upc-presets";
+    [
+      ["default", "Balanced Default"],
+      ["stellar", "Stellar / Supernova"],
+      ["reactor", "Reactor & Chem"],
+      ["fast", "High-FPS Mode"]
+    ].forEach(([id, label]) => {
+      const b = document.createElement("button");
+      b.className = "upc-act";
+      b.textContent = label;
+      b.onclick = () => applyPreset(id);
+      presetRow.appendChild(b);
+    });
+    panelEl.appendChild(presetRow);
+
+    function addSection(title) {
+      const s = document.createElement("div");
+      s.className = "upc-sec";
+      s.textContent = title;
+      panelEl.appendChild(s);
+    }
+
+    function addSelect(label, key, options) {
+      const row = document.createElement("div");
+      row.className = "upc-row";
+      const lbl = document.createElement("label");
+      lbl.textContent = label;
+      const sel = document.createElement("select");
+      options.forEach(([val, text]) => {
+        const opt = document.createElement("option");
+        opt.value = String(val);
+        opt.textContent = text;
+        sel.appendChild(opt);
+      });
+      sel.value = String(UPC_CONFIG[key]);
+      sel.onchange = () => {
+        const parsed = Number(sel.value);
+        UPC_CONFIG[key] = Number.isNaN(parsed) ? sel.value : parsed;
+        applyUPCConfig(true);
+      };
+      uiControls[key] = sel;
+      row.appendChild(lbl);
+      row.appendChild(sel);
+      panelEl.appendChild(row);
+    }
+
+    function addSlider(label, key, min, max, step) {
+      const row = document.createElement("div");
+      row.className = "upc-row";
+      const lbl = document.createElement("label");
+      lbl.textContent = label;
+      const inp = document.createElement("input");
+      inp.type = "range";
+      inp.min = String(min);
+      inp.max = String(max);
+      inp.step = String(step);
+      inp.value = String(UPC_CONFIG[key]);
+      const val = document.createElement("span");
+      val.className = "upc-val";
+      val.textContent = String(UPC_CONFIG[key]);
+      inp._valLabel = val;
+      inp.oninput = () => {
+        UPC_CONFIG[key] = Number(inp.value);
+        val.textContent = inp.value;
+        applyUPCConfig(true);
+      };
+      uiControls[key] = inp;
+      row.appendChild(lbl);
+      row.appendChild(inp);
+      row.appendChild(val);
+      panelEl.appendChild(row);
+    }
+
+    function addToggle(label, key) {
+      const row = document.createElement("div");
+      row.className = "upc-row";
+      const lbl = document.createElement("label");
+      lbl.textContent = label;
+      const chk = document.createElement("input");
+      chk.type = "checkbox";
+      chk.checked = !!UPC_CONFIG[key];
+      chk.onchange = () => {
+        UPC_CONFIG[key] = chk.checked;
+        applyUPCConfig(true);
+      };
+      uiControls[key] = chk;
+      row.appendChild(lbl);
+      row.appendChild(chk);
+      panelEl.appendChild(row);
+    }
+
+    addSection("Gravity & Tile Engine");
+    addSelect("Gravity Method", "gravityMethod", [
+      ["element", "Element-Based (star_gravity / wells)"],
+      ["star", "Multi-Body Tiles (Always On)"],
+      ["com", "Fast Single Center-of-Mass"],
+      ["wells_only", "Gravity Wells / Cores Only"],
+      ["off", "Off (Vanilla Only)"]
+    ]);
+    addSelect("Tile Resolution", "fieldTileSize", [
+      [2, "2x2 (Ultra Sharp)"],
+      [4, "4x4 (Balanced)"],
+      [6, "6x6 (Fast)"],
+      [8, "8x8 (Max FPS)"]
+    ]);
+    addSlider("Rebuild Every (ticks)", "fieldRebuildInterval", 1, 6, 1);
+    addSlider("Gravity Strength", "gravAccel", 0, 0.12, 0.004);
+    addSlider("Max Pixel Speed", "maxSpeed", 0.5, 3.5, 0.1);
+    addSlider("Orbital Drag", "starDrag", 0.94, 1.0, 0.002);
+
+    addSection("Magnets & Plasma");
+    addSlider("Magnetic Strength", "magScale", 0, 3.0, 0.1);
+    addToggle("Tokamak Plasma Confinement", "plasmaConfinement");
+    addToggle("Curie Temp Demagnetization", "curieDemagnetize");
+    addToggle("Show Field Vectors Overlay", "showFields");
+
+    addSection("Nuclear & Fusion");
+    addSlider("Fusion Rate", "fusionRate", 0, 3.0, 0.1);
+    addSlider("Fission Heat Scale", "fissionHeatScale", 0.2, 3.0, 0.1);
+    addSlider("Neutron Cap", "maxNeutrons", 60, 800, 20);
+    addToggle("Delayed Neutrons", "delayedNeutrons");
+    addToggle("Supernova Core Collapse", "supernovaEnabled");
+
+    addSection("Chemical Bonding");
+    addToggle("Auto Chemical Bonding", "autoBonding");
+    addToggle("Render Bond Lines", "showBonds");
+    addSlider("Max Bond Edges", "maxBonds", 0, 1800, 50);
+
+    // Action buttons
+    const actRow = document.createElement("div");
+    actRow.className = "upc-presets";
+    const clearBondBtn = document.createElement("button");
+    clearBondBtn.className = "upc-act";
+    clearBondBtn.textContent = "Break All Bonds";
+    clearBondBtn.onclick = () => { clearAllBonds(); notifyUser("Cleared all chemical bonds."); };
+
+    const zeroVelBtn = document.createElement("button");
+    zeroVelBtn.className = "upc-act";
+    zeroVelBtn.textContent = "Zero All Velocity";
+    zeroVelBtn.onclick = () => {
+      for (let i = 0; i < currentPixels.length; i++) {
+        const p = currentPixels[i];
+        if (p) { p.vx = 0; p.vy = 0; p.rx = 0; p.ry = 0; }
+      }
+      movingPixelsLastTick = 0;
+      notifyUser("Zeroed velocity on all pixels.");
+    };
+    actRow.appendChild(clearBondBtn);
+    actRow.appendChild(zeroVelBtn);
+    panelEl.appendChild(actRow);
+
+    document.body.appendChild(panelEl);
+
+    const togglePanel = () => {
+      const open = panelEl.style.display === "block";
+      panelEl.style.display = open ? "none" : "block";
+      if (!open) syncSettingsUI();
+    };
+
+    btn.onclick = (e) => { e.stopPropagation(); togglePanel(); };
+    const closeX = document.getElementById("upc-close-x");
+    if (closeX) closeX.onclick = togglePanel;
+
+    window.addEventListener("keydown", function (e) {
+      if (e.shiftKey && (e.key === "P" || e.key === "p")) {
+        const tag = document.activeElement?.tagName;
+        if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+        e.preventDefault();
+        togglePanel();
+      }
+    });
+
+    // Lightweight 2Hz telemetry refresh only while panel is open
+    setInterval(function () {
+      if (!panelEl || panelEl.style.display !== "block" || !statsEl) return;
+      statsEl.textContent =
+        `Tick: ${UPC_STATS.lastTickMs.toFixed(2)} ms | Moving: ${UPC_STATS.movingPixels}\n` +
+        `Tiles G:${UPC_STATS.activeGravTiles} B:${UPC_STATS.activeMagTiles} | Bonds:${UPC_STATS.activeBonds} | n:${UPC_STATS.activeNeutrons}`;
+    }, 450);
+  }
+
+  function registerBetterSettingsTab() {
+    if (typeof SettingsTab !== "function" || typeof settingsManager === "undefined") return;
+    try {
+      const tab = new SettingsTab("Unified Physics");
+      const gravMode = new SelectSetting("Gravity Method", "upc_grav_method", [
+        ["element", "Element-Based"],
+        ["star", "Multi-Body Always On"],
+        ["com", "Fast Center-of-Mass"],
+        ["wells_only", "Wells/Cores Only"],
+        ["off", "Off"]
+      ]);
+      const tileSize = new SelectSetting("Gravity/Magnet Tile Size", "upc_tile_size", [
+        [2, "2x2"], [4, "4x4"], [6, "6x6"], [8, "8x8"]
+      ]);
+      const bind = (s, key) => {
+        if (s && typeof s.onUpdate === "function") {
+          s.onUpdate(val => { UPC_CONFIG[key] = val; applyUPCConfig(true); });
+        }
+        if (typeof tab.registerSetting === "function") tab.registerSetting(s);
+      };
+      bind(gravMode, "gravityMethod");
+      bind(tileSize, "fieldTileSize");
+      if (typeof Setting === "function" && typeof settingType !== "undefined") {
+        bind(new Setting("Auto Chemical Bonding", "upc_auto_bond", settingType.BOOLEAN, false, UPC_CONFIG.autoBonding), "autoBonding");
+        bind(new Setting("Show Field Vectors", "upc_show_fields", settingType.BOOLEAN, false, UPC_CONFIG.showFields), "showFields");
+      }
+      settingsManager.registerTab(tab);
+    } catch (err) {
+      // Built-in Physics Settings panel still works independently
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // 12. PATCH VANILLA & CHEM.JS + HOOK GLOBAL ENGINE
   // ---------------------------------------------------------------------------
 
   function initUnifiedPhysics() {
-    // 1. Iron gas state for hot stellar cores
+    applyUPCConfig(false);
+
+    // 1. Iron gas state for stellar cores
     if (!elements.iron_gas) {
       registerOrEnhance("iron_gas", {
         color: ["#ffb870", "#ffc98f"],
@@ -3234,7 +3731,7 @@
 
     // 2. Patch vanilla neutron, uranium, plutonium
     if (elements.neutron) {
-      elements.neutron.desc = "Free neutron (enhanced by Unified Physics & Chemistry v3).";
+      elements.neutron.desc = "Free neutron (enhanced by Unified Physics & Chemistry v4).";
       if (!elements.neutron.reactions) elements.neutron.reactions = {};
       elements.neutron.tick = function (pixel) { neutronTick(pixel, true); };
     }
@@ -3257,13 +3754,12 @@
     // 3. Stellar Fusion Hooks on Vanilla Gases (all inside tick -> crash-proof!)
     if (elements.hydrogen) {
       wrapTick("hydrogen", function (pixel) {
-        if (pixel.temp >= 50000 && Math.random() < 0.16) {
+        if (UPC_CONFIG.fusionRate > 0 && pixel.temp >= 50000 && Math.random() < 0.16 * UPC_CONFIG.fusionRate) {
           const other = findAdjacentElement(pixel, "hydrogen");
           if (other) {
             safeChange(pixel, "deuterium");
             safeChangeAny(other, ["positron", "gamma_ray", "radiation"]);
-            pixel.temp += 4000;
-            other.temp += 4000;
+            pixel.temp += 4000; other.temp += 4000;
             return true;
           }
         }
@@ -3273,13 +3769,12 @@
 
     if (elements.helium) {
       wrapTick("helium", function (pixel) {
-        if (pixel.temp >= 65000 && Math.random() < 0.15) {
+        if (UPC_CONFIG.fusionRate > 0 && pixel.temp >= 65000 && Math.random() < 0.15 * UPC_CONFIG.fusionRate) {
           const other = findAdjacentElement(pixel, "helium");
           if (other) {
             safeChange(pixel, "carbon_vapor");
             safeChange(other, "gamma_ray");
-            pixel.temp += 5500;
-            other.temp += 5500;
+            pixel.temp += 5500; other.temp += 5500;
             return true;
           }
         }
@@ -3289,7 +3784,7 @@
 
     if (elements.oxygen) {
       wrapTick("oxygen", function (pixel) {
-        if (pixel.temp >= 95000 && Math.random() < 0.16) {
+        if (UPC_CONFIG.fusionRate > 0 && pixel.temp >= 95000 && Math.random() < 0.16 * UPC_CONFIG.fusionRate) {
           const other = findAdjacentElement(pixel, "oxygen");
           if (other) {
             if (Math.random() < 0.75) {
@@ -3298,8 +3793,7 @@
               safeChangeAny(pixel, ["sulfur_gas", "molten_sulfur", "sulfur", "silicon_gas"]);
             }
             safeChange(other, "gamma_ray");
-            pixel.temp += 4000;
-            other.temp += 4000;
+            pixel.temp += 4000; other.temp += 4000;
             return true;
           }
         }
@@ -3307,7 +3801,7 @@
       });
     }
 
-    // 4. High-Temperature Thermal Dissociation (CO2, Steam, Ammonia, Sand/SiO2)
+    // 4. High-Temperature Thermal Dissociation
     if (elements.carbon_dioxide) {
       wrapTick("carbon_dioxide", function (pixel) {
         if (pixel.temp >= 4000 && Math.random() < 0.25) {
@@ -3345,17 +3839,14 @@
       });
     }
 
-    // 5. Thermite Reaction (Rust + Aluminum > 1,200 C -> Molten Iron + Alumina + 2,500 C flash!)
+    // 5. Thermite Reaction (Rust + Aluminum > 1,200 C)
     if (elements.rust && elements.aluminum) {
       safeAddReaction("rust", "aluminum", {
         elem1: "molten_iron",
         elem2: "alumina",
         tempMin: 1200,
         chance: 0.45,
-        func: function (p1, p2) {
-          p1.temp += 1800;
-          p2.temp += 1800;
-        }
+        func: function (p1, p2) { p1.temp += 1800; p2.temp += 1800; }
       });
     }
 
@@ -3370,24 +3861,26 @@
       };
     }
 
-    // 7. Hook global simulation tick (guarded against double-wrap)
+    // 7. Hook global simulation tick with live timing
     if (typeof window !== "undefined" && typeof window.tickPixels === "function" && !window.tickPixels._upcWrapped) {
       const origTickPixels = window.tickPixels;
       const wrappedTick = function (...args) {
         const res = origTickPixels.apply(this, args);
+        const t0 = performance.now();
         try {
           updateGravityAndCompressionTick();
           updateBondsTick();
         } catch (err) {
           console.error("[unified_physics_chem] global tick error:", err);
         }
+        UPC_STATS.lastTickMs = performance.now() - t0;
         return res;
       };
       wrappedTick._upcWrapped = true;
       window.tickPixels = wrappedTick;
     }
 
-    // 8. Hook canvas render for visible chemical bonds & live field vector overlay
+    // 8. Hook canvas render for field vectors & chemical bond lines
     if (typeof window !== "undefined" && typeof window.drawPixels === "function" && !window.drawPixels._upcWrapped) {
       const origDrawPixels = window.drawPixels;
       const wrappedDraw = function (...args) {
@@ -3402,7 +3895,7 @@
       window.drawPixels = wrappedDraw;
     }
 
-    // 9. Global safety sweep (preserves tools; eliminates null/non-function ticks)
+    // 9. Global safety sweep (preserves tools; strips any non-function tick)
     for (const key in elements) {
       const el = elements[key];
       if (!el || el.tool) continue;
@@ -3417,7 +3910,15 @@
       }
     }
 
-    console.log("[unified_physics_chem] Loaded v3 successfully!");
+    // 10. Mount built-in Settings Panel & optional betterSettings.js tab
+    createSettingsUI();
+    if (typeof SettingsTab === "function") {
+      registerBetterSettingsTab();
+    } else if (typeof dependOn === "function") {
+      dependOn("betterSettings.js", registerBetterSettingsTab, true);
+    }
+
+    console.log("[unified_physics_chem] Loaded v4 successfully!");
   }
 
   if (typeof runAfterLoad === "function") {
