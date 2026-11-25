@@ -23,21 +23,26 @@
   }
 
   function registerOrEnhance(name, def) {
+    const clean = {};
+    for (const key of Object.keys(def)) {
+      if (key === "_override") continue;
+      if (key === "tick" && typeof def[key] !== "function") continue;
+      if (def[key] === undefined || def[key] === null) continue;
+      clean[key] = def[key];
+    }
+
     if (elements[name]) {
       const existing = elements[name];
-      if (def.reactions) {
-        existing.reactions = Object.assign({}, existing.reactions || {}, def.reactions);
+      if (clean.reactions) {
+        existing.reactions = Object.assign({}, existing.reactions || {}, clean.reactions);
       }
-      // Preserve existing chem.js properties unless explicitly overriding physics
-      for (const key of Object.keys(def)) {
+      for (const key of Object.keys(clean)) {
         if (key === "reactions") continue;
         if (existing[key] === undefined || def._override) {
-          existing[key] = def[key];
+          existing[key] = clean[key];
         }
       }
     } else {
-      const clean = Object.assign({}, def);
-      delete clean._override;
       elements[name] = clean;
     }
   }
@@ -59,15 +64,16 @@
       hardness = 0.7,
       behavior = behaviors.WALL,
       reactions = {},
-      tick = null,
+      tick,
       desc = "",
       extra = {}
     } = cfg;
 
     const moltenId = "molten_" + id;
     const gasId = id + "_gas";
+    const hasTick = typeof tick === "function";
 
-    registerOrEnhance(id, Object.assign({
+    const solidDef = Object.assign({
       color,
       behavior,
       category,
@@ -78,11 +84,12 @@
       tempHigh: meltTemp,
       stateHigh: moltenId,
       reactions,
-      tick,
       desc
-    }, extra));
+    }, extra);
+    if (hasTick) solidDef.tick = tick;
+    registerOrEnhance(id, solidDef);
 
-    registerOrEnhance(moltenId, {
+    const moltenDef = {
       color: moltenColor || ["#ff7b29", "#ff9e3d", "#ffb84d"],
       behavior: behaviors.MOLTEN,
       category: "states",
@@ -96,9 +103,10 @@
       tempHigh: boilTemp,
       stateHigh: gasId,
       viscosity: 15,
-      reactions,
-      tick
-    });
+      reactions
+    };
+    if (hasTick) moltenDef.tick = tick;
+    registerOrEnhance(moltenId, moltenDef);
 
     registerOrEnhance(gasId, {
       color: gasColor || ["#d9d9d9", "#bfbfbf"],
@@ -128,15 +136,16 @@
       meltTemp,
       density,
       reactions = {},
-      tick = null,
+      tick,
       desc = "",
       extra = {}
     } = cfg;
 
     const liquidId = "liquid_" + id;
     const solidId = "solid_" + id;
+    const hasTick = typeof tick === "function";
 
-    registerOrEnhance(id, Object.assign({
+    const gasDef = Object.assign({
       color,
       behavior: behaviors.GAS,
       category,
@@ -145,11 +154,12 @@
       tempLow: boilTemp,
       stateLow: liquidId,
       reactions,
-      tick,
       desc
-    }, extra));
+    }, extra);
+    if (hasTick) gasDef.tick = tick;
+    registerOrEnhance(id, gasDef);
 
-    registerOrEnhance(liquidId, {
+    const liquidDef = {
       color: liquidColor || color,
       behavior: behaviors.LIQUID,
       category: "states",
@@ -161,11 +171,12 @@
       stateHigh: id,
       tempLow: meltTemp,
       stateLow: solidId,
-      reactions,
-      tick
-    });
+      reactions
+    };
+    if (hasTick) liquidDef.tick = tick;
+    registerOrEnhance(liquidId, liquidDef);
 
-    registerOrEnhance(solidId, {
+    const solidDef = {
       color: solidColor || liquidColor || color,
       behavior: behaviors.WALL,
       category: "states",
@@ -175,9 +186,10 @@
       temp: meltTemp - 5,
       tempHigh: meltTemp,
       stateHigh: liquidId,
-      reactions,
-      tick
-    });
+      reactions
+    };
+    if (hasTick) solidDef.tick = tick;
+    registerOrEnhance(solidId, solidDef);
   }
 
   // ---------------------------------------------------------------------------
