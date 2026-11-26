@@ -1,12 +1,12 @@
 /*
- * Unified Physics & Chemistry v6.1 (unified_physics_chem.js)
+ * Unified Physics & Chemistry v7 (unified_physics_chem.js)
  * Companion add-on for Sandboxels + chem.js
- * - Cloud-In-Cell (CIC) 2x2..8x8 Gravity & Magnetic Tiles (zero self-force) + Per-Pixel Velocity
- * - 8-neighbor velocity-driven compression (solids: stress/pressure, zero static heat;
- *   liquids: Pascal lateral flow; gases: adiabatic P dV heating + stellar pause/re-compression)
- * - Full stellar & reactor fusion (D-T -> p-p -> He -> C -> Ne/Mg -> O -> Si -> Ni56 -> Co56 -> Fe -> Supernova)
- * - Crash-proof neutron fission + Alpha/Beta/Gamma radiation + External-Map Bond Graph (Undo/Save safe)
- * - Supernova recursive tick1/tick2 cycle breaker + Dark-Mode Settings Panel ("Physics Settings" / Shift+P)
+ * - Slower, watchable fusion, fission & decay pacing (+ Fission Rate & Collapse Threshold sliders)
+ * - Velocity-convergence degeneracy crush: high infall -> Neutron Star (neutronium),
+ *   extreme infall or TOV overload on neutronium -> Black Hole (black_hole_core)
+ * - Gigantic multi-tick expanding Supernova shockwaves (50-68px radius) + r-process nucleosynthesis
+ * - CIC 2x2..8x8 Gravity & Magnetic Tiles + 8-neighbor state-aware compression + External Bond Graph
+ * - Supernova recursive tick1/tick2 cycle breaker + Dark-Mode Settings Panel (Shift+P)
  */
 
 (function () {
@@ -16,7 +16,7 @@
   // 1. LIVE CONFIGURATION & PERSISTENCE
   // ---------------------------------------------------------------------------
 
-  const STORAGE_KEY = "upc_v6_settings";
+  const STORAGE_KEY = "upc_v7_settings";
   const DEFAULT_CONFIG = {
     gravityMethod: "element",     // "element" | "star" | "com" | "wells_only" | "off"
     fieldTileSize: 4,             // 2 | 4 | 6 | 8
@@ -24,10 +24,12 @@
     gravAccel: 0.032,
     compressionHeatScale: 1.0,
     radiativeCooling: true,
+    collapseThresholdScale: 1.0,  // Scales Neutron Star & Black Hole velocity-crush thresholds
     magScale: 1.0,
     maxSpeed: 2.6,
     starDrag: 0.996,
     fusionRate: 1.0,
+    fissionRate: 1.0,
     fissionHeatScale: 1.0,
     maxNeutrons: 320,
     maxBonds: 700,
@@ -73,6 +75,8 @@
     GRAV_ACCEL = Number.isNaN(ga) ? DEFAULT_CONFIG.gravAccel : Math.max(0, Math.min(0.25, ga));
     const cs = Number(UPC_CONFIG.compressionHeatScale);
     UPC_CONFIG.compressionHeatScale = Number.isNaN(cs) ? 1.0 : Math.max(0, Math.min(2.5, cs));
+    const ct = Number(UPC_CONFIG.collapseThresholdScale);
+    UPC_CONFIG.collapseThresholdScale = Number.isNaN(ct) ? 1.0 : Math.max(0.3, Math.min(3.0, ct));
     const ms = Number(UPC_CONFIG.magScale);
     const sms = Number.isNaN(ms) ? 1.0 : Math.max(0, Math.min(4.0, ms));
     MAG_POLE_ACCEL = 0.18 * sms;
@@ -86,6 +90,8 @@
     UPC_CONFIG.starDrag = Math.max(0.85, Math.min(1.0, Number(UPC_CONFIG.starDrag) || 0.996));
     const fr = Number(UPC_CONFIG.fusionRate);
     UPC_CONFIG.fusionRate = Number.isNaN(fr) ? 1.0 : Math.max(0, Math.min(3.0, fr));
+    const fisr = Number(UPC_CONFIG.fissionRate);
+    UPC_CONFIG.fissionRate = Number.isNaN(fisr) ? 1.0 : Math.max(0.1, Math.min(3.0, fisr));
     UPC_CONFIG.fissionHeatScale = Math.max(0.2, Math.min(3.0, Number(UPC_CONFIG.fissionHeatScale) || 1.0));
     lastFieldTick = -100;
     if (persist) saveConfig();
@@ -152,7 +158,7 @@
   function getFusionFactor(pixel) {
     if (UPC_CONFIG.fusionRate <= 0) return 0;
     const comp = pixel.comp || 1.0;
-    return UPC_CONFIG.fusionRate * Math.min(2.6, 0.75 + Math.max(0, comp - 1.0) * 0.55);
+    return UPC_CONFIG.fusionRate * Math.min(2.2, 0.7 + Math.max(0, comp - 1.0) * 0.35);
   }
 
   function safeAddReaction(elemName, targetName, reactionObj) {
@@ -264,21 +270,21 @@
 
   const RADIOLYSIS_AGENTS = new Set(["radiation", "fast_neutron", "alpha_particle", "beta_particle", "gamma_ray"]);
   const AUTO_BOND_RULES = {
-    "hydrogen|hydrogen":   { type: "covalent", breakTemp: 3500, minTemp: -250, maxTemp: 2500, prob: 0.08, maxA: 1, maxB: 1 },
-    "hydrogen|oxygen":     { type: "polar",    breakTemp: 2800, minTemp: 120,  maxTemp: 2200, prob: 0.14, maxA: 1, maxB: 2 },
-    "deuterium|oxygen":    { type: "polar",    breakTemp: 2850, minTemp: 120,  maxTemp: 2200, prob: 0.14, maxA: 1, maxB: 2 },
-    "chlorine|sodium":     { type: "ionic",    breakTemp: 1450, minTemp: -50,  maxTemp: 1100, prob: 0.22, maxA: 1, maxB: 1 },
-    "chlorine|hydrogen":   { type: "polar",    breakTemp: 2200, minTemp: -100, maxTemp: 1600, prob: 0.14, maxA: 1, maxB: 1 },
-    "nitrogen|nitrogen":   { type: "covalent", breakTemp: 5500, minTemp: -200, maxTemp: 4000, prob: 0.06, maxA: 1, maxB: 1 },
-    "hydrogen|nitrogen":   { type: "polar",    breakTemp: 1300, minTemp: 350,  maxTemp: 900,  prob: 0.08, maxA: 1, maxB: 3 },
-    "carbon_vapor|oxygen": { type: "covalent", breakTemp: 3800, minTemp: 600,  maxTemp: 3200, prob: 0.12, maxA: 2, maxB: 2 },
-    "graphite|graphite":   { type: "covalent", breakTemp: 4200, minTemp: 800,  maxTemp: 3400, prob: 0.04, maxA: 3, maxB: 3 },
-    "silicon|silicon":     { type: "covalent", breakTemp: 2600, minTemp: 200,  maxTemp: 2200, prob: 0.04, maxA: 4, maxB: 4 },
-    "oxygen|silicon":      { type: "covalent", breakTemp: 3000, minTemp: 700,  maxTemp: 2400, prob: 0.10, maxA: 2, maxB: 4 },
-    "magnesium|oxygen":    { type: "ionic",    breakTemp: 2800, minTemp: 400,  maxTemp: 2300, prob: 0.18, maxA: 2, maxB: 2 },
-    "cesium|chlorine":     { type: "ionic",    breakTemp: 1300, minTemp: -50,  maxTemp: 900,  prob: 0.25, maxA: 1, maxB: 1 },
-    "iron|oxygen":         { type: "ionic",    breakTemp: 2200, minTemp: 300,  maxTemp: 1600, prob: 0.06, maxA: 2, maxB: 2 },
-    "aluminum|oxygen":     { type: "ionic",    breakTemp: 2900, minTemp: 500,  maxTemp: 2400, prob: 0.08, maxA: 3, maxB: 2 }
+    "hydrogen|hydrogen":   { type: "covalent", breakTemp: 3500, minTemp: -250, maxTemp: 2500, prob: 0.04, maxA: 1, maxB: 1 },
+    "hydrogen|oxygen":     { type: "polar",    breakTemp: 2800, minTemp: 120,  maxTemp: 2200, prob: 0.08, maxA: 1, maxB: 2 },
+    "deuterium|oxygen":    { type: "polar",    breakTemp: 2850, minTemp: 120,  maxTemp: 2200, prob: 0.08, maxA: 1, maxB: 2 },
+    "chlorine|sodium":     { type: "ionic",    breakTemp: 1450, minTemp: -50,  maxTemp: 1100, prob: 0.14, maxA: 1, maxB: 1 },
+    "chlorine|hydrogen":   { type: "polar",    breakTemp: 2200, minTemp: -100, maxTemp: 1600, prob: 0.08, maxA: 1, maxB: 1 },
+    "nitrogen|nitrogen":   { type: "covalent", breakTemp: 5500, minTemp: -200, maxTemp: 4000, prob: 0.03, maxA: 1, maxB: 1 },
+    "hydrogen|nitrogen":   { type: "polar",    breakTemp: 1300, minTemp: 350,  maxTemp: 900,  prob: 0.04, maxA: 1, maxB: 3 },
+    "carbon_vapor|oxygen": { type: "covalent", breakTemp: 3800, minTemp: 600,  maxTemp: 3200, prob: 0.06, maxA: 2, maxB: 2 },
+    "graphite|graphite":   { type: "covalent", breakTemp: 4200, minTemp: 800,  maxTemp: 3400, prob: 0.02, maxA: 3, maxB: 3 },
+    "silicon|silicon":     { type: "covalent", breakTemp: 2600, minTemp: 200,  maxTemp: 2200, prob: 0.02, maxA: 4, maxB: 4 },
+    "oxygen|silicon":      { type: "covalent", breakTemp: 3000, minTemp: 700,  maxTemp: 2400, prob: 0.05, maxA: 2, maxB: 4 },
+    "magnesium|oxygen":    { type: "ionic",    breakTemp: 2800, minTemp: 400,  maxTemp: 2300, prob: 0.10, maxA: 2, maxB: 2 },
+    "cesium|chlorine":     { type: "ionic",    breakTemp: 1300, minTemp: -50,  maxTemp: 900,  prob: 0.14, maxA: 1, maxB: 1 },
+    "iron|oxygen":         { type: "ionic",    breakTemp: 2200, minTemp: 300,  maxTemp: 1600, prob: 0.03, maxA: 2, maxB: 2 },
+    "aluminum|oxygen":     { type: "ionic",    breakTemp: 2900, minTemp: 500,  maxTemp: 2400, prob: 0.04, maxA: 3, maxB: 2 }
   };
 
   const getBonds = (p) => bondGraph.get(p) || null;
@@ -381,12 +387,12 @@
           if (!t || t.del || !inSafeBounds(t.x, t.y) || pixelMap[t.x][t.y] !== t) { breakBondBetween(p, t, false); continue; }
           const dist = Math.max(Math.abs(p.x - t.x), Math.abs(p.y - t.y));
           if (dist > 3 || p.temp > bond.breakTemp || t.temp > bond.breakTemp) { breakBondBetween(p, t, true); continue; }
-          if (((p.charge > 0) || (t.charge > 0)) && (bond.type === "ionic" || bond.type === "polar" || Math.random() < 0.4)) { breakBondBetween(p, t, true); continue; }
-          if (hitRad && Math.random() < 0.35) { breakBondBetween(p, t, true); continue; }
-          if (bond.type === "ionic" && hitWater && Math.random() < 0.18) { breakBondBetween(p, t, true); continue; }
+          if (((p.charge > 0) || (t.charge > 0)) && (bond.type === "ionic" || bond.type === "polar" || Math.random() < 0.3)) { breakBondBetween(p, t, true); continue; }
+          if (hitRad && Math.random() < 0.25) { breakBondBetween(p, t, true); continue; }
+          if (bond.type === "ionic" && hitWater && Math.random() < 0.10) { breakBondBetween(p, t, true); continue; }
 
           const avgT = (p.temp + t.temp) * 0.5;
-          p.temp += (avgT - p.temp) * 0.25; t.temp += (avgT - t.temp) * 0.25;
+          p.temp += (avgT - p.temp) * 0.2; t.temp += (avgT - t.temp) * 0.2;
           if (!isImmobileElement(p.element) && !isImmobileElement(t.element)) {
             const avx = ((p.vx || 0) + (t.vx || 0)) * 0.5, avy = ((p.vy || 0) + (t.vy || 0)) * 0.5;
             if (avx || avy) {
@@ -404,7 +410,7 @@
     }
 
     if (UPC_CONFIG.autoBonding && totalBondEdges < MAX_BONDS && currentPixels?.length) {
-      const samples = Math.min(85, currentPixels.length);
+      const samples = Math.min(45, currentPixels.length);
       for (let s = 0; s < samples && totalBondEdges < MAX_BONDS; s++) {
         const p = currentPixels[Math.floor(Math.random() * currentPixels.length)];
         if (!p || p.del || getBondCount(p) >= 3) continue;
@@ -447,11 +453,11 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 4. CIC GRAVITY & MAGNETIC TILES + 8-NEIGHBOR VELOCITY-DRIVEN COMPRESSION
+  // 4. CIC GRAVITY & MAGNETIC TILES + VELOCITY-CRUSH COLLAPSE + GIGANTIC SUPERNOVA
   // ---------------------------------------------------------------------------
 
   const IRON_FAMILY = new Set(["iron", "molten_iron", "iron_gas"]);
-  const SUPER_R_TARGETS = new Set(["iron", "molten_iron", "iron_gas", "nickel", "molten_nickel", "nickel_gas", "cobalt", "molten_cobalt"]);
+  const SUPER_R_TARGETS = new Set(["iron", "molten_iron", "iron_gas", "nickel", "molten_nickel", "nickel_gas", "cobalt", "molten_cobalt", "silicon_gas", "oxygen"]);
   const R_PRODUCTS = ["gold", "platinum", "lead", "thorium_232", "uranium_238", "uranium_235", "plutonium_239"];
   const STELLAR_GRAV_MASS = {
     hydrogen: 0.50, deuterium: 0.58, tritium: 0.64, helium_3: 0.66, helium: 0.74,
@@ -475,11 +481,15 @@
 
   const FIELD_SOFT_PX2 = 13.6;
   const SELF_PHI_UNIT = 4 / Math.sqrt(FIELD_SOFT_PX2);
+  const BASE_NEUTRON_CRUSH = 55;
+  const BASE_BH_CRUSH = 280;
 
-  let fieldMw = 0, fieldMh = 0, fieldKw = 0;
+  let fieldMw = 0, fieldMh = 0, fieldKw = 0, cellW = 0, cellH = 0;
   let kernelX = null, kernelY = null, kernelPhi = null;
   let macroMass = null, macroGx = null, macroGy = null, macroPhi = null, macroIron = null, macroHotIron = null;
   let macroPole = null, macroMagAbs = null, macroBx = null, macroBy = null, macroMagPot = null, macroBmag = null, macroGradBx = null, macroGradBy = null;
+  let cellCrush = null, crushHasActivity = false;
+  const activeShockwaves = [];
 
   let lastFieldTick = -100, lastSupernovaTick = -200;
   let gravFieldActive = false, magFieldActive = false, starModeActive = false, visualizerActive = false, movingPixelsLastTick = 0;
@@ -498,8 +508,15 @@
 
   function ensureFieldTables() {
     if (typeof width !== "number" || typeof height !== "number") return false;
-    const mw = Math.max(3, Math.ceil((width + 1) / FIELD_BLOCK) + 1);
-    const mh = Math.max(3, Math.ceil((height + 1) / FIELD_BLOCK) + 1);
+    const cw = width + 1, ch = height + 1;
+    if (cw !== cellW || ch !== cellH || !cellCrush) {
+      cellW = cw; cellH = ch;
+      cellCrush = new Float32Array(cw * ch);
+      crushHasActivity = false;
+    }
+
+    const mw = Math.max(3, Math.ceil(cw / FIELD_BLOCK) + 1);
+    const mh = Math.max(3, Math.ceil(ch / FIELD_BLOCK) + 1);
     if (mw === fieldMw && mh === fieldMh && FIELD_BLOCK === activeFieldBlock && kernelX) return true;
 
     activeFieldBlock = FIELD_BLOCK;
@@ -553,21 +570,79 @@
     return top + (bot - top) * ty;
   }
 
+  // Record converging gravitational velocity into a cell; trigger Neutron Star or Black Hole collapse
+  function recordGravitationalCrush(mover, target, gx, gy) {
+    if (!gravFieldActive || !cellCrush || !target || target.del) return;
+    const tElem = target.element;
+    if (tElem === "black_hole_core" || tElem === "star_gravity" || tElem === "field_visualizer" || tElem === "gravity_well") return;
+
+    const gMag = Math.hypot(gx, gy);
+    if (gMag < 0.25) return;
+    const inwardSpd = ((mover.vx || 0) * gx + (mover.vy || 0) * gy) / gMag;
+    if (inwardSpd <= 0.22) return;
+
+    const m = getPixelGravMass(mover.element, mover.comp || 1.0);
+    const crushAdd = inwardSpd * inwardSpd * m * 1.45;
+    const tIdx = target.y * cellW + target.x;
+    cellCrush[tIdx] = Math.min(2000, cellCrush[tIdx] + crushAdd);
+    const mIdx = mover.y * cellW + mover.x;
+    cellCrush[mIdx] = Math.min(2000, cellCrush[mIdx] + crushAdd * 0.35);
+    crushHasActivity = true;
+
+    if (!UPC_CONFIG.supernovaEnabled) return;
+    const scale = UPC_CONFIG.collapseThresholdScale;
+    const nsThresh = BASE_NEUTRON_CRUSH * scale;
+    const bhThresh = BASE_BH_CRUSH * scale;
+
+    // Neutron star absorbing extreme infalling velocity/mass -> crosses TOV limit -> Black Hole!
+    if (tElem === "neutronium") {
+      target.tovLoad = (target.tovLoad || 0) + crushAdd;
+      if (target.tovLoad >= bhThresh * 0.85 || cellCrush[tIdx] >= bhThresh) {
+        const phiNet = sampleField(macroPhi, target.x, target.y);
+        if (phiNet >= 320) {
+          safeChange(target, "black_hole_core");
+          cellCrush[tIdx] = 0;
+          spawnParticle(target.x, target.y, "gamma_ray", 6);
+          notifyUser("Neutron star exceeded TOV limit -> collapsed into a Black Hole!");
+        }
+      }
+      return;
+    }
+
+    if (cellCrush[tIdx] < nsThresh) return;
+    const phiNet = sampleField(macroPhi, target.x, target.y);
+
+    // Extreme converging infall into a cell -> direct Black Hole collapse
+    if (cellCrush[tIdx] >= bhThresh && phiNet >= 440) {
+      cellCrush[tIdx] = 0;
+      safeChange(target, "black_hole_core");
+      triggerSupernova(target.x, target.y, true, Math.min(2.0, phiNet / 260));
+      return;
+    }
+
+    // Heavy converging infall into a cell -> Neutron Star collapse!
+    if (phiNet >= 130) {
+      cellCrush[tIdx] *= 0.2;
+      safeChange(target, "neutronium");
+      target.tovLoad = 0;
+      target.temp = Math.max(target.temp, 85000);
+      if (target.temp > 20000 || phiNet >= 190) {
+        triggerSupernova(target.x, target.y, false, Math.min(1.7, Math.max(1.0, phiNet / 170)));
+      }
+    }
+  }
+
   function applyStateAwareCompression(p, gx, gy, phiNet) {
     const el = elements[p.element];
     const st = el?.state || "solid";
     const gMag = Math.hypot(gx, gy);
 
-    // Count all 8 neighbors via NON_ZERO_DIRS (Sandboxels's adjacentCoords only has 4!)
     let surrounded = 0, emptyDx = 0, emptyDy = 0, emptyCount = 0;
     for (let c = 0; c < 8; c++) {
       const dx = NON_ZERO_DIRS[c][0], dy = NON_ZERO_DIRS[c][1];
       const cx = p.x + dx, cy = p.y + dy;
-      if (!inSafeBounds(cx, cy) || !isEmpty(cx, cy)) {
-        surrounded++;
-      } else {
-        emptyDx += dx; emptyDy += dy; emptyCount++;
-      }
+      if (!inSafeBounds(cx, cy) || !isEmpty(cx, cy)) surrounded++;
+      else { emptyDx += dx; emptyDy += dy; emptyCount++; }
     }
 
     const imp = p.inwardImpulse || 0;
@@ -582,13 +657,12 @@
     const heatScale = UPC_CONFIG.compressionHeatScale;
 
     if (st === "solid") {
-      // SOLIDS: Zero static gravitational heating; blocked inward velocity builds elastic stress
       const targetStress = Math.min(pressureBase * 0.8 + imp * 55, 1200);
       p.stress = Math.max(0, (p.stress || 0) * 0.88 + targetStress * 0.12);
       p.comp = +(1.0 + Math.min(0.05, p.stress / 8000)).toFixed(3);
       if (p.element === "graphite" && p.pressure > 220 && p.temp >= 1200 && elements.diamond) { safeChange(p, "diamond"); return; }
       if (p.element === "ice" && p.pressure > 320 && elements.water) { safeChange(p, "water"); return; }
-      if (p.pressure > 620 && (el?.hardness ?? 0.7) < 0.55 && p.element === "stone" && elements.sand && Math.random() < 0.04) { safeChange(p, "sand"); return; }
+      if (p.pressure > 620 && (el?.hardness ?? 0.7) < 0.55 && p.element === "stone" && elements.sand && Math.random() < 0.02) { safeChange(p, "sand"); return; }
       if (p.stress > 95 && emptyCount >= 3 && !isImmobileElement(p.element)) {
         const len = Math.hypot(emptyDx, emptyDy) || 1, kick = Math.min(0.95, p.stress / 320);
         p.vx = (p.vx || 0) + (emptyDx / len) * kick;
@@ -599,7 +673,6 @@
     }
 
     if (st === "liquid") {
-      // LIQUIDS: Zero temperature explosion; Pascal's Law lateral flow perpendicular to gravity
       p.comp = +(1.0 + Math.min(0.08, pressureBase / 5000)).toFixed(3);
       p.stress = Math.round(pressureBase * 0.4);
       if (imp > 0.12 && emptyCount > 0 && gMag > 0.08) {
@@ -612,11 +685,10 @@
       return;
     }
 
-    // GASES & PLASMA: True adiabatic compression (p.comp = 1.0..8.0) + stellar pause/re-compression
+    // GASES & PLASMA: Measured adiabatic compression + stellar radiative cooling & re-compression
     const oldComp = p.comp || 1.0;
-
     if (UPC_CONFIG.radiativeCooling && starModeActive && p.temp > 2500) {
-      const coolFactor = surrounded < 6 ? 0.0085 : 0.0022;
+      const coolFactor = surrounded < 6 ? 0.0038 : 0.00095;
       p.temp = Math.max(20, p.temp - (p.temp - 2500) * coolFactor);
     }
 
@@ -628,22 +700,22 @@
 
     let newComp = oldComp;
     if (pGrav > pTherm && surrounded >= 5) {
-      const drive = Math.min(1.6, (pGrav - pTherm) / Math.max(30, pGrav));
-      const dComp = (0.03 + Math.min(0.16, imp * 0.10)) * drive * (surrounded / 8);
+      const drive = Math.min(1.5, (pGrav - pTherm) / Math.max(30, pGrav));
+      const dComp = (0.014 + Math.min(0.075, imp * 0.055)) * drive * (surrounded / 8);
       newComp = Math.min(MAX_GAS_COMP, oldComp + dComp);
-      if (heatScale > 0 && dComp > 0.0005) {
-        const workHeat = (tempK * 0.65 * (dComp / oldComp) + dComp * 16500 + imp * 180) * heatScale;
+      if (heatScale > 0 && dComp > 0.0004) {
+        const workHeat = (tempK * 0.55 * (dComp / oldComp) + dComp * 11500 + imp * 90) * heatScale;
         p.temp = Math.min(200000, p.temp + workHeat);
       }
     } else if (oldComp > 1.0) {
-      const relaxRate = surrounded < 5 ? 0.14 : 0.045;
-      const dComp = Math.min(oldComp - 1.0, (oldComp - 1.0) * relaxRate + 0.01);
+      const relaxRate = surrounded < 5 ? 0.10 : 0.03;
+      const dComp = Math.min(oldComp - 1.0, (oldComp - 1.0) * relaxRate + 0.006);
       newComp = Math.max(1.0, oldComp - dComp);
       if (heatScale > 0 && dComp > 0.001 && p.temp > 20) {
-        p.temp = Math.max(20, p.temp - tempK * 0.30 * (dComp / oldComp));
+        p.temp = Math.max(20, p.temp - tempK * 0.25 * (dComp / oldComp));
       }
       if (emptyCount > 0 && dComp > 0.01) {
-        const len = Math.hypot(emptyDx, emptyDy) || 1, push = Math.min(1.1, dComp * 3.5);
+        const len = Math.hypot(emptyDx, emptyDy) || 1, push = Math.min(0.95, dComp * 3.0);
         p.vx = (p.vx || 0) + (emptyDx / len) * push;
         p.vy = (p.vy || 0) + (emptyDy / len) * push;
       }
@@ -653,49 +725,103 @@
     p.stress = Math.round(Math.max(0, pGrav - pTherm));
   }
 
-  function triggerSupernova(cx, cy, formBlackHole = false) {
+  // Gigantic multi-tick Supernova core-bounce & expanding shockwave
+  function triggerSupernova(cx, cy, formBlackHole = false, power = 1.15) {
     const t = typeof pixelTicks === "number" ? pixelTicks : 0;
-    if (t - lastSupernovaTick < 60) return;
+    if (t - lastSupernovaTick < 90) return;
     lastSupernovaTick = t;
-    const coreElem = formBlackHole ? "black_hole_core" : "neutronium";
 
+    const coreElem = formBlackHole ? "black_hole_core" : "neutronium";
+    const coreR2 = formBlackHole ? 4 : 6;
     for (let dx = -2; dx <= 2; dx++) {
       for (let dy = -2; dy <= 2; dy++) {
-        if (dx * dx + dy * dy > 5) continue;
+        if (dx * dx + dy * dy > coreR2) continue;
         const nx = cx + dx, ny = cy + dy;
         if (!inSafeBounds(nx, ny)) continue;
         const p = pixelMap[nx][ny];
-        if (p && !p.del) { safeChange(p, coreElem); p.temp = 130000; }
-        else if (isEmpty(nx, ny)) { const np = safeCreate(coreElem, nx, ny); if (np) np.temp = 130000; }
+        if (p && !p.del) { safeChange(p, coreElem); p.temp = 140000; if (!formBlackHole) p.tovLoad = 0; }
+        else if (isEmpty(nx, ny)) { const np = safeCreate(coreElem, nx, ny); if (np) { np.temp = 140000; if (!formBlackHole) np.tovLoad = 0; } }
       }
     }
 
-    const shockR = 17;
-    for (let dx = -shockR; dx <= shockR; dx++) {
-      for (let dy = -shockR; dy <= shockR; dy++) {
-        const d2 = dx * dx + dy * dy;
-        if (d2 <= 6 || d2 > shockR * shockR) continue;
-        const nx = cx + dx, ny = cy + dy;
-        if (!inSafeBounds(nx, ny)) continue;
-        const p = pixelMap[nx][ny];
-        if (!p || p.del || IMMOBILE_SPECIAL.has(p.element)) continue;
-        const dist = Math.sqrt(d2);
-        p.temp += Math.round(48000 / dist);
-        if (SUPER_R_TARGETS.has(p.element) && Math.random() < 0.45) {
-          safeChange(p, R_PRODUCTS[Math.floor(Math.random() * R_PRODUCTS.length)]);
-        }
-        if (!isImmobileElement(p.element)) {
-          const kick = Math.min(MAX_SPEED, 15 / dist);
-          p.vx = (p.vx || 0) + (dx / dist) * kick;
-          p.vy = (p.vy || 0) + (dy / dist) * kick;
-          p.comp = 1.0;
-          movingPixelsLastTick = Math.max(movingPixelsLastTick, 1);
+    const maxR = Math.min(68, Math.round(42 + power * 18));
+    activeShockwaves.push({ cx, cy, r: 3.5, prevR: 2.5, maxR, speed: 2.8, power, isHypernova: formBlackHole });
+    spawnNeutronsAround(cx, cy, 32, "fast_neutron");
+    spawnParticle(cx, cy, "gamma_ray", 12);
+    explodeAt(cx, cy, 18, "plasma,radiation,fire");
+    notifyUser(formBlackHole ? "HYPERNOVA! Massive core collapsed into a Black Hole!" : "SUPERNOVA! Core bounced into a Neutron Star!");
+  }
+
+  function updateShockwavesTick() {
+    if (activeShockwaves.length === 0) return;
+    for (let i = activeShockwaves.length - 1; i >= 0; i--) {
+      const w = activeShockwaves[i];
+      w.prevR = w.r;
+      w.r += w.speed;
+
+      const rMin = Math.max(3, w.prevR - 1.5);
+      const rMax = w.r + 1.5;
+      const rMin2 = rMin * rMin, rMax2 = rMax * rMax;
+      const bound = Math.ceil(rMax);
+
+      for (let dx = -bound; dx <= bound; dx++) {
+        for (let dy = -bound; dy <= bound; dy++) {
+          const d2 = dx * dx + dy * dy;
+          if (d2 < rMin2 || d2 > rMax2) continue;
+          const nx = w.cx + dx, ny = w.cy + dy;
+          if (!inSafeBounds(nx, ny)) continue;
+          const p = pixelMap[nx][ny];
+          if (!p) {
+            if (Math.random() < 0.055 && w.r < w.maxR * 0.72) {
+              const fx = safeCreate(Math.random() < 0.55 ? "plasma" : "fire", nx, ny);
+              if (fx) { fx.temp = 25000; const d = Math.sqrt(d2) || 1; fx.vx = (dx / d) * 2.5; fx.vy = (dy / d) * 2.5; fx.ejectaTicks = 18; }
+            }
+            continue;
+          }
+          if (p.del || IMMOBILE_SPECIAL.has(p.element)) continue;
+
+          const dist = Math.sqrt(d2) || 1;
+          p.temp = Math.min(220000, p.temp + Math.round((36000 * w.power) / Math.max(4, Math.sqrt(dist))));
+
+          // Explosive r-process nucleosynthesis inside the shock front
+          if (SUPER_R_TARGETS.has(p.element)) {
+            const rChance = (p.element === "oxygen" || p.element === "silicon_gas") ? 0.14 : 0.48;
+            if (Math.random() < rChance) {
+              safeChange(p, R_PRODUCTS[Math.floor(Math.random() * R_PRODUCTS.length)]);
+            }
+          }
+
+          if (!isImmobileElement(p.element)) {
+            const kick = Math.min(4.2, (36 * w.power) / Math.max(5, dist));
+            p.vx = (p.vx || 0) + (dx / dist) * kick;
+            p.vy = (p.vy || 0) + (dy / dist) * kick;
+            p.comp = 1.0;
+            p.ejectaTicks = 28;
+            movingPixelsLastTick = Math.max(movingPixelsLastTick, 1);
+          }
         }
       }
+
+      if (w.r >= w.maxR) activeShockwaves.splice(i, 1);
     }
-    spawnNeutronsAround(cx, cy, 24, "fast_neutron");
-    spawnParticle(cx, cy, "gamma_ray", 6);
-    explodeAt(cx, cy, 11, "plasma,radiation,fire");
+  }
+
+  function drawShockwaves() {
+    if (activeShockwaves.length === 0 || typeof ctx === "undefined" || !ctx || typeof pixelSize !== "number") return;
+    ctx.save();
+    for (let i = 0; i < activeShockwaves.length; i++) {
+      const w = activeShockwaves[i];
+      const frac = 1 - w.r / w.maxR;
+      if (frac <= 0) continue;
+      ctx.strokeStyle = w.isHypernova
+        ? `rgba(195, 130, 255, ${(frac * 0.85).toFixed(2)})`
+        : `rgba(255, 225, 150, ${(frac * 0.85).toFixed(2)})`;
+      ctx.lineWidth = Math.max(2, pixelSize * (1.4 + frac * 2.2));
+      ctx.beginPath();
+      ctx.arc((w.cx + 0.5) * pixelSize, (w.cy + 0.5) * pixelSize, w.r * pixelSize, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.restore();
   }
 
   function rebuildFields() {
@@ -719,8 +845,8 @@
       }
 
       if (e === "gravity_well") { hasPointWell = true; depositCIC(macroMass, p.x, p.y, 48); }
-      else if (e === "neutronium") { hasPointWell = true; depositCIC(macroMass, p.x, p.y, 105); }
-      else if (e === "black_hole_core") { hasPointWell = true; depositCIC(macroMass, p.x, p.y, 210); }
+      else if (e === "neutronium") { hasPointWell = true; depositCIC(macroMass, p.x, p.y, 110); }
+      else if (e === "black_hole_core") { hasPointWell = true; depositCIC(macroMass, p.x, p.y, 230); }
       else if (!isImmobileElement(e)) {
         depositCIC(macroMass, p.x, p.y, getPixelGravMass(e, p.comp || 1.0));
         if (IRON_FAMILY.has(e)) {
@@ -762,7 +888,7 @@
         if (!p || p.del) continue;
         const e = p.element;
         if (e === "gravity_well" || e === "neutronium" || e === "black_hole_core") {
-          depositCIC(macroMass, p.x, p.y, e === "black_hole_core" ? 210 : e === "neutronium" ? 105 : 48);
+          depositCIC(macroMass, p.x, p.y, e === "black_hole_core" ? 230 : e === "neutronium" ? 110 : 48);
         }
       }
     }
@@ -817,7 +943,9 @@
       }
     }
 
+    // Iron-core Supernova trigger: produces Neutron Stars by default; Black Holes ONLY on huge hypernovas!
     if (gravFieldActive && UPC_CONFIG.supernovaEnabled) {
+      const bhPhiMin = 540 * UPC_CONFIG.collapseThresholdScale;
       for (let by = 1; by < mh - 1; by++) {
         for (let bx = 1; bx < mw - 1; bx++) {
           const idx = by * mw + bx;
@@ -827,8 +955,9 @@
             const ni = (by + dy) * mw + (bx + dx);
             ironSum += macroIron[ni]; hotSum += macroHotIron[ni];
           }
-          if (ironSum >= 18 && hotSum >= 10 && macroPhi[idx] > 45) {
-            triggerSupernova(bx * FIELD_BLOCK, by * FIELD_BLOCK, hotSum >= 36 || macroPhi[idx] > 180);
+          if (ironSum >= 20 && hotSum >= 12 && macroPhi[idx] > 65) {
+            const isHypernova = hotSum >= 75 && macroPhi[idx] >= bhPhiMin;
+            triggerSupernova(bx * FIELD_BLOCK, by * FIELD_BLOCK, isHypernova, Math.min(2.0, Math.max(1.0, macroPhi[idx] / 180)));
             return;
           }
         }
@@ -836,11 +965,12 @@
     }
   }
 
-  function advancePixelByVelocity(p) {
+  function advancePixelByVelocity(p, gx, gy) {
     let remX = Math.trunc(p.rx), remY = Math.trunc(p.ry);
     if (!remX && !remY) return;
     p.rx -= remX; p.ry -= remY;
-    const steps = Math.min(3, Math.max(Math.abs(remX), Math.abs(remY)));
+    const maxSteps = p.ejectaTicks > 0 ? 4 : 3;
+    const steps = Math.min(maxSteps, Math.max(Math.abs(remX), Math.abs(remY)));
     const pEl = elements[p.element], pDens = pEl?.density || 1000, pState = pEl?.state || "solid";
 
     for (let s = 0; s < steps; s++) {
@@ -862,6 +992,12 @@
       if (!target || target.del) break;
       const blockedSpd = Math.hypot(p.vx || 0, p.vy || 0);
 
+      // Accumulate converging gravitational velocity crush (for both normal cores and neutronium TOV overload!)
+      if (gravFieldActive && blockedSpd > 0.25) {
+        recordGravitationalCrush(p, target, gx, gy);
+        if (p.del || target.del) break;
+      }
+
       if (!isImmobileElement(target.element)) {
         const tInfo = elements[target.element], tDens = tInfo?.density || 1000, tState = tInfo?.state || "solid";
         if ((tState === "gas" || tState === "liquid") && pDens > tDens * 1.15) {
@@ -882,8 +1018,9 @@
           const tot = pDens + tDens, nvx = (pDens * p.vx + tDens * tvx) / tot, nvy = (pDens * p.vy + tDens * tvy) / tot;
           const damp = (pState === "solid" && tState === "solid") ? 0.55 : 0.82;
           p.vx = nvx * damp; p.vy = nvy * damp;
-          target.vx = Math.max(-MAX_SPEED, Math.min(MAX_SPEED, tvx + (nvx - tvx) * 1.05));
-          target.vy = Math.max(-MAX_SPEED, Math.min(MAX_SPEED, tvy + (nvy - tvy) * 1.05));
+          const cap = target.ejectaTicks > 0 ? MAX_SPEED * 1.6 : MAX_SPEED;
+          target.vx = Math.max(-cap, Math.min(cap, tvx + (nvx - tvx) * 1.05));
+          target.vy = Math.max(-cap, Math.min(cap, tvy + (nvy - tvy) * 1.05));
         }
         break;
       } else {
@@ -901,7 +1038,21 @@
     if (!currentPixels?.length) return;
     const t = typeof pixelTicks === "number" ? pixelTicks : 0;
     if (t - lastFieldTick >= FIELD_REBUILD_INTERVAL) { lastFieldTick = t; rebuildFields(); }
-    if (!gravFieldActive && !magFieldActive && movingPixelsLastTick === 0) { UPC_STATS.movingPixels = 0; return; }
+
+    // Decay per-cell gravitational crush buffer so only genuine sustained convergence triggers collapse
+    if (crushHasActivity && cellCrush) {
+      let any = false;
+      for (let i = 0; i < cellCrush.length; i++) {
+        if (cellCrush[i] > 0.15) { cellCrush[i] *= 0.945; any = true; }
+        else cellCrush[i] = 0;
+      }
+      crushHasActivity = any;
+    }
+
+    if (!gravFieldActive && !magFieldActive && movingPixelsLastTick === 0 && activeShockwaves.length === 0) {
+      UPC_STATS.movingPixels = 0;
+      return;
+    }
 
     const doComp = gravFieldActive && ((t & 1) === 0);
     let movingNow = 0;
@@ -965,21 +1116,25 @@
 
       const prevVx = p.vx || 0, prevVy = p.vy || 0;
       if (!ax && !ay && !prevVx && !prevVy) continue;
-      const drag = starModeActive ? UPC_CONFIG.starDrag : 0.94;
+      const isEjecta = p.ejectaTicks > 0;
+      if (isEjecta) p.ejectaTicks--;
+      const drag = isEjecta ? 0.992 : (starModeActive ? UPC_CONFIG.starDrag : 0.94);
       let vx = (prevVx + ax) * drag, vy = (prevVy + ay) * drag;
+      const spdCap = isEjecta ? MAX_SPEED * 1.6 : MAX_SPEED;
       const spd2 = vx * vx + vy * vy;
-      if (spd2 > MAX_SPEED * MAX_SPEED) { const sc = MAX_SPEED / Math.sqrt(spd2); vx *= sc; vy *= sc; }
+      if (spd2 > spdCap * spdCap) { const sc = spdCap / Math.sqrt(spd2); vx *= sc; vy *= sc; }
       if (Math.abs(vx) < 0.015) vx = 0;
       if (Math.abs(vy) < 0.015) vy = 0;
       p.vx = vx; p.vy = vy;
       if (vx || vy) {
         movingNow++;
         p.rx = (p.rx || 0) + vx; p.ry = (p.ry || 0) + vy;
-        advancePixelByVelocity(p);
+        advancePixelByVelocity(p, gx, gy);
       }
     }
     movingPixelsLastTick = movingNow;
     UPC_STATS.movingPixels = movingNow;
+    updateShockwavesTick();
   }
 
   function drawFieldOverlay() {
@@ -1012,15 +1167,15 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 5. NUCLEAR FISSION & IONIZING RADIATION ENGINE
+  // 5. NUCLEAR FISSION & IONIZING RADIATION ENGINE (MEASURED PACING)
   // ---------------------------------------------------------------------------
 
-  const MODERATOR_PROB = { water: 0.55, ice: 0.50, heavy_water: 0.45, heavy_ice: 0.42, graphite: 0.35, paraffin: 0.52 };
+  const MODERATOR_PROB = { water: 0.32, ice: 0.28, heavy_water: 0.26, heavy_ice: 0.24, graphite: 0.20, paraffin: 0.30 };
   const REFLECTORS = new Set(["beryllium", "molten_beryllium", "tungsten", "steel"]);
   const POISONS = new Set(["boron", "molten_boron", "cadmium", "molten_cadmium", "hafnium", "molten_hafnium", "xenon_135"]);
   const HIGH_Z_SHIELD = new Set(["lead", "molten_lead", "tungsten", "osmium", "uranium_238", "concrete"]);
   const BETA_SHIELD = new Set(["aluminum", "iron", "steel", "copper", "glass", "lead", "tungsten", "osmium", "concrete", "titanium"]);
-  const MAX_SPAWN_PER_TICK = 40, MAX_IONIZING = 220, EXPLODE_COOLDOWN_TICKS = 8;
+  const MAX_SPAWN_PER_TICK = 28, MAX_IONIZING = 180, EXPLODE_COOLDOWN_TICKS = 14;
 
   let lastPhysicsTick = -1, neutronsThisTick = 0, prevTickNeutrons = 0, spawnedThisTick = 0, ionizingThisTick = 0, lastExplodeTick = -100, loggedNeutronError = false;
 
@@ -1033,15 +1188,15 @@
   }
 
   const FISSILE_SPECS = {
-    uranium_235:          { th: 0.78, fa: 0.08, n: [2, 3], heat: 2400, d: ["barium_141", "krypton_92", "xenon_135", "strontium_90"] },
-    molten_uranium_235:   { th: 0.72, fa: 0.07, n: [2, 3], heat: 2400, d: ["barium_141", "krypton_92", "xenon_135", "strontium_90"] },
-    plutonium_239:        { th: 0.82, fa: 0.24, n: [2, 3], heat: 2700, d: ["barium_141", "xenon_135", "strontium_90", "cesium_135"] },
-    molten_plutonium_239: { th: 0.78, fa: 0.22, n: [2, 3], heat: 2700, d: ["barium_141", "xenon_135", "strontium_90", "cesium_135"] },
-    uranium_233:          { th: 0.80, fa: 0.14, n: [2, 3], heat: 2300, d: ["barium_141", "krypton_92", "strontium_90"] },
-    molten_uranium_233:   { th: 0.75, fa: 0.12, n: [2, 3], heat: 2300, d: ["barium_141", "krypton_92", "strontium_90"] },
-    uranium:              { th: 0.35, fa: 0.03, n: [2, 2], heat: 1600, d: ["barium_141", "krypton_92", "xenon_135"] },
-    plutonium:            { th: 0.82, fa: 0.24, n: [2, 3], heat: 2700, d: ["barium_141", "xenon_135", "strontium_90"] },
-    enriched_uranium:     { th: 0.76, fa: 0.08, n: [2, 3], heat: 2400, d: ["barium_141", "krypton_92", "xenon_135", "strontium_90"] }
+    uranium_235:          { th: 0.28, fa: 0.025, n: [2, 3], heat: 1500, d: ["barium_141", "krypton_92", "xenon_135", "strontium_90"] },
+    molten_uranium_235:   { th: 0.25, fa: 0.022, n: [2, 3], heat: 1500, d: ["barium_141", "krypton_92", "xenon_135", "strontium_90"] },
+    plutonium_239:        { th: 0.32, fa: 0.085, n: [2, 3], heat: 1750, d: ["barium_141", "xenon_135", "strontium_90", "cesium_135"] },
+    molten_plutonium_239: { th: 0.30, fa: 0.075, n: [2, 3], heat: 1750, d: ["barium_141", "xenon_135", "strontium_90", "cesium_135"] },
+    uranium_233:          { th: 0.30, fa: 0.045, n: [2, 3], heat: 1450, d: ["barium_141", "krypton_92", "strontium_90"] },
+    molten_uranium_233:   { th: 0.27, fa: 0.040, n: [2, 3], heat: 1450, d: ["barium_141", "krypton_92", "strontium_90"] },
+    uranium:              { th: 0.12, fa: 0.010, n: [2, 2], heat: 1050, d: ["barium_141", "krypton_92", "xenon_135"] },
+    plutonium:            { th: 0.32, fa: 0.085, n: [2, 3], heat: 1750, d: ["barium_141", "xenon_135", "strontium_90"] },
+    enriched_uranium:     { th: 0.27, fa: 0.025, n: [2, 3], heat: 1500, d: ["barium_141", "krypton_92", "xenon_135", "strontium_90"] }
   };
 
   function spawnParticle(cx, cy, elemName, count = 1) {
@@ -1053,7 +1208,7 @@
       const np = safeCreate(elemName, cx + dirs[i][0], cy + dirs[i][1]);
       if (np) {
         np.vx = dirs[i][0]; np.vy = dirs[i][1];
-        np.life = elemName === "alpha_particle" ? 18 : elemName === "beta_particle" ? 55 : 90;
+        np.life = elemName === "alpha_particle" ? 22 : elemName === "beta_particle" ? 65 : 100;
         sp++; ionizingThisTick++;
       }
     }
@@ -1068,7 +1223,7 @@
       if (prevTickNeutrons + spawnedThisTick >= MAX_NEUTRONS || spawnedThisTick >= MAX_SPAWN_PER_TICK) break;
       for (let dist = 1; dist <= 2; dist++) {
         const np = safeCreate(type, cx + dirs[i][0] * dist, cy + dirs[i][1] * dist);
-        if (np) { np.vx = dirs[i][0]; np.vy = dirs[i][1]; np.life = 95; sp++; spawnedThisTick++; break; }
+        if (np) { np.vx = dirs[i][0]; np.vy = dirs[i][1]; np.life = 135; sp++; spawnedThisTick++; break; }
       }
     }
   }
@@ -1085,16 +1240,16 @@
       const nx = tx + dx, ny = ty + dy;
       if (!inSafeBounds(nx, ny)) continue;
       const p = pixelMap[nx][ny];
-      if (p && !p.del) { p.temp += Math.round(heatAmt * 0.18); if (FISSILE_SPECS[p.element]) nearbyFissile++; }
+      if (p && !p.del) { p.temp += Math.round(heatAmt * 0.16); if (FISSILE_SPECS[p.element]) nearbyFissile++; }
     }
     if (neutronPixel && !neutronPixel.del && inSafeBounds(neutronPixel.x, neutronPixel.y) && pixelMap[neutronPixel.x][neutronPixel.y] === neutronPixel) {
       deletePixel(neutronPixel.x, neutronPixel.y);
     }
-    spawnNeutronsAround(tx, ty, spec.n[0] + (Math.random() < 0.5 ? spec.n[1] - spec.n[0] : 0), "fast_neutron");
-    if (Math.random() < 0.3) spawnParticle(tx, ty, "gamma_ray", 1);
-    if (targetPixel.temp > 6000 && nearbyFissile >= 10 && lastPhysicsTick - lastExplodeTick >= EXPLODE_COOLDOWN_TICKS) {
+    spawnNeutronsAround(tx, ty, spec.n[0] + (Math.random() < 0.4 ? spec.n[1] - spec.n[0] : 0), "fast_neutron");
+    if (Math.random() < 0.25) spawnParticle(tx, ty, "gamma_ray", 1);
+    if (targetPixel.temp > 7500 && nearbyFissile >= 12 && lastPhysicsTick - lastExplodeTick >= EXPLODE_COOLDOWN_TICKS) {
       lastExplodeTick = lastPhysicsTick;
-      explodeAt(tx, ty, 8, "plasma,fire,radiation,fallout");
+      explodeAt(tx, ty, 9, "plasma,fire,radiation,fallout");
     }
   }
 
@@ -1103,13 +1258,13 @@
     syncPhysicsTick(); ionizingThisTick++;
     if (ionizingThisTick > MAX_IONIZING * 1.4) { deletePixel(pixel.x, pixel.y); return; }
     if (!pixel.vx && !pixel.vy) { const d = randomDir(); pixel.vx = d[0]; pixel.vy = d[1]; }
-    if (pixel.life === undefined) pixel.life = kind === "alpha" ? 18 : kind === "beta" ? 55 : 90;
+    if (pixel.life === undefined) pixel.life = kind === "alpha" ? 22 : kind === "beta" ? 65 : 100;
     if (--pixel.life <= 0) {
       if (kind === "alpha" && Math.random() < 0.35 && elements.helium) safeChange(pixel, "helium");
       else deletePixel(pixel.x, pixel.y);
       return;
     }
-    const steps = kind === "gamma" ? 3 : kind === "beta" ? 2 : 1;
+    const steps = kind === "gamma" ? 2 : 1;
     for (let s = 0; s < steps && !pixel.del; s++) {
       const nx = pixel.x + pixel.vx, ny = pixel.y + pixel.vy;
       if (!inSafeBounds(nx, ny)) { deletePixel(pixel.x, pixel.y); return; }
@@ -1118,15 +1273,15 @@
       if (!target || target === pixel || target.del) continue;
       const tElem = target.element;
       if (kind === "alpha") {
-        if (tElem === "beryllium" || tElem === "molten_beryllium") { spawnNeutronsAround(target.x, target.y, 1, "fast_neutron"); target.temp += 80; deletePixel(pixel.x, pixel.y); return; }
-        if (elements[tElem]?.state === "gas") { safeSwap(pixel, target); target.temp += 5; }
-        else { target.temp += 45; if (Math.random() < 0.25 && elements.helium) safeChange(pixel, "helium"); else deletePixel(pixel.x, pixel.y); return; }
+        if (tElem === "beryllium" || tElem === "molten_beryllium") { spawnNeutronsAround(target.x, target.y, 1, "fast_neutron"); target.temp += 60; deletePixel(pixel.x, pixel.y); return; }
+        if (elements[tElem]?.state === "gas") { safeSwap(pixel, target); target.temp += 4; }
+        else { target.temp += 35; if (Math.random() < 0.25 && elements.helium) safeChange(pixel, "helium"); else deletePixel(pixel.x, pixel.y); return; }
       } else if (kind === "beta") {
-        if (BETA_SHIELD.has(tElem)) { target.temp += 22; deletePixel(pixel.x, pixel.y); return; }
-        target.temp += 6; safeSwap(pixel, target);
+        if (BETA_SHIELD.has(tElem)) { target.temp += 18; deletePixel(pixel.x, pixel.y); return; }
+        target.temp += 5; safeSwap(pixel, target);
       } else {
-        if (HIGH_Z_SHIELD.has(tElem) && Math.random() < 0.55) { target.temp += 35; deletePixel(pixel.x, pixel.y); return; }
-        target.temp += 10; safeSwap(pixel, target);
+        if (HIGH_Z_SHIELD.has(tElem) && Math.random() < 0.55) { target.temp += 28; deletePixel(pixel.x, pixel.y); return; }
+        target.temp += 8; safeSwap(pixel, target);
       }
     }
   }
@@ -1137,10 +1292,13 @@
       syncPhysicsTick(); neutronsThisTick++;
       if (neutronsThisTick > MAX_NEUTRONS * 1.25) { deletePixel(pixel.x, pixel.y); return; }
       if (!pixel.vx && !pixel.vy) { const d = randomDir(); pixel.vx = d[0]; pixel.vy = d[1]; }
-      if (pixel.life === undefined) pixel.life = 95;
+      if (pixel.life === undefined) pixel.life = 135;
       if (--pixel.life <= 0) { safeChangeAny(pixel, ["proton", "hydrogen"]); return; }
 
-      const steps = isFast ? 2 : 1;
+      // Legible neutron velocity: thermal neutrons move ~55% of ticks; fast neutrons move 1 (35% chance 2)
+      if (!isFast && Math.random() > 0.55) return;
+      const steps = isFast ? (Math.random() < 0.35 ? 2 : 1) : 1;
+
       for (let s = 0; s < steps && !pixel.del; s++) {
         const nx = pixel.x + pixel.vx, ny = pixel.y + pixel.vy;
         if (!inSafeBounds(nx, ny)) { deletePixel(pixel.x, pixel.y); return; }
@@ -1151,40 +1309,40 @@
 
         if (FISSILE_SPECS[tElem]) {
           const spec = FISSILE_SPECS[tElem];
-          let prob = isFast ? spec.fa : spec.th;
-          if (!isFast && target.temp > 1200) prob *= Math.max(0.65, 1 - (target.temp - 1200) / 10000);
+          let prob = (isFast ? spec.fa : spec.th) * UPC_CONFIG.fissionRate;
+          if (!isFast && target.temp > 1200) prob *= Math.max(0.60, 1 - (target.temp - 1200) / 10000);
           if (Math.random() < prob) { triggerFission(target, spec, pixel); return; }
-          if (Math.random() < 0.5) safeSwap(pixel, target); else { pixel.vx = -pixel.vx; pixel.vy = -pixel.vy; }
+          if (Math.random() < 0.55) safeSwap(pixel, target); else { pixel.vx = -pixel.vx; pixel.vy = -pixel.vy; }
           return;
         }
-        if (isFast && target.temp > 75000 && SUPER_R_TARGETS.has(tElem) && Math.random() < 0.40) {
+        if (isFast && target.temp > 75000 && SUPER_R_TARGETS.has(tElem) && Math.random() < 0.20) {
           safeChange(target, R_PRODUCTS[Math.floor(Math.random() * R_PRODUCTS.length)]); deletePixel(pixel.x, pixel.y); return;
         }
-        if ((tElem === "uranium_238" || tElem === "molten_uranium_238") && Math.random() < (isFast ? 0.12 : 0.35) + (target.temp > 800 ? 0.08 : 0)) {
-          safeChange(target, "neptunium_239"); target.temp += 150; deletePixel(pixel.x, pixel.y); return;
+        if ((tElem === "uranium_238" || tElem === "molten_uranium_238") && Math.random() < ((isFast ? 0.05 : 0.16) + (target.temp > 800 ? 0.04 : 0)) * UPC_CONFIG.fissionRate) {
+          safeChange(target, "neptunium_239"); target.temp += 110; deletePixel(pixel.x, pixel.y); return;
         }
-        if ((tElem === "thorium_232" || tElem === "molten_thorium_232" || tElem === "thorium") && Math.random() < (isFast ? 0.10 : 0.38)) {
-          safeChange(target, "protactinium_233"); target.temp += 140; deletePixel(pixel.x, pixel.y); return;
+        if ((tElem === "thorium_232" || tElem === "molten_thorium_232" || tElem === "thorium") && Math.random() < (isFast ? 0.04 : 0.18) * UPC_CONFIG.fissionRate) {
+          safeChange(target, "protactinium_233"); target.temp += 100; deletePixel(pixel.x, pixel.y); return;
         }
-        if ((tElem === "lithium_6" || tElem === "molten_lithium_6") && Math.random() < 0.55) {
-          safeChange(target, "tritium"); target.temp += 850; safeChange(pixel, "helium"); return;
+        if ((tElem === "lithium_6" || tElem === "molten_lithium_6") && Math.random() < 0.30) {
+          safeChange(target, "tritium"); target.temp += 650; safeChange(pixel, "helium"); return;
         }
-        if ((tElem === "cobalt" || tElem === "molten_cobalt") && Math.random() < 0.30) {
-          safeChange(target, "cobalt_60"); target.temp += 120; deletePixel(pixel.x, pixel.y); return;
+        if ((tElem === "cobalt" || tElem === "molten_cobalt") && Math.random() < 0.14) {
+          safeChange(target, "cobalt_60"); target.temp += 90; deletePixel(pixel.x, pixel.y); return;
         }
-        if (tElem === "nitrogen" && !isFast && Math.random() < 0.12) {
+        if (tElem === "nitrogen" && !isFast && Math.random() < 0.06) {
           safeChange(target, "carbon_14"); safeChangeAny(pixel, ["proton", "hydrogen"]); return;
         }
-        if (POISONS.has(tElem) && !isFast && Math.random() < (tElem === "xenon_135" ? 0.96 : 0.85)) {
-          target.temp += 80;
-          if (tElem === "boron" && Math.random() < 0.15) safeChange(target, "lithium_7");
+        if (POISONS.has(tElem) && !isFast && Math.random() < (tElem === "xenon_135" ? 0.90 : 0.72)) {
+          target.temp += 60;
+          if (tElem === "boron" && Math.random() < 0.12) safeChange(target, "lithium_7");
           else if (tElem === "xenon_135") safeChange(target, "xenon_136");
           deletePixel(pixel.x, pixel.y); return;
         }
         if (MODERATOR_PROB[tElem] !== undefined) {
-          target.temp += isFast ? 35 : 5;
+          target.temp += isFast ? 24 : 3;
           if (isFast) {
-            if (tElem === "water" && Math.random() < 0.05) { safeChange(target, "heavy_water"); deletePixel(pixel.x, pixel.y); return; }
+            if (tElem === "water" && Math.random() < 0.025) { safeChange(target, "heavy_water"); deletePixel(pixel.x, pixel.y); return; }
             if (Math.random() < MODERATOR_PROB[tElem]) { safeChange(pixel, "thermal_neutron"); const d = randomDir(); pixel.vx = d[0]; pixel.vy = d[1]; return; }
           }
           safeSwap(pixel, target); return;
@@ -1193,14 +1351,14 @@
           pixel.vx = Math.max(-1, Math.min(1, -pixel.vx + (Math.random() < 0.3 ? (Math.random() < 0.5 ? 1 : -1) : 0)));
           pixel.vy = Math.max(-1, Math.min(1, -pixel.vy + (Math.random() < 0.3 ? (Math.random() < 0.5 ? 1 : -1) : 0)));
           if (!pixel.vx && !pixel.vy) { const d = randomDir(); pixel.vx = d[0]; pixel.vy = d[1]; }
-          if (isFast && !pixel.beMultiplied && (tElem === "beryllium" || tElem === "molten_beryllium") && Math.random() < 0.08) {
+          if (isFast && !pixel.beMultiplied && (tElem === "beryllium" || tElem === "molten_beryllium") && Math.random() < 0.05) {
             pixel.beMultiplied = true; spawnNeutronsAround(pixel.x, pixel.y, 1, "fast_neutron");
           }
           return;
         }
         if (HIGH_Z_SHIELD.has(tElem)) {
-          target.temp += 15;
-          if (Math.random() < 0.45) { deletePixel(pixel.x, pixel.y); return; }
+          target.temp += 12;
+          if (Math.random() < 0.42) { deletePixel(pixel.x, pixel.y); return; }
           pixel.vx = -pixel.vx; pixel.vy = -pixel.vy; return;
         }
         const tState = elements[tElem]?.state;
@@ -1255,8 +1413,8 @@
       if (!p || p.del) return;
       p.pressure = (p.pressure || 0) + 400;
       const st = elements[p.element]?.state;
-      if (st === "gas") { p.comp = Math.min(MAX_GAS_COMP, (p.comp || 1.0) + 0.65); p.temp += 1800; }
-      else if (st === "liquid") p.temp += 40;
+      if (st === "gas") { p.comp = Math.min(MAX_GAS_COMP, (p.comp || 1.0) + 0.65); p.temp += 1400; }
+      else if (st === "liquid") p.temp += 30;
       else {
         p.stress = Math.min(1200, (p.stress || 0) + 250);
         if (p.element === "graphite" && p.temp >= 1200 && elements.diamond) safeChange(p, "diamond");
@@ -1298,13 +1456,13 @@
   registerOrEnhance("neutron_pulse", {
     color: ["#ff6d00", "#ffd180"], category: "tools",
     desc: "Emits fast neutrons around brushed pixels to jump-start fission or breeding.",
-    tool: (p) => { if (p && !p.del && Math.random() < 0.35) spawnNeutronsAround(p.x, p.y, 1, "fast_neutron"); }
+    tool: (p) => { if (p && !p.del && Math.random() < 0.25) spawnNeutronsAround(p.x, p.y, 1, "fast_neutron"); }
   });
 
   let lastInspectTime = 0;
   registerOrEnhance("inspect_tool", {
     color: ["#26c6da", "#80deea"], category: "tools",
-    desc: "Displays state, temp, compression (comp), pressure, stress, velocity, g, B, and active chemical bonds.",
+    desc: "Displays state, temp, compression, pressure, crush/TOV load, velocity, g, B, and active chemical bonds.",
     tool: (p) => {
       if (!p || p.del) return;
       const now = Date.now();
@@ -1313,9 +1471,11 @@
       const st = elements[p.element]?.state || "?";
       const g = gravFieldActive ? Math.hypot(sampleField(macroGx, p.x, p.y), sampleField(macroGy, p.x, p.y)).toFixed(2) : "0";
       const b = magFieldActive ? sampleField(macroBmag, p.x, p.y).toFixed(2) : "0";
+      const crush = cellCrush ? Math.round(cellCrush[p.y * cellW + p.x] || 0) : 0;
+      const tov = p.element === "neutronium" ? ` | tov=${Math.round(p.tovLoad || 0)}` : "";
       const pb = getBonds(p);
       const bl = pb?.length ? pb.map(x => `${x.target.element}(${x.type})`).join(", ") : "none";
-      notifyUser(`${p.element}[${st}] | ${Math.round(p.temp)}C | comp=${(p.comp || 1).toFixed(2)}x | P=${p.pressure || 0} | stress=${Math.round(p.stress || 0)} | v=(${(p.vx || 0).toFixed(2)},${(p.vy || 0).toFixed(2)}) | g=${g} | B=${b} | bonds: ${bl}`);
+      notifyUser(`${p.element}[${st}] | ${Math.round(p.temp)}C | comp=${(p.comp || 1).toFixed(2)}x | P=${p.pressure || 0} | crush=${crush}${tov} | v=(${(p.vx || 0).toFixed(2)},${(p.vy || 0).toFixed(2)}) | g=${g} | B=${b} | bonds: ${bl}`);
     }
   });
 
@@ -1328,12 +1488,12 @@
   registerOrEnhance("field_visualizer", { color: ["#00e5ff", "#ffd740"], behavior: behaviors.WALL, category: "astrophysics", state: "solid", density: 1000, desc: "Renders live Magnetic (cyan) and Gravity (gold) field vectors." });
   registerOrEnhance("neutronium", {
     color: ["#d9f7ff", "#ffffff", "#9ce5ff"], behavior: behaviors.WALL, category: "astrophysics", state: "solid", density: 999999, hardness: 1, conduct: 1,
-    desc: "Degenerate neutron-star core forged by Supernova collapse.",
-    tick: (p) => { if (Math.random() < 0.004) spawnNeutronsAround(p.x, p.y, 1, "fast_neutron"); doDefaults(p); }
+    desc: "Degenerate neutron-star core forged by gravitational velocity crush or Supernova collapse. Overload with infalling mass to reach the TOV limit -> Black Hole!",
+    tick: (p) => { if (Math.random() < 0.002) spawnNeutronsAround(p.x, p.y, 1, "fast_neutron"); doDefaults(p); }
   });
   registerOrEnhance("black_hole_core", {
     color: ["#050008", "#0d0014", "#1a0029"], behavior: behaviors.WALL, category: "astrophysics", state: "solid", density: 9999999, hardness: 1,
-    desc: "Event-horizon singularity. Devours infalling matter and emits gamma jets.",
+    desc: "Event-horizon singularity formed by extreme converging gravitational collapse or TOV overload. Devours infalling matter and emits gamma jets.",
     tick: (p) => {
       for (let i = 0; i < 8; i++) {
         const nx = p.x + NON_ZERO_DIRS[i][0], ny = p.y + NON_ZERO_DIRS[i][1];
@@ -1341,7 +1501,7 @@
         const v = pixelMap[nx][ny];
         if (!v || v.del || IMMOBILE_SPECIAL.has(v.element)) continue;
         breakAllBonds(v); deletePixel(nx, ny);
-        if (Math.random() < 0.25) spawnParticle(p.x, p.y, "gamma_ray", 1);
+        if (Math.random() < 0.18) spawnParticle(p.x, p.y, "gamma_ray", 1);
       }
       doDefaults(p);
     }
@@ -1390,7 +1550,7 @@
   registerOrEnhance("heavy_ice", { color: ["#a8d0f5", "#b8daf8"], behavior: behaviors.WALL, category: "states", state: "solid", hidden: true, density: 1017, temp: 0, tempHigh: 3.8, stateHigh: "heavy_water" });
   registerOrEnhance("heavy_steam", {
     color: ["#c7dbf0", "#d7e6f5"], behavior: behaviors.GAS, category: "states", state: "gas", hidden: true, density: 0.66, temp: 110, tempLow: 101.4, stateLow: "heavy_water",
-    tick: (p) => { if (p.temp >= 3200 && Math.random() < 0.2) { safeChange(p, Math.random() < 0.66 ? "deuterium" : "oxygen"); return; } doDefaults(p); }
+    tick: (p) => { if (p.temp >= 3200 && Math.random() < 0.07) { safeChange(p, Math.random() < 0.66 ? "deuterium" : "oxygen"); return; } doDefaults(p); }
   });
   registerOrEnhance("carbon_vapor", {
     color: ["#54545c", "#666670", "#45454d"], behavior: behaviors.GAS, category: "states", state: "gas", hidden: true, density: 0.52, temp: 3700, tempLow: 3642, stateLow: "graphite",
@@ -1398,25 +1558,25 @@
     tick: (p) => {
       const fr = getFusionFactor(p);
       if (fr > 0) {
-        if (p.temp >= 75000 && Math.random() < 0.18 * fr) { const he = findAdjacentElement(p, "helium"); if (he) { safeChange(p, "oxygen"); safeChange(he, "gamma_ray"); p.temp += 5000; return; } }
-        if (p.temp >= 82000 && Math.random() < 0.15 * fr) { const o = findAdjacentElement(p, "carbon_vapor"); if (o) { safeChange(p, Math.random() < 0.55 ? "neon" : "magnesium_gas"); safeChange(o, "gamma_ray"); p.temp += 4500; return; } }
+        if (p.temp >= 75000 && Math.random() < 0.014 * fr) { const he = findAdjacentElement(p, "helium"); if (he) { safeChange(p, "oxygen"); safeChange(he, "gamma_ray"); p.temp += 3500; return; } }
+        if (p.temp >= 82000 && Math.random() < 0.012 * fr) { const o = findAdjacentElement(p, "carbon_vapor"); if (o) { safeChange(p, Math.random() < 0.55 ? "neon" : "magnesium_gas"); safeChange(o, "gamma_ray"); p.temp += 3200; return; } }
       }
       doDefaults(p);
     },
-    reactions: { oxygen: { elem1: "carbon_dioxide", elem2: "fire", tempMin: 750, tempMax: 3500, chance: 0.25 } }
+    reactions: { oxygen: { elem1: "carbon_dioxide", elem2: "fire", tempMin: 750, tempMax: 3500, chance: 0.12 } }
   });
   registerOrEnhance("graphite", {
     _override: true, color: ["#2b2b2e", "#36363a", "#232326"], behavior: behaviors.WALL, category: "nuclear", state: "solid", density: 2260, conduct: 0.85, hardness: 0.65, tempHigh: 3642, stateHigh: "carbon_vapor",
     desc: "Carbon moderator. Sublimates to carbon_vapor (>3,642 C); smelts sand -> silicon & rust -> iron; presses to diamond.",
     reactions: {
-      oxygen: { elem1: "carbon_dioxide", elem2: "fire", tempMin: 750, tempMax: 3500, chance: 0.15 },
-      sand:   { elem1: "carbon_dioxide", elem2: "molten_silicon", tempMin: 1900, tempMax: 3500, chance: 0.22 },
-      rust:   { elem1: "carbon_dioxide", elem2: "molten_iron", tempMin: 1100, tempMax: 3200, chance: 0.25 }
+      oxygen: { elem1: "carbon_dioxide", elem2: "fire", tempMin: 750, tempMax: 3500, chance: 0.08 },
+      sand:   { elem1: "carbon_dioxide", elem2: "molten_silicon", tempMin: 1900, tempMax: 3500, chance: 0.12 },
+      rust:   { elem1: "carbon_dioxide", elem2: "molten_iron", tempMin: 1100, tempMax: 3200, chance: 0.14 }
     }
   });
 
   // ---------------------------------------------------------------------------
-  // 8. FULL GASES, ISOTOPES & SOLID/MOLTEN/GAS ELEMENT CHAINS
+  // 8. FULL GASES, ISOTOPES & SOLID/MOLTEN/GAS ELEMENT CHAINS (PACED RATES)
   // ---------------------------------------------------------------------------
 
   const SILICON_STATES = new Set(["silicon", "molten_silicon", "silicon_gas"]);
@@ -1428,19 +1588,19 @@
     tick: (p) => {
       const fr = getFusionFactor(p);
       if (fr > 0) {
-        if (p.temp >= 10000 && Math.random() < 0.55 * fr) { const t = findAdjacentElement(p, "tritium"); if (t) { safeChange(p, "helium"); safeChange(t, "fast_neutron"); p.temp += 9000; t.temp += 9000; return; } }
-        if (p.temp >= 25000 && Math.random() < 0.35 * fr) { const o = findAdjacentElement(p, "deuterium"); if (o) { if (Math.random() < 0.5) { safeChange(p, "tritium"); safeChangeAny(o, ["proton", "hydrogen"]); } else { safeChange(p, "helium_3"); safeChange(o, "fast_neutron"); } p.temp += 4500; o.temp += 4500; return; } }
-        if (p.temp >= 40000 && Math.random() < 0.45 * fr) { const h = findAdjacentElement(p, "helium_3"); if (h) { safeChange(p, "helium"); safeChangeAny(h, ["proton", "hydrogen"]); p.temp += 11000; h.temp += 11000; return; } }
+        if (p.temp >= 10000 && Math.random() < 0.06 * fr) { const t = findAdjacentElement(p, "tritium"); if (t) { safeChange(p, "helium"); safeChange(t, "fast_neutron"); p.temp += 6500; t.temp += 6500; return; } }
+        if (p.temp >= 25000 && Math.random() < 0.025 * fr) { const o = findAdjacentElement(p, "deuterium"); if (o) { if (Math.random() < 0.5) { safeChange(p, "tritium"); safeChangeAny(o, ["proton", "hydrogen"]); } else { safeChange(p, "helium_3"); safeChange(o, "fast_neutron"); } p.temp += 3200; o.temp += 3200; return; } }
+        if (p.temp >= 40000 && Math.random() < 0.035 * fr) { const h = findAdjacentElement(p, "helium_3"); if (h) { safeChange(p, "helium"); safeChangeAny(h, ["proton", "hydrogen"]); p.temp += 7500; h.temp += 7500; return; } }
       }
       doDefaults(p);
     },
-    reactions: { oxygen: { elem1: "heavy_steam", elem2: "fire", tempMin: 560, tempMax: 3000, chance: 0.65 } }
+    reactions: { oxygen: { elem1: "heavy_steam", elem2: "fire", tempMin: 560, tempMax: 3000, chance: 0.35 } }
   });
 
   defineFullGas({
     id: "tritium", color: ["#5cffb0", "#82ffc4"], liquidColor: ["#28d483", "#3ee093"], solidColor: ["#9effd0", "#c4ffe2"],
     category: "isotopes", boilTemp: -248.1, meltTemp: -252.5, density: 0.27, desc: "Hydrogen-3. Fuses with Deuterium (10,000 C); beta-decays to He-3.",
-    tick: (p) => { if (Math.random() < 0.00015) { safeChange(p, "helium_3"); spawnParticle(p.x, p.y, "beta_particle", 1); p.temp += 5; return; } doDefaults(p); }
+    tick: (p) => { if (Math.random() < 0.00005) { safeChange(p, "helium_3"); spawnParticle(p.x, p.y, "beta_particle", 1); p.temp += 5; return; } doDefaults(p); }
   });
 
   defineFullGas({
@@ -1448,7 +1608,7 @@
     category: "isotopes", boilTemp: -269.9, meltTemp: -272.2, density: 0.13, desc: "Helium-3. Aneutronic fusion with D (40,000 C) or He-3 (45,000 C).",
     tick: (p) => {
       const fr = getFusionFactor(p);
-      if (fr > 0 && p.temp >= 45000 && Math.random() < 0.25 * fr) { const o = findAdjacentElement(p, "helium_3"); if (o) { safeChange(p, "helium"); safeChangeAny(o, ["proton", "hydrogen"]); p.temp += 7500; o.temp += 7500; return; } }
+      if (fr > 0 && p.temp >= 45000 && Math.random() < 0.022 * fr) { const o = findAdjacentElement(p, "helium_3"); if (o) { safeChange(p, "helium"); safeChangeAny(o, ["proton", "hydrogen"]); p.temp += 5500; o.temp += 5500; return; } }
       doDefaults(p);
     }
   });
@@ -1458,56 +1618,56 @@
     category: "gases", boilTemp: -246.1, meltTemp: -248.6, density: 0.90, conduct: 0.4, desc: "Noble gas forged by Carbon burning. Fuses with He (88,000 C -> Mg).",
     tick: (p) => {
       const fr = getFusionFactor(p);
-      if (fr > 0 && p.temp >= 88000 && Math.random() < 0.16 * fr) { const he = findAdjacentElement(p, "helium"); if (he) { safeChange(p, "magnesium_gas"); safeChange(he, "gamma_ray"); p.temp += 4200; return; } }
+      if (fr > 0 && p.temp >= 88000 && Math.random() < 0.014 * fr) { const he = findAdjacentElement(p, "helium"); if (he) { safeChange(p, "magnesium_gas"); safeChange(he, "gamma_ray"); p.temp += 3000; return; } }
       doDefaults(p);
     }
   });
 
   defineFullGas({ id: "argon", color: ["#c7b8ff", "#d6ccff"], liquidColor: ["#9b87f5", "#ac99ff"], solidColor: ["#e6e0ff", "#f0ecff"], category: "gases", boilTemp: -185.8, meltTemp: -189.3, density: 1.78, desc: "Dense inert shielding gas." });
-  defineFullGas({ id: "radon", color: ["#b8e0c8", "#ccebd8"], liquidColor: ["#8ac2a0", "#9cd4b2"], solidColor: ["#ffaa55", "#ff8844"], category: "isotopes", boilTemp: -61.7, meltTemp: -71.0, density: 9.73, desc: "Heavy radioactive noble gas; decays to Polonium-210.", tick: (p) => { if (Math.random() < 0.0005) { safeChange(p, "polonium_210"); spawnParticle(p.x, p.y, "alpha_particle", 1); p.temp += 20; return; } doDefaults(p); } });
-  defineFullGas({ id: "xenon_135", color: ["#9a78e3", "#b091f2"], liquidColor: ["#6c47bd", "#7d55d1"], solidColor: ["#c6b3f5", "#d8c9fa"], category: "isotopes", boilTemp: -108.1, meltTemp: -111.8, density: 5.89, desc: "Reactor poison. Burns to Xe-136 or decays to Cs-135.", tick: (p) => { if (Math.random() < 0.0012) { safeChange(p, "cesium_135"); spawnParticle(p.x, p.y, "beta_particle", 1); return; } doDefaults(p); } });
+  defineFullGas({ id: "radon", color: ["#b8e0c8", "#ccebd8"], liquidColor: ["#8ac2a0", "#9cd4b2"], solidColor: ["#ffaa55", "#ff8844"], category: "isotopes", boilTemp: -61.7, meltTemp: -71.0, density: 9.73, desc: "Heavy radioactive noble gas; decays to Polonium-210.", tick: (p) => { if (Math.random() < 0.00018) { safeChange(p, "polonium_210"); spawnParticle(p.x, p.y, "alpha_particle", 1); p.temp += 15; return; } doDefaults(p); } });
+  defineFullGas({ id: "xenon_135", color: ["#9a78e3", "#b091f2"], liquidColor: ["#6c47bd", "#7d55d1"], solidColor: ["#c6b3f5", "#d8c9fa"], category: "isotopes", boilTemp: -108.1, meltTemp: -111.8, density: 5.89, desc: "Reactor poison. Burns to Xe-136 or decays to Cs-135.", tick: (p) => { if (Math.random() < 0.0004) { safeChange(p, "cesium_135"); spawnParticle(p.x, p.y, "beta_particle", 1); return; } doDefaults(p); } });
   defineFullGas({ id: "xenon_136", color: ["#7c6fa8", "#9183bd"], liquidColor: ["#5a4d82", "#695a94"], solidColor: ["#b5abdb", "#c8c0e6"], category: "isotopes", boilTemp: -108.1, meltTemp: -111.8, density: 5.93, desc: "Stable Xenon-136." });
-  defineFullGas({ id: "krypton_92", color: ["#b8d4e8", "#cfe5f5"], liquidColor: ["#80a8c7", "#92bad9"], solidColor: ["#dcebf7", "#ebf4fc"], category: "isotopes", boilTemp: -153.4, meltTemp: -157.4, density: 3.75, desc: "Fission gas emitting delayed neutrons -> Sr-90.", tick: (p) => { p.temp += 0.15; if (UPC_CONFIG.delayedNeutrons && Math.random() < 0.0015) spawnNeutronsAround(p.x, p.y, 1, "thermal_neutron"); if (Math.random() < 0.004) { safeChange(p, "strontium_90"); return; } doDefaults(p); } });
+  defineFullGas({ id: "krypton_92", color: ["#b8d4e8", "#cfe5f5"], liquidColor: ["#80a8c7", "#92bad9"], solidColor: ["#dcebf7", "#ebf4fc"], category: "isotopes", boilTemp: -153.4, meltTemp: -157.4, density: 3.75, desc: "Fission gas emitting delayed neutrons -> Sr-90.", tick: (p) => { p.temp += 0.08; if (UPC_CONFIG.delayedNeutrons && Math.random() < 0.0006) spawnNeutronsAround(p.x, p.y, 1, "thermal_neutron"); if (Math.random() < 0.0012) { safeChange(p, "strontium_90"); return; } doDefaults(p); } });
 
   const FULL_ELEMENTS = [
-    { id: "carbon_14", color: ["#303835", "#3d4743"], moltenColor: ["#7a8f87", "#8ea69d"], gasColor: ["#5c6b65", "#6d7d77"], category: "isotopes", meltTemp: 3550, boilTemp: 4027, density: 2260, conduct: 0.7, behavior: behaviors.POWDER, desc: "Radioactive C-14 -> N-14.", tick: (p) => { if (Math.random() < 0.0001) { safeChange(p, "nitrogen"); spawnParticle(p.x, p.y, "beta_particle", 1); return; } doDefaults(p); } },
-    { id: "magnesium", color: ["#d4d9de", "#e2e6eb", "#c5cbd1"], moltenColor: ["#f0e8d5", "#fff8e8"], gasColor: ["#e8ecf0", "#f5f7fa"], category: "metals", meltTemp: 650, boilTemp: 1091, density: 1738, conduct: 0.78, hardness: 0.5, tickAllStates: true, desc: "Reactive metal; fuses with He (92,000 C -> Silicon).", tick: (p) => { const fr = getFusionFactor(p); if (fr > 0 && p.temp >= 92000 && Math.random() < 0.16 * fr) { const he = findAdjacentElement(p, "helium"); if (he) { safeChange(p, "silicon_gas"); safeChange(he, "gamma_ray"); p.temp += 4000; return; } } doDefaults(p); }, reactions: { oxygen: { elem1: "ash", elem2: "fire", tempMin: 470, tempMax: 3200, chance: 0.45, func: p1 => { p1.temp += 1800; } }, steam: { elem1: "ash", elem2: "hydrogen", tempMin: 300, chance: 0.35, func: p1 => { p1.temp += 900; } } } },
-    { id: "silicon", color: ["#4b525c", "#58606b", "#3f464f"], moltenColor: ["#e8a86b", "#f2b97e"], gasColor: ["#8a96a6", "#9ca8b8"], category: "solids", meltTemp: 1414, boilTemp: 3265, density: 2329, conduct: 0.35, hardness: 0.82, tickAllStates: true, desc: "Semiconductor (Si-28). Fuses past 115,000 C into Nickel-56 -> Iron.", tick: (p) => { const fr = getFusionFactor(p); if (fr > 0 && p.temp >= 115000 && Math.random() < 0.16 * fr) { const pt = findAdjacentElement(p, "helium") || findAdjacentElement(p, SILICON_STATES); if (pt) { safeChange(p, "nickel_56_gas"); safeChange(pt, "gamma_ray"); p.temp += 3000; return; } } doDefaults(p); }, reactions: { oxygen: { elem1: "sand", elem2: "fire", tempMin: 900, tempMax: 2500, chance: 0.15 } } },
-    { id: "nickel_56", color: ["#9cb5a8", "#adc7b9"], moltenColor: ["#ffbe76", "#ffd39b"], gasColor: ["#c7e3d4", "#daf2e5"], category: "isotopes", meltTemp: 1455, boilTemp: 2913, density: 8908, conduct: 0.7, tickAllStates: true, desc: "Supernova Nickel-56 -> Cobalt-56 -> Iron-56.", tick: (p) => { p.temp += 0.35; if (Math.random() < 0.008) { safeChange(p, p.element === "nickel_56_gas" ? "cobalt_56_gas" : p.element === "molten_nickel_56" ? "molten_cobalt_56" : "cobalt_56"); p.temp += 180; return; } doDefaults(p); } },
-    { id: "cobalt_56", color: ["#7295c4", "#86a8d6"], moltenColor: ["#ffa366", "#ffb885"], gasColor: ["#a4bfe3", "#b8cff0"], category: "isotopes", meltTemp: 1495, boilTemp: 2927, density: 8900, conduct: 0.7, tickAllStates: true, desc: "Decays into stable Iron-56.", tick: (p) => { p.temp += 0.25; if (Math.random() < 0.006) { if (p.temp >= 2862) safeChangeAny(p, ["iron_gas", "molten_iron", "iron"]); else if (p.temp >= 1538) safeChangeAny(p, ["molten_iron", "iron"]); else safeChange(p, "iron"); p.temp += 120; return; } doDefaults(p); } },
-    { id: "uranium_235", color: ["#4b7843", "#578c4e", "#3f6938"], moltenColor: ["#9be05a", "#b7f06e"], gasColor: ["#88b878", "#a2cc95"], category: "nuclear", meltTemp: 1132, boilTemp: 4131, density: 18950, conduct: 0.45, desc: "Fissile U-235.", tick: (p) => { if (Math.random() < 0.00025) spawnNeutronsAround(p.x, p.y, 1, "fast_neutron"); doDefaults(p); } },
+    { id: "carbon_14", color: ["#303835", "#3d4743"], moltenColor: ["#7a8f87", "#8ea69d"], gasColor: ["#5c6b65", "#6d7d77"], category: "isotopes", meltTemp: 3550, boilTemp: 4027, density: 2260, conduct: 0.7, behavior: behaviors.POWDER, desc: "Radioactive C-14 -> N-14.", tick: (p) => { if (Math.random() < 0.00004) { safeChange(p, "nitrogen"); spawnParticle(p.x, p.y, "beta_particle", 1); return; } doDefaults(p); } },
+    { id: "magnesium", color: ["#d4d9de", "#e2e6eb", "#c5cbd1"], moltenColor: ["#f0e8d5", "#fff8e8"], gasColor: ["#e8ecf0", "#f5f7fa"], category: "metals", meltTemp: 650, boilTemp: 1091, density: 1738, conduct: 0.78, hardness: 0.5, tickAllStates: true, desc: "Reactive metal; fuses with He (92,000 C -> Silicon).", tick: (p) => { const fr = getFusionFactor(p); if (fr > 0 && p.temp >= 92000 && Math.random() < 0.014 * fr) { const he = findAdjacentElement(p, "helium"); if (he) { safeChange(p, "silicon_gas"); safeChange(he, "gamma_ray"); p.temp += 3000; return; } } doDefaults(p); }, reactions: { oxygen: { elem1: "ash", elem2: "fire", tempMin: 470, tempMax: 3200, chance: 0.25, func: p1 => { p1.temp += 1400; } }, steam: { elem1: "ash", elem2: "hydrogen", tempMin: 300, chance: 0.20, func: p1 => { p1.temp += 700; } } } },
+    { id: "silicon", color: ["#4b525c", "#58606b", "#3f464f"], moltenColor: ["#e8a86b", "#f2b97e"], gasColor: ["#8a96a6", "#9ca8b8"], category: "solids", meltTemp: 1414, boilTemp: 3265, density: 2329, conduct: 0.35, hardness: 0.82, tickAllStates: true, desc: "Semiconductor (Si-28). Fuses past 115,000 C into Nickel-56 -> Iron.", tick: (p) => { const fr = getFusionFactor(p); if (fr > 0 && p.temp >= 115000 && Math.random() < 0.015 * fr) { const pt = findAdjacentElement(p, "helium") || findAdjacentElement(p, SILICON_STATES); if (pt) { safeChange(p, "nickel_56_gas"); safeChange(pt, "gamma_ray"); p.temp += 2200; return; } } doDefaults(p); }, reactions: { oxygen: { elem1: "sand", elem2: "fire", tempMin: 900, tempMax: 2500, chance: 0.08 } } },
+    { id: "nickel_56", color: ["#9cb5a8", "#adc7b9"], moltenColor: ["#ffbe76", "#ffd39b"], gasColor: ["#c7e3d4", "#daf2e5"], category: "isotopes", meltTemp: 1455, boilTemp: 2913, density: 8908, conduct: 0.7, tickAllStates: true, desc: "Supernova Nickel-56 -> Cobalt-56 -> Iron-56.", tick: (p) => { p.temp += 0.2; if (Math.random() < 0.0022) { safeChange(p, p.element === "nickel_56_gas" ? "cobalt_56_gas" : p.element === "molten_nickel_56" ? "molten_cobalt_56" : "cobalt_56"); p.temp += 120; return; } doDefaults(p); } },
+    { id: "cobalt_56", color: ["#7295c4", "#86a8d6"], moltenColor: ["#ffa366", "#ffb885"], gasColor: ["#a4bfe3", "#b8cff0"], category: "isotopes", meltTemp: 1495, boilTemp: 2927, density: 8900, conduct: 0.7, tickAllStates: true, desc: "Decays into stable Iron-56.", tick: (p) => { p.temp += 0.14; if (Math.random() < 0.0018) { if (p.temp >= 2862) safeChangeAny(p, ["iron_gas", "molten_iron", "iron"]); else if (p.temp >= 1538) safeChangeAny(p, ["molten_iron", "iron"]); else safeChange(p, "iron"); p.temp += 90; return; } doDefaults(p); } },
+    { id: "uranium_235", color: ["#4b7843", "#578c4e", "#3f6938"], moltenColor: ["#9be05a", "#b7f06e"], gasColor: ["#88b878", "#a2cc95"], category: "nuclear", meltTemp: 1132, boilTemp: 4131, density: 18950, conduct: 0.45, desc: "Fissile U-235.", tick: (p) => { if (Math.random() < 0.00005) spawnNeutronsAround(p.x, p.y, 1, "fast_neutron"); doDefaults(p); } },
     { id: "uranium_238", color: ["#3b4d3b", "#455945", "#324232"], moltenColor: ["#7a9c59", "#8eb06a"], gasColor: ["#6b7d6b", "#7c8f7c"], category: "nuclear", meltTemp: 1132, boilTemp: 4131, density: 19100, conduct: 0.45, desc: "Fertile U-238; breeds Np-239 -> Pu-239." },
-    { id: "neptunium_239", color: ["#5e6e7d", "#6e8091"], moltenColor: ["#b58d52", "#cfa363"], gasColor: ["#8e9eab", "#a3b3c2"], category: "isotopes", meltTemp: 644, boilTemp: 3902, density: 20450, conduct: 0.35, desc: "Breeder intermediate -> Pu-239.", tick: (p) => { p.temp += 0.08; if (Math.random() < 0.003) { safeChange(p, "plutonium_239"); spawnParticle(p.x, p.y, "beta_particle", 1); p.temp += 60; return; } doDefaults(p); } },
-    { id: "plutonium_239", color: ["#6b756b", "#7d8a7d", "#5c665c"], moltenColor: ["#e68a45", "#f5a056"], gasColor: ["#9ca89c", "#b0bdb0"], category: "nuclear", meltTemp: 640, boilTemp: 3228, density: 19816, conduct: 0.25, desc: "Fissile Pu-239.", tick: (p) => { p.temp += 0.05; if (Math.random() < 0.0006) spawnNeutronsAround(p.x, p.y, 1, "fast_neutron"); doDefaults(p); } },
+    { id: "neptunium_239", color: ["#5e6e7d", "#6e8091"], moltenColor: ["#b58d52", "#cfa363"], gasColor: ["#8e9eab", "#a3b3c2"], category: "isotopes", meltTemp: 644, boilTemp: 3902, density: 20450, conduct: 0.35, desc: "Breeder intermediate -> Pu-239.", tick: (p) => { p.temp += 0.05; if (Math.random() < 0.0008) { safeChange(p, "plutonium_239"); spawnParticle(p.x, p.y, "beta_particle", 1); p.temp += 45; return; } doDefaults(p); } },
+    { id: "plutonium_239", color: ["#6b756b", "#7d8a7d", "#5c665c"], moltenColor: ["#e68a45", "#f5a056"], gasColor: ["#9ca89c", "#b0bdb0"], category: "nuclear", meltTemp: 640, boilTemp: 3228, density: 19816, conduct: 0.25, desc: "Fissile Pu-239.", tick: (p) => { p.temp += 0.03; if (Math.random() < 0.00014) spawnNeutronsAround(p.x, p.y, 1, "fast_neutron"); doDefaults(p); } },
     { id: "thorium_232", color: ["#63605c", "#75726d", "#575450"], moltenColor: ["#d98a4e", "#eb9e60"], gasColor: ["#8f8b85", "#a39f98"], category: "nuclear", meltTemp: 1750, boilTemp: 4788, density: 11724, conduct: 0.5, desc: "Fertile Th-232; breeds Pa-233 -> U-233." },
-    { id: "protactinium_233", color: ["#7a7380", "#8c8494"], moltenColor: ["#c78b63", "#db9e74"], gasColor: ["#a199a8", "#b3abc0"], category: "isotopes", meltTemp: 1568, boilTemp: 4027, density: 15370, conduct: 0.4, desc: "Thorium breeder -> U-233.", tick: (p) => { p.temp += 0.06; if (Math.random() < 0.002) { safeChange(p, "uranium_233"); spawnParticle(p.x, p.y, "beta_particle", 1); p.temp += 50; return; } doDefaults(p); } },
+    { id: "protactinium_233", color: ["#7a7380", "#8c8494"], moltenColor: ["#c78b63", "#db9e74"], gasColor: ["#a199a8", "#b3abc0"], category: "isotopes", meltTemp: 1568, boilTemp: 4027, density: 15370, conduct: 0.4, desc: "Thorium breeder -> U-233.", tick: (p) => { p.temp += 0.04; if (Math.random() < 0.0006) { safeChange(p, "uranium_233"); spawnParticle(p.x, p.y, "beta_particle", 1); p.temp += 35; return; } doDefaults(p); } },
     { id: "uranium_233", color: ["#4d8066", "#5a9476", "#427058"], moltenColor: ["#8be0a4", "#a3f0ba"], gasColor: ["#84b89c", "#9accb1"], category: "nuclear", meltTemp: 1132, boilTemp: 4131, density: 18900, conduct: 0.45, desc: "Fissile U-233." },
-    { id: "californium_252", color: ["#a8b099", "#bcc4ab"], moltenColor: ["#ffad66", "#ffc285"], gasColor: ["#d4dbc5", "#e4ebd5"], category: "nuclear", meltTemp: 900, boilTemp: 1470, density: 15100, conduct: 0.4, desc: "Spontaneous-fission neutron source.", tick: (p) => { p.temp += 0.35; if (Math.random() < 0.03) spawnNeutronsAround(p.x, p.y, 1, "fast_neutron"); doDefaults(p); } },
-    { id: "americium_241", color: ["#c2c7cc", "#d3d8de"], moltenColor: ["#f0b07a", "#ffc48f"], gasColor: ["#dee3e8", "#eef2f7"], category: "isotopes", meltTemp: 1176, boilTemp: 2607, density: 13670, conduct: 0.45, desc: "Alpha emitter (pair with Beryllium).", tick: (p) => { p.temp += 0.12; if (Math.random() < 0.015) spawnParticle(p.x, p.y, "alpha_particle", 1); doDefaults(p); } },
-    { id: "radium_226", color: ["#80ff95", "#a3ffb3", "#64e87b"], moltenColor: ["#b8ffc4", "#d4ffdc"], gasColor: ["#a8e6b2", "#c2f2ca"], category: "isotopes", meltTemp: 700, boilTemp: 1737, density: 5500, conduct: 0.5, desc: "Radioluminescent Ra-226 -> Radon -> Po-210 -> Lead.", tick: (p) => { p.temp += 0.12; if (Math.random() < 0.008) spawnParticle(p.x, p.y, "alpha_particle", 1); if (Math.random() < 0.0004) { safeChange(p, "radon"); return; } doDefaults(p); } },
-    { id: "polonium_210", color: ["#8c9e99", "#9eb0ab"], moltenColor: ["#b5f5d8", "#ccffe8"], gasColor: ["#a8bfb9", "#bcd4ce"], category: "isotopes", meltTemp: 254, boilTemp: 962, density: 9196, conduct: 0.5, desc: "Intense alpha emitter -> Lead.", tick: (p) => { p.temp += 0.45; if (Math.random() < 0.02) spawnParticle(p.x, p.y, "alpha_particle", 1); if (Math.random() < 0.00025 && elements.lead) { safeChange(p, "lead"); return; } doDefaults(p); } },
-    { id: "barium_141", color: ["#a3a89c", "#b5baa9"], moltenColor: ["#d9b977", "#ebca86"], gasColor: ["#cfd4c7", "#dfe3d8"], category: "isotopes", meltTemp: 727, boilTemp: 1897, density: 3510, conduct: 0.4, behavior: behaviors.POWDER, desc: "Fission daughter with delayed neutrons.", tick: (p) => { p.temp += 0.12; if (UPC_CONFIG.delayedNeutrons && Math.random() < 0.0008) spawnNeutronsAround(p.x, p.y, 1, "thermal_neutron"); doDefaults(p); } },
-    { id: "strontium_90", color: ["#c2c7b8", "#d3d9c7"], moltenColor: ["#e6c373", "#f2d183"], gasColor: ["#e0e3d8", "#edf0e6"], category: "isotopes", meltTemp: 777, boilTemp: 1382, density: 2640, conduct: 0.45, behavior: behaviors.POWDER, desc: "RTG beta heat source.", tick: (p) => { p.temp += 0.08; if (Math.random() < 0.004) spawnParticle(p.x, p.y, "beta_particle", 1); doDefaults(p); } },
+    { id: "californium_252", color: ["#a8b099", "#bcc4ab"], moltenColor: ["#ffad66", "#ffc285"], gasColor: ["#d4dbc5", "#e4ebd5"], category: "nuclear", meltTemp: 900, boilTemp: 1470, density: 15100, conduct: 0.4, desc: "Spontaneous-fission neutron source.", tick: (p) => { p.temp += 0.2; if (Math.random() < 0.008) spawnNeutronsAround(p.x, p.y, 1, "fast_neutron"); doDefaults(p); } },
+    { id: "americium_241", color: ["#c2c7cc", "#d3d8de"], moltenColor: ["#f0b07a", "#ffc48f"], gasColor: ["#dee3e8", "#eef2f7"], category: "isotopes", meltTemp: 1176, boilTemp: 2607, density: 13670, conduct: 0.45, desc: "Alpha emitter (pair with Beryllium).", tick: (p) => { p.temp += 0.08; if (Math.random() < 0.006) spawnParticle(p.x, p.y, "alpha_particle", 1); doDefaults(p); } },
+    { id: "radium_226", color: ["#80ff95", "#a3ffb3", "#64e87b"], moltenColor: ["#b8ffc4", "#d4ffdc"], gasColor: ["#a8e6b2", "#c2f2ca"], category: "isotopes", meltTemp: 700, boilTemp: 1737, density: 5500, conduct: 0.5, desc: "Radioluminescent Ra-226 -> Radon -> Po-210 -> Lead.", tick: (p) => { p.temp += 0.08; if (Math.random() < 0.004) spawnParticle(p.x, p.y, "alpha_particle", 1); if (Math.random() < 0.00015) { safeChange(p, "radon"); return; } doDefaults(p); } },
+    { id: "polonium_210", color: ["#8c9e99", "#9eb0ab"], moltenColor: ["#b5f5d8", "#ccffe8"], gasColor: ["#a8bfb9", "#bcd4ce"], category: "isotopes", meltTemp: 254, boilTemp: 962, density: 9196, conduct: 0.5, desc: "Intense alpha emitter -> Lead.", tick: (p) => { p.temp += 0.28; if (Math.random() < 0.008) spawnParticle(p.x, p.y, "alpha_particle", 1); if (Math.random() < 0.0001 && elements.lead) { safeChange(p, "lead"); return; } doDefaults(p); } },
+    { id: "barium_141", color: ["#a3a89c", "#b5baa9"], moltenColor: ["#d9b977", "#ebca86"], gasColor: ["#cfd4c7", "#dfe3d8"], category: "isotopes", meltTemp: 727, boilTemp: 1897, density: 3510, conduct: 0.4, behavior: behaviors.POWDER, desc: "Fission daughter with delayed neutrons.", tick: (p) => { p.temp += 0.07; if (UPC_CONFIG.delayedNeutrons && Math.random() < 0.00035) spawnNeutronsAround(p.x, p.y, 1, "thermal_neutron"); doDefaults(p); } },
+    { id: "strontium_90", color: ["#c2c7b8", "#d3d9c7"], moltenColor: ["#e6c373", "#f2d183"], gasColor: ["#e0e3d8", "#edf0e6"], category: "isotopes", meltTemp: 777, boilTemp: 1382, density: 2640, conduct: 0.45, behavior: behaviors.POWDER, desc: "RTG beta heat source.", tick: (p) => { p.temp += 0.05; if (Math.random() < 0.002) spawnParticle(p.x, p.y, "beta_particle", 1); doDefaults(p); } },
     { id: "cesium_135", color: ["#d9c27e", "#e6cf8c"], moltenColor: ["#f0d88b", "#fce597"], gasColor: ["#ebdcb0", "#f5e8c1"], category: "isotopes", meltTemp: 28.5, boilTemp: 671, density: 1930, conduct: 0.65, behavior: behaviors.POWDER, desc: "Long-lived Cesium-135." },
-    { id: "beryllium", color: ["#8c9c94", "#9eb0a7", "#7d8c85"], moltenColor: ["#d99b66", "#eba971"], gasColor: ["#b5c4bc", "#c8d6cf"], category: "nuclear", meltTemp: 1287, boilTemp: 2470, density: 1850, conduct: 0.75, hardness: 0.8, desc: "Neutron reflector & (n,2n) multiplier.", reactions: { polonium_210: { chance: 0.08, func: p1 => { spawnNeutronsAround(p1.x, p1.y, 1, "fast_neutron"); p1.temp += 15; } }, americium_241: { chance: 0.05, func: p1 => { spawnNeutronsAround(p1.x, p1.y, 1, "fast_neutron"); p1.temp += 10; } } } },
-    { id: "boron", color: ["#3a3330", "#4a413d", "#2e2826"], moltenColor: ["#b85e37", "#cc6b41"], gasColor: ["#786c67", "#8a7c76"], category: "nuclear", meltTemp: 2076, boilTemp: 3927, density: 2340, conduct: 0.15, hardness: 0.92, tickAllStates: true, desc: "Control rod & aneutronic p-B11 fusion fuel (>55,000 C).", tick: (p) => { const fr = getFusionFactor(p); if (fr > 0 && p.temp >= 55000 && Math.random() < 0.2 * fr) { const h = findAdjacentElement(p, "hydrogen"); if (h) { safeChange(p, "helium"); safeChange(h, "helium"); p.temp += 9500; h.temp += 9500; return; } } doDefaults(p); } },
+    { id: "beryllium", color: ["#8c9c94", "#9eb0a7", "#7d8c85"], moltenColor: ["#d99b66", "#eba971"], gasColor: ["#b5c4bc", "#c8d6cf"], category: "nuclear", meltTemp: 1287, boilTemp: 2470, density: 1850, conduct: 0.75, hardness: 0.8, desc: "Neutron reflector & (n,2n) multiplier.", reactions: { polonium_210: { chance: 0.03, func: p1 => { spawnNeutronsAround(p1.x, p1.y, 1, "fast_neutron"); p1.temp += 12; } }, americium_241: { chance: 0.02, func: p1 => { spawnNeutronsAround(p1.x, p1.y, 1, "fast_neutron"); p1.temp += 8; } } } },
+    { id: "boron", color: ["#3a3330", "#4a413d", "#2e2826"], moltenColor: ["#b85e37", "#cc6b41"], gasColor: ["#786c67", "#8a7c76"], category: "nuclear", meltTemp: 2076, boilTemp: 3927, density: 2340, conduct: 0.15, hardness: 0.92, tickAllStates: true, desc: "Control rod & aneutronic p-B11 fusion fuel (>55,000 C).", tick: (p) => { const fr = getFusionFactor(p); if (fr > 0 && p.temp >= 55000 && Math.random() < 0.02 * fr) { const h = findAdjacentElement(p, "hydrogen"); if (h) { safeChange(p, "helium"); safeChange(h, "helium"); p.temp += 6500; h.temp += 6500; return; } } doDefaults(p); } },
     { id: "cadmium", color: ["#9da8b8", "#adb8c9", "#8c96a6"], moltenColor: ["#cfd6e0", "#dfe6f0"], gasColor: ["#b8c2d1", "#cbd4e3"], category: "nuclear", meltTemp: 321, boilTemp: 767, density: 8650, conduct: 0.7, hardness: 0.45, desc: "Control-rod neutron absorber." },
     { id: "hafnium", color: ["#7a8491", "#8b95a3", "#697380"], moltenColor: ["#eb9952", "#ffa963"], gasColor: ["#a3adb8", "#b6c0cc"], category: "nuclear", meltTemp: 2233, boilTemp: 4603, density: 13310, conduct: 0.55, hardness: 0.88, desc: "High-temp control rod absorber." },
     { id: "tungsten", color: ["#5b616b", "#6b727d", "#4d525c"], moltenColor: ["#fff3b0", "#fff9d4"], gasColor: ["#a8b0bd", "#bcc4d1"], category: "metals", meltTemp: 3422, boilTemp: 5555, density: 19250, conduct: 0.78, hardness: 0.96, desc: "Highest-melting pure metal (3,422 C)." },
-    { id: "lithium_6", color: ["#b8bcc2", "#c7cbd1"], moltenColor: ["#e0c59b", "#f0d4a8"], gasColor: ["#d6dae0", "#e6e9f0"], category: "isotopes", meltTemp: 180.5, boilTemp: 1342, density: 460, conduct: 0.6, hardness: 0.25, desc: "Breeds Tritium + He-4 from neutrons.", reactions: { water: { elem1: "hydrogen", elem2: "fire", chance: 0.4, func: p1 => { p1.temp += 300; } } } },
-    { id: "lithium_7", color: ["#aeb3ba", "#bfc4cc"], moltenColor: ["#d9be93", "#e8cca0"], gasColor: ["#cfd4db", "#dfe4eb"], category: "isotopes", meltTemp: 180.5, boilTemp: 1342, density: 534, conduct: 0.6, hardness: 0.25, desc: "Low-absorption Lithium-7.", reactions: { water: { elem1: "hydrogen", elem2: "fire", chance: 0.4, func: p1 => { p1.temp += 300; } } } },
+    { id: "lithium_6", color: ["#b8bcc2", "#c7cbd1"], moltenColor: ["#e0c59b", "#f0d4a8"], gasColor: ["#d6dae0", "#e6e9f0"], category: "isotopes", meltTemp: 180.5, boilTemp: 1342, density: 460, conduct: 0.6, hardness: 0.25, desc: "Breeds Tritium + He-4 from neutrons.", reactions: { water: { elem1: "hydrogen", elem2: "fire", chance: 0.22, func: p1 => { p1.temp += 260; } } } },
+    { id: "lithium_7", color: ["#aeb3ba", "#bfc4cc"], moltenColor: ["#d9be93", "#e8cca0"], gasColor: ["#cfd4db", "#dfe4eb"], category: "isotopes", meltTemp: 180.5, boilTemp: 1342, density: 534, conduct: 0.6, hardness: 0.25, desc: "Low-absorption Lithium-7.", reactions: { water: { elem1: "hydrogen", elem2: "fire", chance: 0.22, func: p1 => { p1.temp += 260; } } } },
     { id: "nickel", color: ["#a8a89e", "#babab0", "#96968c"], moltenColor: ["#eb9a52", "#ffa961"], gasColor: ["#c7c7bd", "#d9d9cf"], category: "metals", meltTemp: 1455, boilTemp: 2913, density: 8908, conduct: 0.72, hardness: 0.75, behavior: behaviors.POWDER, desc: "Ferromagnetic metal (Curie: 358 C)." },
     { id: "cobalt", color: ["#587196", "#6682ab", "#4c6282"], moltenColor: ["#e6863e", "#f59851"], gasColor: ["#8da2c2", "#9fb4d4"], category: "metals", meltTemp: 1495, boilTemp: 2927, density: 8900, conduct: 0.72, hardness: 0.78, behavior: behaviors.POWDER, desc: "Ferromagnetic metal (Curie: 1,115 C); activates to Co-60." },
-    { id: "cobalt_60", color: ["#3b6eff", "#5985ff", "#2c5be6"], moltenColor: ["#7aa2ff", "#99b8ff"], gasColor: ["#6b93ff", "#88a8ff"], category: "isotopes", meltTemp: 1495, boilTemp: 2927, density: 8900, conduct: 0.72, hardness: 0.78, desc: "Intense gamma emitter.", tick: (p) => { p.temp += 0.25; if (Math.random() < 0.015) spawnParticle(p.x, p.y, "gamma_ray", 1); doDefaults(p); } },
+    { id: "cobalt_60", color: ["#3b6eff", "#5985ff", "#2c5be6"], moltenColor: ["#7aa2ff", "#99b8ff"], gasColor: ["#6b93ff", "#88a8ff"], category: "isotopes", meltTemp: 1495, boilTemp: 2927, density: 8900, conduct: 0.72, hardness: 0.78, desc: "Intense gamma emitter.", tick: (p) => { p.temp += 0.16; if (Math.random() < 0.006) spawnParticle(p.x, p.y, "gamma_ray", 1); doDefaults(p); } },
     { id: "neodymium", color: ["#8c929c", "#9da4b0"], moltenColor: ["#eb9b5e", "#ffa96e"], gasColor: ["#b4bac4", "#c5cbd6"], category: "metals", meltTemp: 1024, boilTemp: 3074, density: 7010, conduct: 0.5, hardness: 0.65, behavior: behaviors.POWDER, desc: "Rare-earth magnetic metal (Curie: 310 C)." },
     { id: "gadolinium", color: ["#a3b4bd", "#b5c6cf"], moltenColor: ["#e6aa6e", "#f5bb7f"], gasColor: ["#c7d6de", "#d9e6ed"], category: "metals", meltTemp: 1313, boilTemp: 3273, density: 7900, conduct: 0.45, hardness: 0.6, behavior: behaviors.POWDER, desc: "Magnetic thermal switch (Curie: 20 C)." },
     { id: "bismuth", color: ["#c7a4d6", "#9be3d8", "#f0c88c"], moltenColor: ["#d9d4e3", "#ebe6f5"], gasColor: ["#e0d5eb", "#efe6fa"], category: "metals", meltTemp: 271.4, boilTemp: 1564, density: 9780, conduct: 0.25, hardness: 0.4, behavior: behaviors.POWDER, desc: "Strongest room-temp diamagnet (weakly repelled by magnets)." },
-    { id: "platinum", color: ["#d6dce3", "#e5ebf2", "#c4cbd4"], moltenColor: ["#ffe1b8", "#ffedd4"], gasColor: ["#e6ecf2", "#f2f7fc"], category: "metals", meltTemp: 1768, boilTemp: 3825, density: 21450, conduct: 0.85, hardness: 0.8, desc: "Catalyzes H2+O2 ignition and Haber Ammonia synthesis (350-650 C).", tick: (p) => { if (Math.random() < 0.25) { const h = findAdjacentElement(p, "hydrogen"); if (h) { const o = findAdjacentElement(p, "oxygen"); if (o) { safeChange(h, "steam"); safeChange(o, "fire"); p.temp += 120; return; } if (p.temp >= 350 && p.temp <= 650 && elements.ammonia) { const n = findAdjacentElement(p, "nitrogen"); if (n) { safeChange(h, "ammonia"); safeChange(n, "ammonia"); p.temp += 60; return; } } } } doDefaults(p); } },
-    { id: "cesium", color: ["#e3cf86", "#edda95", "#d4bf77"], moltenColor: ["#f5e29d", "#ffedab"], gasColor: ["#f2e6bd", "#fcf1cc"], category: "metals", meltTemp: 28.5, boilTemp: 671, density: 1930, conduct: 0.72, hardness: 0.1, behavior: behaviors.POWDER, desc: "Melts at 28.5 C; explodes with water/ice.", reactions: { water: { chance: 0.9, func: p1 => { safeChange(p1, "hydrogen"); p1.temp += 1200; explodeAt(p1.x, p1.y, 4, "fire,hydrogen,steam"); } }, ice: { chance: 0.7, func: p1 => { safeChange(p1, "hydrogen"); explodeAt(p1.x, p1.y, 4, "fire,hydrogen,steam"); } }, oxygen: { elem1: "fire", elem2: "ash", tempMin: 35, chance: 0.35 } } },
-    { id: "rubidium", color: ["#c9cfd6", "#d8dee6"], moltenColor: ["#dfe5ed", "#edf2f7"], gasColor: ["#cfd6de", "#dee4eb"], category: "metals", meltTemp: 39.3, boilTemp: 688, density: 1532, conduct: 0.7, hardness: 0.12, behavior: behaviors.POWDER, desc: "Explodes on contact with water.", reactions: { water: { chance: 0.85, func: p1 => { safeChange(p1, "hydrogen"); explodeAt(p1.x, p1.y, 3, "fire,hydrogen,steam"); } } } },
-    { id: "gallium", color: ["#b4c2d1", "#c5d2e0", "#a4b2c2"], moltenColor: ["#d4e0ed", "#e3edf7"], gasColor: ["#c7d4e3", "#d8e4f2"], category: "metals", meltTemp: 29.8, boilTemp: 2400, density: 5910, conduct: 0.65, hardness: 0.35, desc: "Melts at 29.8 C; embrittles Aluminum.", reactions: { aluminum: { elem2: "metal_scrap", chance: 0.25 } } },
-    { id: "phosphorus_white", color: ["#f5f0c4", "#fffad1", "#e8e2b0"], moltenColor: ["#fff49e", "#fff9ba"], gasColor: ["#f0ebb9", "#faf5c8"], category: "chemistry", meltTemp: 44.1, boilTemp: 280.5, density: 1823, conduct: 0.05, hardness: 0.2, behavior: behaviors.POWDER, desc: "Pyrophoric (>30 C in O2); converts to Red Phosphorus >250 C without O2.", tick: (p) => { if (p.temp >= 250 && p.temp < 400 && Math.random() < 0.04 && !findAdjacentElement(p, "oxygen")) { safeChange(p, "phosphorus_red"); return; } doDefaults(p); }, reactions: { oxygen: { elem1: "fire", elem2: "smoke", tempMin: 30, chance: 0.5, func: p1 => { p1.temp += 800; } } } },
-    { id: "phosphorus_red", color: ["#9e2b25", "#b5352e", "#87221d"], moltenColor: ["#d94a38", "#eb5a46"], gasColor: ["#f0ebb9", "#faf5c8"], category: "chemistry", meltTemp: 590, boilTemp: 620, density: 2340, conduct: 0.05, hardness: 0.35, behavior: behaviors.POWDER, desc: "Stable Red Phosphorus.", reactions: { oxygen: { elem1: "fire", elem2: "smoke", tempMin: 260, chance: 0.35, func: p1 => { p1.temp += 700; } } } },
+    { id: "platinum", color: ["#d6dce3", "#e5ebf2", "#c4cbd4"], moltenColor: ["#ffe1b8", "#ffedd4"], gasColor: ["#e6ecf2", "#f2f7fc"], category: "metals", meltTemp: 1768, boilTemp: 3825, density: 21450, conduct: 0.85, hardness: 0.8, desc: "Catalyzes H2+O2 ignition and Haber Ammonia synthesis (350-650 C).", tick: (p) => { if (Math.random() < 0.12) { const h = findAdjacentElement(p, "hydrogen"); if (h) { const o = findAdjacentElement(p, "oxygen"); if (o) { safeChange(h, "steam"); safeChange(o, "fire"); p.temp += 100; return; } if (p.temp >= 350 && p.temp <= 650 && elements.ammonia) { const n = findAdjacentElement(p, "nitrogen"); if (n) { safeChange(h, "ammonia"); safeChange(n, "ammonia"); p.temp += 50; return; } } } } doDefaults(p); } },
+    { id: "cesium", color: ["#e3cf86", "#edda95", "#d4bf77"], moltenColor: ["#f5e29d", "#ffedab"], gasColor: ["#f2e6bd", "#fcf1cc"], category: "metals", meltTemp: 28.5, boilTemp: 671, density: 1930, conduct: 0.72, hardness: 0.1, behavior: behaviors.POWDER, desc: "Melts at 28.5 C; explodes with water/ice.", reactions: { water: { chance: 0.65, func: p1 => { safeChange(p1, "hydrogen"); p1.temp += 1100; explodeAt(p1.x, p1.y, 4, "fire,hydrogen,steam"); } }, ice: { chance: 0.45, func: p1 => { safeChange(p1, "hydrogen"); explodeAt(p1.x, p1.y, 4, "fire,hydrogen,steam"); } }, oxygen: { elem1: "fire", elem2: "ash", tempMin: 35, chance: 0.2 } } },
+    { id: "rubidium", color: ["#c9cfd6", "#d8dee6"], moltenColor: ["#dfe5ed", "#edf2f7"], gasColor: ["#cfd6de", "#dee4eb"], category: "metals", meltTemp: 39.3, boilTemp: 688, density: 1532, conduct: 0.7, hardness: 0.12, behavior: behaviors.POWDER, desc: "Explodes on contact with water.", reactions: { water: { chance: 0.6, func: p1 => { safeChange(p1, "hydrogen"); explodeAt(p1.x, p1.y, 3, "fire,hydrogen,steam"); } } } },
+    { id: "gallium", color: ["#b4c2d1", "#c5d2e0", "#a4b2c2"], moltenColor: ["#d4e0ed", "#e3edf7"], gasColor: ["#c7d4e3", "#d8e4f2"], category: "metals", meltTemp: 29.8, boilTemp: 2400, density: 5910, conduct: 0.65, hardness: 0.35, desc: "Melts at 29.8 C; embrittles Aluminum.", reactions: { aluminum: { elem2: "metal_scrap", chance: 0.14 } } },
+    { id: "phosphorus_white", color: ["#f5f0c4", "#fffad1", "#e8e2b0"], moltenColor: ["#fff49e", "#fff9ba"], gasColor: ["#f0ebb9", "#faf5c8"], category: "chemistry", meltTemp: 44.1, boilTemp: 280.5, density: 1823, conduct: 0.05, hardness: 0.2, behavior: behaviors.POWDER, desc: "Pyrophoric (>30 C in O2); converts to Red Phosphorus >250 C without O2.", tick: (p) => { if (p.temp >= 250 && p.temp < 400 && Math.random() < 0.02 && !findAdjacentElement(p, "oxygen")) { safeChange(p, "phosphorus_red"); return; } doDefaults(p); }, reactions: { oxygen: { elem1: "fire", elem2: "smoke", tempMin: 30, chance: 0.28, func: p1 => { p1.temp += 700; } } } },
+    { id: "phosphorus_red", color: ["#9e2b25", "#b5352e", "#87221d"], moltenColor: ["#d94a38", "#eb5a46"], gasColor: ["#f0ebb9", "#faf5c8"], category: "chemistry", meltTemp: 590, boilTemp: 620, density: 2340, conduct: 0.05, hardness: 0.35, behavior: behaviors.POWDER, desc: "Stable Red Phosphorus.", reactions: { oxygen: { elem1: "fire", elem2: "smoke", tempMin: 260, chance: 0.2, func: p1 => { p1.temp += 650; } } } },
     { id: "alumina", color: ["#e8ecf0", "#f2f5f7", "#d8dde3"], moltenColor: ["#ffcf9e", "#ffe0bd"], gasColor: ["#e6eaed", "#f5f8fa"], category: "chemistry", meltTemp: 2072, boilTemp: 2977, density: 3950, conduct: 0.1, hardness: 0.9, behavior: behaviors.POWDER, desc: "Al2O3 ceramic slag from Thermite." },
     { id: "osmium", color: ["#526075", "#5f6e85", "#465366"], moltenColor: ["#e69653", "#f5a764"], gasColor: ["#7c8ba3", "#8d9cb5"], category: "metals", meltTemp: 3033, boilTemp: 5012, density: 22590, conduct: 0.7, hardness: 0.95, desc: "Densest natural element on Earth." }
   ];
@@ -1533,8 +1693,8 @@
   function applyPreset(name) {
     const presets = {
       default: DEFAULT_CONFIG,
-      stellar: { gravityMethod: "star", fieldTileSize: 4, fieldRebuildInterval: 2, gravAccel: 0.04, compressionHeatScale: 1.1, radiativeCooling: true, starDrag: 0.998, fusionRate: 1.3, supernovaEnabled: true, autoBonding: false },
-      reactor: { gravityMethod: "element", fieldTileSize: 4, fieldRebuildInterval: 2, fissionHeatScale: 1.0, maxNeutrons: 480, delayedNeutrons: true, plasmaConfinement: true, autoBonding: true },
+      stellar: { gravityMethod: "star", fieldTileSize: 4, fieldRebuildInterval: 2, gravAccel: 0.038, compressionHeatScale: 1.0, radiativeCooling: true, collapseThresholdScale: 1.0, starDrag: 0.998, fusionRate: 1.0, supernovaEnabled: true, autoBonding: false },
+      reactor: { gravityMethod: "element", fieldTileSize: 4, fieldRebuildInterval: 2, fissionRate: 1.0, fissionHeatScale: 1.0, maxNeutrons: 420, delayedNeutrons: true, plasmaConfinement: true, autoBonding: true },
       fast:    { gravityMethod: "com", fieldTileSize: 6, fieldRebuildInterval: 4, maxNeutrons: 200, maxBonds: 300, showFields: false }
     };
     if (presets[name]) Object.assign(UPC_CONFIG, presets[name]);
@@ -1548,12 +1708,12 @@
     style.textContent = `
       #upc-settings-btn{position:fixed;top:10px;right:12px;z-index:99998;background:#181a22;color:#e6ecff;border:1px solid #3c4663;border-radius:6px;padding:6px 11px;font:600 12px/1 system-ui,sans-serif;cursor:pointer;box-shadow:0 2px 10px rgba(0,0,0,.45)}
       #upc-settings-btn:hover{background:#232838;border-color:#66b2ff}
-      #upc-settings-panel{position:fixed;top:44px;right:12px;z-index:99999;width:330px;max-height:calc(100vh - 64px);overflow-y:auto;background:rgba(18,20,27,.96);color:#e2e8f5;border:1px solid #343d54;border-radius:9px;padding:12px 14px;font:12px/1.4 system-ui,sans-serif;box-shadow:0 10px 28px rgba(0,0,0,.65);display:none}
+      #upc-settings-panel{position:fixed;top:44px;right:12px;z-index:99999;width:332px;max-height:calc(100vh - 64px);overflow-y:auto;background:rgba(18,20,27,.96);color:#e2e8f5;border:1px solid #343d54;border-radius:9px;padding:12px 14px;font:12px/1.4 system-ui,sans-serif;box-shadow:0 10px 28px rgba(0,0,0,.65);display:none}
       #upc-settings-panel h3{margin:0 0 8px;font-size:14px;color:#7cc4ff;display:flex;justify-content:space-between;align-items:center}
       #upc-settings-panel .upc-sec{margin:10px 0 5px;padding-top:7px;border-top:1px solid #2b3245;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#8c9bbd}
       #upc-settings-panel .upc-row{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:5px 0}
       #upc-settings-panel label{flex:1;color:#d5ddf0}
-      #upc-settings-panel select,#upc-settings-panel input[type="range"]{width:140px;background:#101218;color:#eef3ff;border:1px solid #39435e;border-radius:4px;padding:2px 4px;font-size:11.5px}
+      #upc-settings-panel select,#upc-settings-panel input[type="range"]{width:136px;background:#101218;color:#eef3ff;border:1px solid #39435e;border-radius:4px;padding:2px 4px;font-size:11.5px}
       #upc-settings-panel .upc-val{width:38px;text-align:right;color:#8cd1ff;font-variant-numeric:tabular-nums}
       #upc-settings-panel .upc-presets{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin:6px 0 8px}
       #upc-settings-panel button.upc-act{background:#23293a;color:#dce6ff;border:1px solid #3a4563;border-radius:5px;padding:5px 7px;font-size:11px;cursor:pointer}
@@ -1569,7 +1729,7 @@
     panelEl = document.createElement("div");
     panelEl.id = "upc-settings-panel";
     ["mousedown", "mouseup", "click", "wheel", "keydown", "keyup", "touchstart"].forEach(ev => panelEl.addEventListener(ev, e => e.stopPropagation()));
-    panelEl.innerHTML = '<h3><span>Unified Physics v6.1</span><span style="cursor:pointer;color:#7e8ba8" id="upc-close-x">✕</span></h3>';
+    panelEl.innerHTML = '<h3><span>Unified Physics v7</span><span style="cursor:pointer;color:#7e8ba8" id="upc-close-x">✕</span></h3>';
 
     statsEl = document.createElement("div"); statsEl.id = "upc-stats-bar";
     statsEl.textContent = "Tick: 0.00 ms | Moving: 0\nTiles G:0 B:0 | Bonds:0 | n:0";
@@ -1607,12 +1767,13 @@
       uiControls[key] = c; r.append(l, c); panelEl.appendChild(r);
     };
 
-    addSec("Gravity & CIC Tile Engine");
+    addSec("Gravity & Collapse Engine");
     addSel("Gravity Method", "gravityMethod", [["element", "Element-Based (star_gravity/wells)"], ["star", "Multi-Body CIC (Always On)"], ["com", "Fast Center-of-Mass"], ["wells_only", "Gravity Wells / Cores Only"], ["off", "Off (Vanilla Only)"]]);
     addSel("Tile Resolution", "fieldTileSize", [[2, "2x2 (Ultra Sharp)"], [4, "4x4 (Balanced)"], [6, "6x6 (Fast)"], [8, "8x8 (Max FPS)"]]);
     addSld("Rebuild Every (ticks)", "fieldRebuildInterval", 1, 6, 1);
     addSld("Gravity Strength", "gravAccel", 0, 0.12, 0.004);
     addSld("Gas Compression Heat", "compressionHeatScale", 0, 2.5, 0.1);
+    addSld("Collapse Threshold", "collapseThresholdScale", 0.3, 3.0, 0.1);
     addTgl("Stellar Radiative Cooling", "radiativeCooling");
     addSld("Max Pixel Speed", "maxSpeed", 0.5, 3.5, 0.1);
     addSld("Orbital Drag", "starDrag", 0.94, 1.0, 0.002);
@@ -1625,10 +1786,11 @@
 
     addSec("Nuclear & Fusion");
     addSld("Fusion Rate", "fusionRate", 0, 3.0, 0.1);
+    addSld("Fission Rate", "fissionRate", 0.1, 3.0, 0.1);
     addSld("Fission Heat Scale", "fissionHeatScale", 0.2, 3.0, 0.1);
     addSld("Neutron Cap", "maxNeutrons", 60, 800, 20);
     addTgl("Delayed Neutrons", "delayedNeutrons");
-    addTgl("Supernova Core Collapse", "supernovaEnabled");
+    addTgl("Supernova & Crush Collapse", "supernovaEnabled");
 
     addSec("Chemical Bonding");
     addTgl("Auto Chemical Bonding", "autoBonding");
@@ -1644,6 +1806,7 @@
         const p = currentPixels[i];
         if (p) { p.vx = 0; p.vy = 0; p.rx = 0; p.ry = 0; p.inwardImpulse = 0; }
       }
+      if (cellCrush) cellCrush.fill(0);
       movingPixelsLastTick = 0; notifyUser("Zeroed velocity on all pixels.");
     };
     aRow.append(cbBtn, zvBtn); panelEl.appendChild(aRow);
@@ -1707,7 +1870,7 @@
     }
 
     if (elements.neutron) {
-      elements.neutron.desc = "Free neutron (enhanced by Unified Physics & Chemistry v6.1).";
+      elements.neutron.desc = "Free neutron (enhanced by Unified Physics & Chemistry v7).";
       if (!elements.neutron.reactions) elements.neutron.reactions = {};
       delete elements.neutron.tick1; delete elements.neutron.tick2;
       elements.neutron.tick = (p) => neutronTick(p, true);
@@ -1715,21 +1878,21 @@
     if (elements.uranium) {
       elements.uranium.desc = "Natural/Low-Enriched Uranium (patched). Requires moderated thermal neutrons.";
       delete elements.uranium.tick1; delete elements.uranium.tick2;
-      elements.uranium.tick = (p) => { if (Math.random() < 0.0001) spawnNeutronsAround(p.x, p.y, 1, "fast_neutron"); doDefaults(p); };
+      elements.uranium.tick = (p) => { if (Math.random() < 0.00003) spawnNeutronsAround(p.x, p.y, 1, "fast_neutron"); doDefaults(p); };
     }
     if (elements.plutonium) {
       elements.plutonium.desc = "Plutonium-239 (patched). Self-heats via alpha decay; fissions on thermal & fast neutrons.";
       delete elements.plutonium.tick1; delete elements.plutonium.tick2;
-      elements.plutonium.tick = (p) => { p.temp += 0.05; if (Math.random() < 0.0005) spawnNeutronsAround(p.x, p.y, 1, "fast_neutron"); doDefaults(p); };
+      elements.plutonium.tick = (p) => { p.temp += 0.03; if (Math.random() < 0.00012) spawnNeutronsAround(p.x, p.y, 1, "fast_neutron"); doDefaults(p); };
     }
 
-    // Stellar Fusion Hooks on Vanilla Gases (compression-scaled & crash-proof)
+    // Stellar Fusion Hooks on Vanilla Gases (paced ~12x slower & compression-scaled)
     if (elements.hydrogen) {
       wrapTick("hydrogen", (p) => {
         const fr = getFusionFactor(p);
-        if (fr > 0 && p.temp >= 50000 && Math.random() < 0.16 * fr) {
+        if (fr > 0 && p.temp >= 50000 && Math.random() < 0.012 * fr) {
           const o = findAdjacentElement(p, "hydrogen");
-          if (o) { safeChange(p, "deuterium"); safeChangeAny(o, ["positron", "gamma_ray", "radiation"]); p.temp += 4000; o.temp += 4000; return true; }
+          if (o) { safeChange(p, "deuterium"); safeChangeAny(o, ["positron", "gamma_ray", "radiation"]); p.temp += 2800; o.temp += 2800; return true; }
         }
         return false;
       });
@@ -1737,9 +1900,9 @@
     if (elements.helium) {
       wrapTick("helium", (p) => {
         const fr = getFusionFactor(p);
-        if (fr > 0 && p.temp >= 65000 && Math.random() < 0.15 * fr) {
+        if (fr > 0 && p.temp >= 65000 && Math.random() < 0.011 * fr) {
           const o = findAdjacentElement(p, "helium");
-          if (o) { safeChange(p, "carbon_vapor"); safeChange(o, "gamma_ray"); p.temp += 5500; o.temp += 5500; return true; }
+          if (o) { safeChange(p, "carbon_vapor"); safeChange(o, "gamma_ray"); p.temp += 3800; o.temp += 3800; return true; }
         }
         return false;
       });
@@ -1747,30 +1910,30 @@
     if (elements.oxygen) {
       wrapTick("oxygen", (p) => {
         const fr = getFusionFactor(p);
-        if (fr > 0 && p.temp >= 95000 && Math.random() < 0.16 * fr) {
+        if (fr > 0 && p.temp >= 95000 && Math.random() < 0.014 * fr) {
           const o = findAdjacentElement(p, "oxygen");
           if (o) {
             if (Math.random() < 0.75) safeChange(p, "silicon_gas");
             else safeChangeAny(p, ["sulfur_gas", "molten_sulfur", "sulfur", "silicon_gas"]);
-            safeChange(o, "gamma_ray"); p.temp += 4000; o.temp += 4000; return true;
+            safeChange(o, "gamma_ray"); p.temp += 2800; o.temp += 2800; return true;
           }
         }
         return false;
       });
     }
 
-    // High-Temperature Thermal Dissociation
-    if (elements.carbon_dioxide) wrapTick("carbon_dioxide", (p) => (p.temp >= 4000 && Math.random() < 0.25 ? (safeChange(p, Math.random() < 0.5 ? "carbon_vapor" : "oxygen"), true) : false));
-    if (elements.steam) wrapTick("steam", (p) => (p.temp >= 3200 && Math.random() < 0.20 ? (safeChange(p, Math.random() < 0.66 ? "hydrogen" : "oxygen"), true) : false));
-    if (elements.ammonia) wrapTick("ammonia", (p) => (p.temp >= 1200 && Math.random() < 0.22 ? (safeChange(p, Math.random() < 0.75 ? "hydrogen" : "nitrogen"), true) : false));
-    if (elements.sand) wrapTick("sand", (p) => (p.temp >= 4500 && Math.random() < 0.18 ? (safeChange(p, Math.random() < 0.45 ? "silicon_gas" : "oxygen"), true) : false));
+    // Paced High-Temperature Thermal Dissociation
+    if (elements.carbon_dioxide) wrapTick("carbon_dioxide", (p) => (p.temp >= 4000 && Math.random() < 0.08 ? (safeChange(p, Math.random() < 0.5 ? "carbon_vapor" : "oxygen"), true) : false));
+    if (elements.steam) wrapTick("steam", (p) => (p.temp >= 3200 && Math.random() < 0.07 ? (safeChange(p, Math.random() < 0.66 ? "hydrogen" : "oxygen"), true) : false));
+    if (elements.ammonia) wrapTick("ammonia", (p) => (p.temp >= 1200 && Math.random() < 0.08 ? (safeChange(p, Math.random() < 0.75 ? "hydrogen" : "nitrogen"), true) : false));
+    if (elements.sand) wrapTick("sand", (p) => (p.temp >= 4500 && Math.random() < 0.06 ? (safeChange(p, Math.random() < 0.45 ? "silicon_gas" : "oxygen"), true) : false));
 
     // Thermite (Rust + Aluminum > 1,200 C) & chem.js Uranium Dioxide integration
     if (elements.rust && elements.aluminum) {
-      safeAddReaction("rust", "aluminum", { elem1: "molten_iron", elem2: "alumina", tempMin: 1200, chance: 0.45, func: (p1, p2) => { p1.temp += 1800; p2.temp += 1800; } });
+      safeAddReaction("rust", "aluminum", { elem1: "molten_iron", elem2: "alumina", tempMin: 1200, chance: 0.22, func: (p1, p2) => { p1.temp += 1500; p2.temp += 1500; } });
     }
     if (elements.uranium_dioxide) {
-      FISSILE_SPECS.uranium_dioxide = { th: 0.45, fa: 0.04, n: [2, 3], heat: 1850, d: ["barium_141", "krypton_92", "xenon_135"] };
+      FISSILE_SPECS.uranium_dioxide = { th: 0.16, fa: 0.015, n: [2, 3], heat: 1200, d: ["barium_141", "krypton_92", "xenon_135"] };
     }
 
     // Global simulation tick & render hooks
@@ -1792,7 +1955,7 @@
       const origDraw = window.drawPixels;
       const wrappedDraw = function (...args) {
         const res = origDraw.apply(this, args);
-        try { drawFieldOverlay(); drawActiveBonds(); } catch (err) {}
+        try { drawFieldOverlay(); drawShockwaves(); drawActiveBonds(); } catch (err) {}
         return res;
       };
       wrappedDraw._upcWrapped = true;
@@ -1828,7 +1991,7 @@
     if (typeof SettingsTab === "function") registerBetterSettingsTab();
     else if (typeof dependOn === "function") dependOn("betterSettings.js", registerBetterSettingsTab, true);
 
-    console.log("[unified_physics_chem] Loaded v6.1 successfully!");
+    console.log("[unified_physics_chem] Loaded v7 successfully!");
   }
 
   if (typeof runAfterLoad === "function") runAfterLoad(initUnifiedPhysics);
