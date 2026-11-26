@@ -1,5 +1,5 @@
 /*
- * Unified Physics & Chemistry v9 (unified_physics_chem.js)
+ * Unified Physics & Chemistry v10 (unified_physics_chem.js)
  * Complete drop-in companion add-on for Sandboxels + chem.js
  */
 
@@ -10,14 +10,14 @@
   // 1. LIVE CONFIG, PERSISTENCE & QUIET TOAST
   // ---------------------------------------------------------------------------
 
-  const STORAGE_KEY = "upc_v9_settings";
+  const STORAGE_KEY = "upc_v10_settings";
   const DEFAULT_CONFIG = {
     gravityMethod: "element",     // "element" | "star" | "com" | "wells_only" | "off"
     fieldTileSize: 4,             // 2 | 4 | 6 | 8
     fieldRebuildInterval: 2,
     zeroVanillaGravity: true,
-    gravAccel: 0.032,
-    pressureForceScale: 1.0,
+    gravAccel: 0.030,
+    pressureForceScale: 1.2,
     compressionHeatScale: 1.0,
     radiativeCooling: true,
     collapseThresholdScale: 1.0,
@@ -47,11 +47,11 @@
 
   function saveConfig() { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(UPC_CONFIG)); } catch (e) {} }
 
-  let FIELD_BLOCK = 4, FIELD_REBUILD_INTERVAL = 2, MAX_SPEED = 2.6, GRAV_ACCEL = 0.032;
+  let FIELD_BLOCK = 4, FIELD_REBUILD_INTERVAL = 2, MAX_SPEED = 2.6, GRAV_ACCEL = 0.030;
   let MAG_POLE_ACCEL = 0.18, MAG_FERRO_ACCEL = 0.55, MAG_MEISSNER_ACCEL = 0.72, MAG_DIAMAG_ACCEL = 0.14, MAG_PLASMA_ACCEL = 0.45;
   let MAX_NEUTRONS = 320, MAX_BONDS = 700, activeFieldBlock = 0, inVanillaTick = false;
 
-  const BASE_NS_PACK = 24, BASE_BH_PACK = 85, MAX_PACK = 120;
+  const BASE_NS_PACK = 28, BASE_BH_PACK = 95, MAX_PACK = 140;
   const UPC_STATS = { lastTickMs: 0, activeGravTiles: 0, activeMagTiles: 0, movingPixels: 0, activeNeutrons: 0, activeBonds: 0, maxPack: 1, lastEvent: "Ready" };
 
   let toastEl = null, toastTimer = null;
@@ -72,7 +72,7 @@
     if (nb !== FIELD_BLOCK) { FIELD_BLOCK = nb; kernelX = null; }
     FIELD_REBUILD_INTERVAL = Math.max(1, Math.min(6, parseInt(UPC_CONFIG.fieldRebuildInterval, 10) || 2));
     GRAV_ACCEL = clampNum(UPC_CONFIG.gravAccel, 0, 0.25, DEFAULT_CONFIG.gravAccel);
-    UPC_CONFIG.pressureForceScale = clampNum(UPC_CONFIG.pressureForceScale, 0, 2.5, 1.0);
+    UPC_CONFIG.pressureForceScale = clampNum(UPC_CONFIG.pressureForceScale, 0, 3.0, 1.2);
     UPC_CONFIG.compressionHeatScale = clampNum(UPC_CONFIG.compressionHeatScale, 0, 2.5, 1.0);
     UPC_CONFIG.collapseThresholdScale = clampNum(UPC_CONFIG.collapseThresholdScale, 0.3, 3.0, 1.0);
     const ms = clampNum(UPC_CONFIG.magScale, 0, 4.0, 1.0);
@@ -94,7 +94,7 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 2. CORE UTILITIES & ELEMENT BUILDERS
+  // 2. CORE UTILITIES, SAFE REACTIONS & ELEMENT BUILDERS
   // ---------------------------------------------------------------------------
 
   const DIRS = [[-1, -1], [0, -1], [1, -1], [-1, 0], [1, 0], [-1, 1], [0, 1], [1, 1]];
@@ -104,6 +104,16 @@
   function safeChange(p, name) { if (!p || p.del || !elements[name]) return false; changePixel(p, name); return true; }
   function safeChangeAny(p, list) { if (!p || p.del) return false; for (let i = 0; i < list.length; i++) if (elements[list[i]]) { changePixel(p, list[i]); return true; } return false; }
   function safeCreate(name, x, y) { if (!elements[name] || !inSafeBounds(x, y) || !isEmpty(x, y)) return null; createPixel(name, x, y); return pixelMap[x][y] || null; }
+
+  // Guarded reactPixels wrapper (fixes Undefined 'check' crash in Zero-G / Supernova)
+  function safeReact(p1, p2) {
+    if (!p1 || !p2 || p1.del || p2.del || typeof reactPixels !== "function") return;
+    if (elements[p1.element]?.reactions?.[p2.element]) {
+      try { reactPixels(p1, p2); } catch (e) {}
+    } else if (elements[p2.element]?.reactions?.[p1.element]) {
+      try { reactPixels(p2, p1); } catch (e) {}
+    }
+  }
 
   function safeSwap(p1, p2) {
     if (!p1 || !p2 || p1 === p2 || p1.del || p2.del) return false;
@@ -130,6 +140,15 @@
     return UPC_CONFIG.fusionRate * Math.min(2.6, 0.72 + Math.log2(p.pack || 1) * 0.52);
   }
 
+  function injectRadiationPulse(cx, cy, amount) {
+    for (let i = 0; i < 8; i++) {
+      const nx = cx + DIRS[i][0], ny = cy + DIRS[i][1];
+      if (!inSafeBounds(nx, ny)) continue;
+      const nb = pixelMap[nx][ny];
+      if (nb && !nb.del) nb.radEnergy = Math.min(300, (nb.radEnergy || 0) + amount);
+    }
+  }
+
   const LIGHT_PRODS = new Set(["gamma_ray", "fast_neutron", "positron", "proton", "radiation"]);
   function fusePair(p1, p2, prod1, prod2, heat) {
     if (!p1 || !p2 || p1.del || p2.del) return false;
@@ -142,6 +161,10 @@
     else { const avg = Math.min(MAX_PACK, +((pk1 + pk2) * 0.5).toFixed(2)); p1.pack = avg; p2.pack = avg; }
     p1.temp = Math.min(200000, p1.temp + heat);
     p2.temp = Math.min(200000, p2.temp + heat);
+    // Fusion injects outward radiation pressure to hold the star up against gravity!
+    p1.radEnergy = Math.min(300, (p1.radEnergy || 0) + 60);
+    p2.radEnergy = Math.min(300, (p2.radEnergy || 0) + 40);
+    injectRadiationPulse(p1.x, p1.y, 18);
     return true;
   }
 
@@ -346,7 +369,7 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 4. CIC GRAVITY & MAGNETIC TILES + EOS PRESSURE FIGHT-BACK + MASS PACKING
+  // 4. CIC GRAVITY & MAGNETS + MATERIAL COMPRESSIBILITY + ENERGY PRESSURE
   // ---------------------------------------------------------------------------
 
   const IRON_CORE_SET = new Set(["iron", "molten_iron", "iron_gas", "nickel_56", "molten_nickel_56", "nickel_56_gas", "cobalt_56", "molten_cobalt_56", "cobalt_56_gas"]);
@@ -358,6 +381,34 @@
   const MAG_STR = { magnet_north: 1.0, magnet_south: -1.0, neodymium_north: 2.2, neodymium_south: -2.2, electromagnet_north: 1.9, electromagnet_south: -1.9, magnet_bead_n: 0.45, magnet_bead_s: -0.45 };
   const PLASMA_SET = new Set(["plasma", "hydrogen", "deuterium", "tritium", "helium", "helium_3", "carbon_vapor", "oxygen", "neon", "silicon_gas"]);
   const VEL_EXEMPT = new Set(["fast_neutron", "thermal_neutron", "radiation", "alpha_particle", "beta_particle", "gamma_ray", "bond_breaker", "bond_catalyst"]);
+
+  // Explicit material compressibility (0.0 = incompressible liquid, 0.005..0.08 = hard solid, 0.08..0.35 = powder, 0.75..1.0 = gas)
+  const ELEM_COMP = {
+    diamond: 0.005, osmium: 0.01, tungsten: 0.015, boron: 0.015, hafnium: 0.02, platinum: 0.02, steel: 0.025,
+    iron: 0.03, cobalt: 0.03, nickel: 0.03, silicon: 0.03, uranium: 0.03, uranium_235: 0.03, uranium_238: 0.03,
+    thorium_232: 0.03, beryllium: 0.03, glass: 0.03, plutonium_239: 0.035, copper: 0.035, gold: 0.035,
+    stone: 0.04, concrete: 0.04, lead: 0.05, bismuth: 0.05, graphite: 0.05, alumina: 0.05, gallium: 0.06,
+    ice: 0.07, heavy_ice: 0.07, iron_filings: 0.08, sand: 0.10, salt: 0.10, cesium: 0.11, rubidium: 0.11,
+    rust: 0.12, dirt: 0.15, ash: 0.20, sawdust: 0.24, snow: 0.34,
+    water: 0.0, heavy_water: 0.0, oil: 0.0, lava: 0.0, mercury: 0.0,
+    hydrogen: 1.0, plasma: 1.0, deuterium: 0.98, tritium: 0.96, helium_3: 0.95, helium: 0.94,
+    oxygen: 0.88, nitrogen: 0.88, neon: 0.86, steam: 0.86, heavy_steam: 0.85, ammonia: 0.86,
+    carbon_vapor: 0.85, carbon_dioxide: 0.84, argon: 0.82, magnesium_gas: 0.82, silicon_gas: 0.80,
+    iron_gas: 0.75, nickel_56_gas: 0.75, cobalt_56_gas: 0.75
+  };
+
+  function getCompressibility(name) {
+    if (ELEM_COMP[name] !== undefined) return ELEM_COMP[name];
+    const el = elements[name];
+    if (!el) return 0.0;
+    const st = el.state || "solid";
+    if (st === "liquid") return 0.0; // Unknown liquids default to incompressible
+    if (st === "gas" || st === "energy") return 0.85;
+    const hard = el.hardness !== undefined ? el.hardness : 0.65;
+    const isPowder = el.behavior === behaviors.POWDER || el.category === "powders" || hard < 0.35;
+    return isPowder ? Math.max(0.06, Math.min(0.22, +(0.19 * (1 - hard * 0.55)).toFixed(3)))
+                    : Math.max(0.01, Math.min(0.07, +(0.065 * (1 - hard * 0.75)).toFixed(3)));
+  }
 
   const FIELD_SOFT_PX2 = 13.6, SELF_PHI_UNIT = 4 / Math.sqrt(FIELD_SOFT_PX2);
   let fieldMw = 0, fieldMh = 0, fieldKw = 0;
@@ -418,33 +469,40 @@
     return top + (bot - top) * ty;
   }
 
-  // Equation-of-State internal pressure (solids/liquids have steep bulk modulus; gases have thermal + radiation P)
+  // Equation-of-State Pressure: Bulk Resistance + Thermal + Fusion/Fission Radiation + Electrical Energy
   function computeEOSPressure(p) {
-    const el = elements[p.element], st = el?.state || "solid", pk = p.pack || 1, tempK = Math.max(100, p.temp + 273);
-    if (st === "solid") {
-      const hard = el?.hardness !== undefined ? el.hardness : 0.65;
-      const bulk = 420 + hard * 780;
-      return pk > 1 ? bulk * Math.pow(pk - 1, 1.35) + tempK * 0.012 : 0;
+    const el = elements[p.element], st = el?.state || "solid", pk = p.pack || 1;
+    const comp = getCompressibility(p.element);
+    const tempK = Math.max(100, p.temp + 273);
+    const pElec = p.charge > 0 ? p.charge * 120 : 0;
+    const pRad = (p.radEnergy || 0) * 5.0 + (p.temp > 35000 ? Math.pow((p.temp - 35000) / 10000, 2.0) * 10 * Math.pow(pk, 0.45) : 0);
+
+    if (st === "liquid" || comp <= 0.0001) {
+      return (pk > 1 ? 5000 * (pk - 1) : 0) + tempK * 0.025 + pRad + pElec;
     }
-    if (st === "liquid") return pk > 1 ? 340 * Math.pow(pk - 1, 1.25) + tempK * 0.02 : 0;
-    // Gas / plasma: ideal-gas pressure + radiation pressure at stellar core temperatures
-    const pIdeal = Math.pow(tempK, 0.72) * 0.036 * Math.pow(pk, 0.85);
-    const pRad = p.temp > 30000 ? Math.pow((p.temp - 30000) / 10000, 2.0) * 6.5 * Math.pow(pk, 0.4) : 0;
-    return pIdeal + pRad;
+    if (st === "solid") {
+      const bulkK = 240 / comp;
+      const pBulk = pk > 1 ? bulkK * Math.pow(pk - 1, 1.65) : 0;
+      return pBulk + tempK * 0.015 + pRad + pElec;
+    }
+    // Gas / Plasma: Ideal-gas thermal pressure + radiation pressure + electrical energy
+    const pIdeal = Math.pow(tempK, 0.75) * 0.042 * Math.pow(pk, 0.92);
+    return pIdeal + pRad + pElec;
   }
 
   function mergeVoxelInto(keeper, absorbed, st) {
     if (!keeper || !absorbed || keeper === absorbed || keeper.del || absorbed.del) return false;
     if (keeper.element !== absorbed.element || isImmobile(absorbed.element)) return false;
+    if (getCompressibility(keeper.element) <= 0.0001) return false; // Liquids are strictly incompressible!
     const kp = keeper.pack || 1, ap = absorbed.pack || 1, npk = kp + ap;
     if (npk > MAX_PACK) return false;
     keeper.vx = ((keeper.vx || 0) * kp + (absorbed.vx || 0) * ap) / npk;
     keeper.vy = ((keeper.vy || 0) * kp + (absorbed.vy || 0) * ap) / npk;
+    keeper.radEnergy = Math.min(300, Math.max(keeper.radEnergy || 0, absorbed.radEnergy || 0));
     let avgT = (keeper.temp * kp + absorbed.temp * ap) / npk;
-    // Only gases get strong adiabatic P dV heating (solids & liquids stay cool!)
     if (st === "gas" && UPC_CONFIG.compressionHeatScale > 0) {
       const ratio = npk / kp, tempK = Math.max(200, avgT + 273);
-      avgT = Math.min(200000, avgT + (tempK * 0.50 * (ratio - 1) + 2400 * (ratio - 1)) * UPC_CONFIG.compressionHeatScale);
+      avgT = Math.min(200000, avgT + (tempK * 0.48 * (ratio - 1) + 2200 * (ratio - 1)) * UPC_CONFIG.compressionHeatScale);
     }
     keeper.temp = avgT;
     keeper.pack = +npk.toFixed(2);
@@ -462,7 +520,8 @@
     let nt = p.temp;
     if (st === "gas" && UPC_CONFIG.compressionHeatScale > 0 && nt > 20) nt = Math.max(20, nt - (nt + 273) * 0.14 * UPC_CONFIG.compressionHeatScale);
     p.temp = nt; np.temp = nt;
-    np.vx = (p.vx || 0) + Math.sign(ex - p.x) * 0.55; np.vy = (p.vy || 0) + Math.sign(ey - p.y) * 0.55;
+    np.radEnergy = (p.radEnergy || 0) * 0.6;
+    np.vx = (p.vx || 0) + Math.sign(ex - p.x) * 0.6; np.vy = (p.vy || 0) + Math.sign(ey - p.y) * 0.6;
     movingPixelsLastTick = Math.max(movingPixelsLastTick, 1);
     return true;
   }
@@ -472,7 +531,7 @@
     const pk = p.pack || 1, sc = UPC_CONFIG.collapseThresholdScale;
     const nsThresh = BASE_NS_PACK * sc, bhThresh = BASE_BH_PACK * sc;
     if (p.element === "neutronium") {
-      if (pk >= bhThresh && phiNet >= 360 * sc) {
+      if (pk >= bhThresh && phiNet >= 420 * sc) {
         safeChange(p, "black_hole_core");
         spawnParticle(p.x, p.y, "gamma_ray", 6);
         notifyUser("Neutron star exceeded TOV limit -> Black Hole!", true);
@@ -481,22 +540,41 @@
       return false;
     }
     if (p.element === "black_hole_core") return false;
-    if (pk >= bhThresh && phiNet >= 520 * sc) {
-      triggerSupernova(p.x, p.y, true, Math.min(2.2, phiNet / 240));
+    // Active radiation energy fights off premature collapse!
+    if ((p.radEnergy || 0) > 65 && !IRON_CORE_SET.has(p.element)) return false;
+
+    if (pk >= bhThresh && phiNet >= 620 * sc) {
+      triggerSupernova(p.x, p.y, true, Math.min(2.2, phiNet / 260));
       return true;
     }
-    if (pk >= nsThresh && phiNet >= 240 * sc) {
-      const doSN = p.temp > 25000 || IRON_CORE_SET.has(p.element) || phiNet >= 320 * sc;
+    if (pk >= nsThresh && phiNet >= 320 * sc) {
+      const doSN = p.temp > 25000 || IRON_CORE_SET.has(p.element) || phiNet >= 400 * sc;
       safeChange(p, "neutronium"); p.temp = Math.max(p.temp, 85000);
-      if (doSN) triggerSupernova(p.x, p.y, false, Math.min(1.8, Math.max(1.1, phiNet / 180)));
+      if (doSN) triggerSupernova(p.x, p.y, false, Math.min(1.85, Math.max(1.1, phiNet / 200)));
       return true;
     }
     return false;
   }
 
-  // Universal compression + outward -grad(P) pressure fight-back
   function applyCompressionAndPressure(p, gx, gy, phiNet, mergeBudget) {
     const el = elements[p.element], st = el?.state || "solid", gMag = Math.hypot(gx, gy), pk = p.pack || 1;
+    const comp = getCompressibility(p.element);
+
+    // Diffuse & decay radiation energy (fusion/fission energy radiating outward)
+    if (p.radEnergy > 0.5) {
+      const rd = randomDir(), rx = p.x + rd[0], ry = p.y + rd[1];
+      if (inSafeBounds(rx, ry)) {
+        const rnb = pixelMap[rx][ry];
+        if (rnb && !rnb.del && (rnb.radEnergy || 0) < p.radEnergy) {
+          const xfer = (p.radEnergy - (rnb.radEnergy || 0)) * 0.14;
+          rnb.radEnergy = (rnb.radEnergy || 0) + xfer;
+          p.radEnergy -= xfer;
+        }
+      }
+      p.radEnergy *= 0.92;
+      if (p.radEnergy < 0.5) p.radEnergy = 0;
+    }
+
     let surrounded = 0, emptyDx = 0, emptyDy = 0, emptyCount = 0, firstEX = -1, firstEY = -1, sameNb = null;
     let gradPx = 0, gradPy = 0;
 
@@ -510,7 +588,6 @@
       if (isEmpty(cx, cy)) {
         emptyDx += d[0]; emptyDy += d[1]; emptyCount++;
         if (firstEX === -1) { firstEX = cx; firstEY = cy; }
-        // Vacuum neighbor has P = 0 -> pushes outward into open space
         gradPx -= myP * d[0] * 0.25;
         gradPy -= myP * d[1] * 0.25;
       } else {
@@ -525,55 +602,60 @@
       }
     }
 
-    // Outward pressure acceleration = -grad(P) / effective density
+    // Outward pressure counter-force = -grad(P) / effective density
     let pax = 0, pay = 0;
     const pScale = UPC_CONFIG.pressureForceScale;
-    if (pScale > 0 && (myP > 15 || gradPx || gradPy)) {
-      const effMass = st === "gas" ? Math.max(1, pk * 0.65) : Math.max(4, pk * 2.5);
-      const gain = (st === "gas" ? 0.00052 : 0.00028) * pScale / effMass;
-      pax = Math.max(-0.45, Math.min(0.45, -gradPx * gain));
-      pay = Math.max(-0.45, Math.min(0.45, -gradPy * gain));
+    if (pScale > 0 && (myP > 12 || gradPx || gradPy)) {
+      const effMass = st === "gas" ? Math.max(1, pk * 0.6) : Math.max(4, pk * 2.5);
+      const gain = (st === "gas" ? 0.00068 : 0.00032) * pScale / effMass;
+      pax = Math.max(-0.55, Math.min(0.55, -gradPx * gain));
+      pay = Math.max(-0.55, Math.min(0.55, -gradPy * gain));
     }
 
     const imp = p.inwardImpulse || 0;
     p.inwardImpulse = imp * 0.45;
 
-    // External gravitational overburden squeezing this voxel
+    // Weaker gravity compression requiring genuinely large mass & potential (Phi > 48 for gas, Phi > 220 for solids)
     const densNorm = Math.min(3.0, Math.max(0.35, Math.sqrt((el?.density || 1000) / 1000)));
-    const pOverburden = surrounded >= 5 && phiNet > 12
-      ? (phiNet - 12) * (1.85 + Math.min(2.0, imp * 1.1) + Math.min(1.0, gMag * 0.05)) * (st === "gas" ? 1.15 : densNorm * 0.85)
+    const pOverburden = surrounded >= 5 && phiNet > 48
+      ? (phiNet - 48) * (1.25 + Math.min(1.6, imp * 0.8) + Math.min(0.8, gMag * 0.04)) * (st === "gas" ? Math.sqrt(pk) : densNorm * 0.85)
       : 0;
+    p.pGrav = Math.round(pOverburden);
 
     if (st === "gas" && UPC_CONFIG.radiativeCooling && starModeActive && p.temp > 2500) {
       p.temp = Math.max(20, p.temp - (p.temp - 2500) * (surrounded < 6 ? 0.0042 : 0.0010));
     }
 
-    // Special pressure phase transitions for solids (graphite -> diamond, ice -> water, stone -> sand)
     if (st === "solid") {
-      if (p.element === "graphite" && (pOverburden > 260 || myP > 260) && p.temp >= 1200 && elements.diamond) { safeChange(p, "diamond"); return { pax, pay }; }
-      if (p.element === "ice" && (pOverburden > 360 || myP > 360) && elements.water) { safeChange(p, "water"); return { pax, pay }; }
-      if (pOverburden > 750 && (el?.hardness ?? 0.7) < 0.55 && p.element === "stone" && elements.sand && Math.random() < 0.02) { safeChange(p, "sand"); return { pax, pay }; }
+      if (p.element === "graphite" && (pOverburden > 300 || myP > 300) && p.temp >= 1200 && elements.diamond) { safeChange(p, "diamond"); return { pax, pay }; }
+      if (p.element === "ice" && (pOverburden > 380 || myP > 380) && elements.water) { safeChange(p, "water"); return { pax, pay }; }
+      if (pOverburden > 850 && (el?.hardness ?? 0.7) < 0.55 && p.element === "stone" && elements.sand && Math.random() < 0.02) { safeChange(p, "sand"); return { pax, pay }; }
     } else if (st === "liquid" && imp > 0.12 && emptyCount > 0 && gMag > 0.08) {
       const tx = -gy / gMag, ty = gx / gMag, sign = (tx * emptyDx + ty * emptyDy) >= 0 ? 1 : -1, flow = Math.min(0.8, imp * 0.5);
       pax += tx * sign * flow * 0.4; pay += ty * sign * flow * 0.4;
     }
 
-    // Universal compression: ANY state merges if overburden genuinely exceeds its EOS bulk/thermal pressure!
-    if (pOverburden > myP * 1.15 && surrounded >= 5 && sameNb && mergeBudget.left > 0) {
-      const excess = Math.min(1.5, (pOverburden - myP) / Math.max(40, pOverburden));
-      const stateRate = st === "gas" ? 1.0 : (st === "liquid" ? 0.35 : 0.22);
-      const ironBoost = IRON_CORE_SET.has(p.element) ? 2.4 : 1.0;
-      const prob = Math.min(0.24, (0.011 + Math.min(0.05, imp * 0.035)) * excess * stateRate * ironBoost);
-      if (Math.random() < prob && mergeVoxelInto(p, sameNb, st)) {
-        mergeBudget.left--;
-        checkDegeneracyCollapse(p, phiNet);
-        return { pax, pay };
+    // State- & compressibility-gated compression (liquids: comp === 0 -> NEVER compress!)
+    if (comp > 0.0001 && surrounded >= 5 && sameNb && mergeBudget.left > 0) {
+      const minPhi = st === "gas" ? 48 : 220;
+      const bulkGate = st === "solid" ? (240 / comp) * 0.55 : 0;
+      const effResist = Math.max(myP * 1.18, bulkGate);
+
+      if (phiNet >= minPhi && pOverburden > effResist) {
+        const excess = Math.min(1.4, (pOverburden - effResist) / Math.max(50, pOverburden));
+        const ironBoost = IRON_CORE_SET.has(p.element) ? 2.4 : 1.0;
+        const prob = Math.min(0.18, (0.009 + Math.min(0.035, imp * 0.025)) * comp * excess * ironBoost);
+        if (Math.random() < prob && mergeVoxelInto(p, sameNb, st)) {
+          mergeBudget.left--;
+          checkDegeneracyCollapse(p, phiNet);
+          return { pax, pay };
+        }
       }
     }
 
-    // Universal decompression: packed voxel splits outward whenever internal EOS pressure beats overburden!
-    if (pk >= 2 && firstEX !== -1 && (surrounded < 5 || myP > pOverburden * 1.12)) {
-      const splitProb = surrounded < 5 ? 0.24 : Math.min(0.20, 0.03 + ((myP - pOverburden) / Math.max(60, myP)) * 0.15);
+    // Decompression: packed voxel splits outward whenever EOS / fusion / energy pressure beats overburden!
+    if (pk >= 2 && firstEX !== -1 && (surrounded < 5 || myP > pOverburden * 1.10)) {
+      const splitProb = surrounded < 5 ? 0.26 : Math.min(0.22, 0.035 + ((myP - pOverburden) / Math.max(60, myP)) * 0.16);
       if (Math.random() < splitProb) { splitPackedVoxel(p, firstEX, firstEY, st); return { pax, pay }; }
     }
 
@@ -624,6 +706,7 @@
         if (p.del || IMMOBILE_SET.has(p.element)) continue;
         const dist = Math.sqrt(d2) || 1;
         p.temp = Math.min(220000, p.temp + Math.round((36000 * w.power) / Math.max(4, Math.sqrt(dist))));
+        p.radEnergy = Math.min(300, (p.radEnergy || 0) + 50);
         if (SUPER_R_TARGETS.has(p.element) && Math.random() < ((p.element === "oxygen" || p.element === "silicon_gas") ? 0.14 : 0.48)) {
           safeChange(p, R_PRODUCTS[Math.floor(Math.random() * R_PRODUCTS.length)]);
         }
@@ -637,16 +720,28 @@
     }
   }
 
+  // Color-coded compression tier overlay + active fusion/energy radiation shimmer + shockwave rings
   function drawShockwavesAndPackGlow() {
     if (typeof ctx === "undefined" || !ctx || typeof pixelSize !== "number") return;
-    if (UPC_CONFIG.showPackGlow && UPC_STATS.maxPack >= 2 && currentPixels?.length) {
+    if (UPC_CONFIG.showPackGlow && currentPixels?.length) {
       ctx.save();
       for (let i = 0; i < currentPixels.length; i++) {
         const p = currentPixels[i];
-        if (!p || p.del || !p.pack || p.pack < 2) continue;
-        const a = Math.min(0.68, 0.10 + Math.log2(p.pack) * 0.14);
-        ctx.fillStyle = p.element === "neutronium" ? `rgba(170,245,255,${a.toFixed(2)})` : `rgba(255,248,215,${a.toFixed(2)})`;
-        ctx.fillRect(p.x * pixelSize, p.y * pixelSize, pixelSize, pixelSize);
+        if (!p || p.del) continue;
+        const pk = p.pack || 1;
+        if (pk > 1.05) {
+          const a = Math.min(0.75, 0.18 + Math.log2(pk) * 0.14);
+          if (pk < 2.5) ctx.fillStyle = `rgba(75,220,255,${a.toFixed(2)})`;       // Cyan: light compression
+          else if (pk < 7) ctx.fillStyle = `rgba(255,205,65,${a.toFixed(2)})`;    // Gold: strong compression
+          else if (pk < 22) ctx.fillStyle = `rgba(255,95,215,${a.toFixed(2)})`;   // Magenta: extreme compression
+          else ctx.fillStyle = `rgba(225,248,255,${Math.min(0.9, a + 0.15).toFixed(2)})`; // White-violet: degeneracy
+          ctx.fillRect(p.x * pixelSize, p.y * pixelSize, pixelSize, pixelSize);
+        } else if (p.radEnergy > 14) {
+          // Warm shimmer where fusion/fission radiation pressure is actively pushing outward
+          const ra = Math.min(0.45, p.radEnergy / 360);
+          ctx.fillStyle = `rgba(255,246,175,${ra.toFixed(2)})`;
+          ctx.fillRect(p.x * pixelSize, p.y * pixelSize, pixelSize, pixelSize);
+        }
       }
       ctx.restore();
     }
@@ -760,16 +855,16 @@
       }
     }
 
-    // Iron-core Supernova endpoint (stars complete their full fusion lifecycle!)
+    // Iron-core Supernova endpoint (stars live through full fusion stages first!)
     if (gravFieldActive && UPC_CONFIG.supernovaEnabled) {
       const sc = UPC_CONFIG.collapseThresholdScale;
       for (let by = 1; by < mh - 1; by++) for (let bx = 1; bx < mw - 1; bx++) {
         const idx = by * mw + bx;
-        if (macroIronPack[idx] < 12) continue;
+        if (macroIronPack[idx] < 14) continue;
         let ironSum = 0, hotSum = 0;
         for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) { const ni = (by + dy) * mw + (bx + dx); ironSum += macroIronPack[ni]; hotSum += macroHotIronPack[ni]; }
-        if (ironSum >= 45 * sc && hotSum >= 28 * sc && macroPhi[idx] >= 165 * sc) {
-          triggerSupernova(bx * FIELD_BLOCK, by * FIELD_BLOCK, hotSum >= 200 * sc && macroPhi[idx] >= 580 * sc, Math.min(2.2, Math.max(1.1, macroPhi[idx] / 210)));
+        if (ironSum >= 55 * sc && hotSum >= 35 * sc && macroPhi[idx] >= 210 * sc) {
+          triggerSupernova(bx * FIELD_BLOCK, by * FIELD_BLOCK, hotSum >= 240 * sc && macroPhi[idx] >= 680 * sc, Math.min(2.2, Math.max(1.1, macroPhi[idx] / 220)));
           return;
         }
       }
@@ -840,7 +935,7 @@
     const hasPressure = UPC_CONFIG.pressureForceScale > 0 && (gravFieldActive || UPC_STATS.maxPack >= 2);
     if (!gravFieldActive && !magFieldActive && !hasPressure && movingPixelsLastTick === 0 && !activeShockwaves.length) { UPC_STATS.movingPixels = 0; return; }
 
-    const doComp = (t & 1) === 0, mergeBudget = { left: 24 };
+    const doComp = (t & 1) === 0, mergeBudget = { left: 16 };
     let movingNow = 0;
     for (let i = 0; i < currentPixels.length; i++) {
       const p = currentPixels[i];
@@ -963,11 +1058,12 @@
     syncPhys(); if (!tp || tp.del) return;
     const tx = tp.x, ty = tp.y, h = Math.round(spec.h * UPC_CONFIG.fissionHeatScale);
     safeChange(tp, spec.d[Math.floor(Math.random() * spec.d.length)]); tp.temp += h;
+    tp.radEnergy = Math.min(300, (tp.radEnergy || 0) + 45);
     let near = 0;
     for (let dx = -2; dx <= 2; dx++) for (let dy = -2; dy <= 2; dy++) {
       if (!inSafeBounds(tx + dx, ty + dy)) continue;
       const q = pixelMap[tx + dx][ty + dy];
-      if (q && !q.del) { q.temp += Math.round(h * 0.16); if (FISSILE[q.element]) near++; }
+      if (q && !q.del) { q.temp += Math.round(h * 0.16); q.radEnergy = Math.min(300, (q.radEnergy || 0) + 12); if (FISSILE[q.element]) near++; }
     }
     if (np && !np.del && inSafeBounds(np.x, np.y) && pixelMap[np.x][np.y] === np) deletePixel(np.x, np.y);
     spawnNeutronsAround(tx, ty, spec.n[0] + (Math.random() < 0.4 ? spec.n[1] - spec.n[0] : 0), "fast_neutron");
@@ -1073,14 +1169,18 @@
   reg("kinetic_launch", { color: ["#ff6e40", "#ff9e80"], category: "tools", desc: "Launches matter right & upward.", tool: (p) => { if (p && !p.del && !isImmobile(p.element) && !VEL_EXEMPT.has(p.element)) { p.vx = MAX_SPEED * 0.88; p.vy = -0.35; movingPixelsLastTick = Math.max(movingPixelsLastTick, 1); } } });
   reg("vel_stop", { color: ["#78909c", "#b0bec5"], category: "tools", desc: "Cancels velocity.", tool: (p) => { if (p && !p.del) { p.vx = 0; p.vy = 0; p.rx = 0; p.ry = 0; } } });
   reg("compress_tool", {
-    color: ["#ab47bc", "#ce93d8"], category: "tools", desc: "Packs adjacent same-element voxels (any state) or presses graphite -> diamond / ice -> water.",
+    color: ["#ab47bc", "#ce93d8"], category: "tools", desc: "Compresses compressible voxels (respects liquid incompressibility & solid stiffness) or presses graphite -> diamond / ice -> water.",
     tool: (p) => {
       if (!p || p.del) return;
-      const st = elements[p.element]?.state || "solid", nb = findAdj(p, p.element);
-      if (nb && mergeVoxelInto(p, nb, st)) { if (gravFieldActive) checkDegeneracyCollapse(p, sampleField(macroPhi, p.x, p.y)); }
-      else if (st === "gas") p.temp += 1000;
-      if (p.element === "graphite" && p.temp >= 1200 && elements.diamond) safeChange(p, "diamond");
-      else if (p.element === "ice" && elements.water) safeChange(p, "water");
+      const st = elements[p.element]?.state || "solid", comp = getCompressibility(p.element);
+      if (p.element === "graphite" && p.temp >= 1200 && elements.diamond) { safeChange(p, "diamond"); return; }
+      if (p.element === "ice" && elements.water) { safeChange(p, "water"); return; }
+      if (comp <= 0.0001) return; // Liquids cannot be compressed
+      if (Math.random() < Math.min(1, comp * 1.4)) {
+        const nb = findAdj(p, p.element);
+        if (nb && mergeVoxelInto(p, nb, st)) { if (gravFieldActive) checkDegeneracyCollapse(p, sampleField(macroPhi, p.x, p.y)); }
+        else if (st === "gas") p.temp += 900;
+      }
       p.pressure = Math.round(computeEOSPressure(p));
     }
   });
@@ -1091,14 +1191,15 @@
 
   let lastInsp = 0;
   reg("inspect_tool", {
-    color: ["#26c6da", "#80deea"], category: "tools", desc: "Quietly displays state, temp, pack, EOS P, Phi, v, g, B, and bonds.",
+    color: ["#26c6da", "#80deea"], category: "tools", desc: "Quietly displays state, temp, pack, compressibility, P_int vs P_grav, radE, Phi, v, g, B, and bonds.",
     tool: (p) => {
       if (!p || p.del) return; const now = Date.now(); if (now - lastInsp < 180) return; lastInsp = now;
       const g = gravFieldActive ? Math.hypot(sampleField(macroGx, p.x, p.y), sampleField(macroGy, p.x, p.y)).toFixed(1) : "0";
       const phi = gravFieldActive ? Math.round(sampleField(macroPhi, p.x, p.y)) : 0;
       const b = magFieldActive ? sampleField(macroBmag, p.x, p.y).toFixed(1) : "0";
+      const comp = getCompressibility(p.element).toFixed(2);
       const pb = getBonds(p), bl = pb?.length ? pb.map(x => `${x.target.element}(${x.type})`).join(", ") : "none";
-      notifyUser(`${p.element}[${elements[p.element]?.state || "?"}] | ${Math.round(p.temp)}C | pack=${(p.pack || 1).toFixed(1)}x | P=${Math.round(computeEOSPressure(p))} | Phi=${phi} | v=(${(p.vx || 0).toFixed(2)},${(p.vy || 0).toFixed(2)}) | g=${g} | B=${b} | bonds: ${bl}`, true);
+      notifyUser(`${p.element}[${elements[p.element]?.state || "?"}] | ${Math.round(p.temp)}C | pack=${(p.pack || 1).toFixed(1)}x | comp=${comp} | P=${Math.round(computeEOSPressure(p))} vs G=${p.pGrav || 0} | radE=${Math.round(p.radEnergy || 0)} | Phi=${phi} | g=${g} | B=${b} | bonds:${bl}`, true);
     }
   });
 
@@ -1252,9 +1353,9 @@
   function applyPreset(name) {
     const P = {
       default: DEFAULT_CONFIG,
-      stellar: { gravityMethod: "star", fieldTileSize: 4, fieldRebuildInterval: 2, zeroVanillaGravity: true, gravAccel: 0.036, pressureForceScale: 1.0, compressionHeatScale: 1.0, radiativeCooling: true, collapseThresholdScale: 1.0, showPackGlow: true, starDrag: 0.998, fusionRate: 1.0, supernovaEnabled: true, autoBonding: false },
+      stellar: { gravityMethod: "star", fieldTileSize: 4, fieldRebuildInterval: 2, zeroVanillaGravity: true, gravAccel: 0.034, pressureForceScale: 1.2, compressionHeatScale: 1.0, radiativeCooling: true, collapseThresholdScale: 1.0, showPackGlow: true, starDrag: 0.998, fusionRate: 1.0, supernovaEnabled: true, autoBonding: false },
       reactor: { gravityMethod: "element", fieldTileSize: 4, fieldRebuildInterval: 2, fissionRate: 1.0, fissionHeatScale: 1.0, maxNeutrons: 420, delayedNeutrons: true, plasmaConfinement: true, autoBonding: true },
-      fast:    { gravityMethod: "com", fieldTileSize: 6, fieldRebuildInterval: 4, zeroVanillaGravity: true, maxNeutrons: 200, maxBonds: 300, showFields: false, showPackGlow: false }
+      fast:    { gravityMethod: "com", fieldTileSize: 6, fieldRebuildInterval: 4, zeroVanillaGravity: true, maxNeutrons: 200, maxBonds: 300, showFields: false, showPackGlow: true }
     };
     if (P[name]) Object.assign(UPC_CONFIG, P[name]);
     applyUPCConfig(true); notifyUser("Preset applied: " + name, true);
@@ -1263,7 +1364,7 @@
   function createSettingsUI() {
     if (typeof document === "undefined" || document.getElementById("upc-settings-btn")) return;
     const style = document.createElement("style");
-    style.textContent = "#upc-settings-btn{position:fixed;top:10px;right:12px;z-index:99998;background:#181a22;color:#e6ecff;border:1px solid #3c4663;border-radius:6px;padding:6px 11px;font:600 12px/1 system-ui,sans-serif;cursor:pointer;box-shadow:0 2px 10px rgba(0,0,0,.45)}#upc-settings-btn:hover{background:#232838;border-color:#66b2ff}#upc-settings-panel{position:fixed;top:44px;right:12px;z-index:99999;width:336px;max-height:calc(100vh - 64px);overflow-y:auto;background:rgba(18,20,27,.96);color:#e2e8f5;border:1px solid #343d54;border-radius:9px;padding:12px 14px;font:12px/1.4 system-ui,sans-serif;box-shadow:0 10px 28px rgba(0,0,0,.65);display:none}#upc-settings-panel h3{margin:0 0 8px;font-size:14px;color:#7cc4ff;display:flex;justify-content:space-between;align-items:center}#upc-settings-panel .upc-sec{margin:10px 0 5px;padding-top:7px;border-top:1px solid #2b3245;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#8c9bbd}#upc-settings-panel .upc-row{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:5px 0}#upc-settings-panel label{flex:1;color:#d5ddf0}#upc-settings-panel select,#upc-settings-panel input[type=range]{width:136px;background:#101218;color:#eef3ff;border:1px solid #39435e;border-radius:4px;padding:2px 4px;font-size:11.5px}#upc-settings-panel .upc-val{width:38px;text-align:right;color:#8cd1ff;font-variant-numeric:tabular-nums}#upc-settings-panel .upc-presets{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin:6px 0 8px}#upc-settings-panel button.upc-act{background:#23293a;color:#dce6ff;border:1px solid #3a4563;border-radius:5px;padding:5px 7px;font-size:11px;cursor:pointer}#upc-settings-panel button.upc-act:hover{background:#2e3852;border-color:#7cc4ff}#upc-stats-bar{background:#11131a;border:1px solid #272e40;border-radius:5px;padding:6px 8px;font:11px/1.45 ui-monospace,Consolas,monospace;color:#9ad1b8;margin-bottom:6px;white-space:pre-line}#upc-toast{position:fixed;bottom:10px;left:12px;z-index:99997;max-width:72vw;background:rgba(16,18,25,.90);color:#d8e6ff;border:1px solid #33405c;border-radius:6px;padding:5px 10px;font:11.5px/1.35 ui-monospace,Consolas,monospace;pointer-events:none;opacity:0;transition:opacity .25s ease}";
+    style.textContent = "#upc-settings-btn{position:fixed;top:10px;right:12px;z-index:99998;background:#181a22;color:#e6ecff;border:1px solid #3c4663;border-radius:6px;padding:6px 11px;font:600 12px/1 system-ui,sans-serif;cursor:pointer;box-shadow:0 2px 10px rgba(0,0,0,.45)}#upc-settings-btn:hover{background:#232838;border-color:#66b2ff}#upc-settings-panel{position:fixed;top:44px;right:12px;z-index:99999;width:338px;max-height:calc(100vh - 64px);overflow-y:auto;background:rgba(18,20,27,.96);color:#e2e8f5;border:1px solid #343d54;border-radius:9px;padding:12px 14px;font:12px/1.4 system-ui,sans-serif;box-shadow:0 10px 28px rgba(0,0,0,.65);display:none}#upc-settings-panel h3{margin:0 0 8px;font-size:14px;color:#7cc4ff;display:flex;justify-content:space-between;align-items:center}#upc-settings-panel .upc-sec{margin:10px 0 5px;padding-top:7px;border-top:1px solid #2b3245;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#8c9bbd}#upc-settings-panel .upc-row{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:5px 0}#upc-settings-panel label{flex:1;color:#d5ddf0}#upc-settings-panel select,#upc-settings-panel input[type=range]{width:136px;background:#101218;color:#eef3ff;border:1px solid #39435e;border-radius:4px;padding:2px 4px;font-size:11.5px}#upc-settings-panel .upc-val{width:38px;text-align:right;color:#8cd1ff;font-variant-numeric:tabular-nums}#upc-settings-panel .upc-presets{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin:6px 0 8px}#upc-settings-panel button.upc-act{background:#23293a;color:#dce6ff;border:1px solid #3a4563;border-radius:5px;padding:5px 7px;font-size:11px;cursor:pointer}#upc-settings-panel button.upc-act:hover{background:#2e3852;border-color:#7cc4ff}#upc-stats-bar{background:#11131a;border:1px solid #272e40;border-radius:5px;padding:6px 8px;font:11px/1.45 ui-monospace,Consolas,monospace;color:#9ad1b8;margin-bottom:6px;white-space:pre-line}#upc-legend{font:10.5px/1.3 system-ui,sans-serif;color:#9eb0d1;margin:2px 0 6px}#upc-toast{position:fixed;bottom:10px;left:12px;z-index:99997;max-width:74vw;background:rgba(16,18,25,.92);color:#d8e6ff;border:1px solid #33405c;border-radius:6px;padding:5px 10px;font:11.5px/1.35 ui-monospace,Consolas,monospace;pointer-events:none;opacity:0;transition:opacity .25s ease}";
     document.head.appendChild(style);
 
     toastEl = document.createElement("div"); toastEl.id = "upc-toast"; document.body.appendChild(toastEl);
@@ -1271,9 +1372,10 @@
 
     panelEl = document.createElement("div"); panelEl.id = "upc-settings-panel";
     ["mousedown", "mouseup", "click", "wheel", "keydown", "keyup", "touchstart"].forEach(ev => panelEl.addEventListener(ev, e => e.stopPropagation()));
-    panelEl.innerHTML = '<h3><span>Unified Physics v9</span><span style="cursor:pointer;color:#7e8ba8" id="upc-close-x">✕</span></h3>';
+    panelEl.innerHTML = '<h3><span>Unified Physics v10</span><span style="cursor:pointer;color:#7e8ba8" id="upc-close-x">✕</span></h3>';
 
     statsEl = document.createElement("div"); statsEl.id = "upc-stats-bar"; statsEl.textContent = "Tick: 0.00 ms | MaxPack: 1.0x"; panelEl.appendChild(statsEl);
+    const leg = document.createElement("div"); leg.id = "upc-legend"; leg.innerHTML = 'Pack Glow: <span style="color:#4bdcff">Cyan &lt;2.5x</span> · <span style="color:#ffcd41">Gold &lt;7x</span> · <span style="color:#ff5fd7">Magenta &lt;22x</span> · <span style="color:#e1f8ff">White 22x+</span>'; panelEl.appendChild(leg);
 
     const pRow = document.createElement("div"); pRow.className = "upc-presets";
     [["default", "Balanced Default"], ["stellar", "Stellar / Supernova"], ["reactor", "Reactor & Chem"], ["fast", "High-FPS Mode"]].forEach(([id, txt]) => {
@@ -1301,17 +1403,17 @@
       uiControls[key] = c; r.append(l, c); panelEl.appendChild(r);
     };
 
-    addSec("Gravity, Pressure & Mass-Packing");
+    addSec("Gravity, Pressure & Compressibility");
     addSel("Gravity Method", "gravityMethod", [["element", "Element-Based (star_gravity/wells)"], ["star", "Multi-Body CIC (Always On)"], ["com", "Fast Center-of-Mass"], ["wells_only", "Gravity Wells / Cores Only"], ["off", "Off (Vanilla Only)"]]);
     addSel("Tile Resolution", "fieldTileSize", [[2, "2x2 (Ultra Sharp)"], [4, "4x4 (Balanced)"], [6, "6x6 (Fast)"], [8, "8x8 (Max FPS)"]]);
     addTgl("Zero-G (Disable Vanilla Fall)", "zeroVanillaGravity");
     addSld("Rebuild Every (ticks)", "fieldRebuildInterval", 1, 6, 1);
     addSld("Gravity Strength", "gravAccel", 0, 0.12, 0.004);
-    addSld("Pressure Fight-Back", "pressureForceScale", 0, 2.5, 0.1);
+    addSld("Pressure Fight-Back", "pressureForceScale", 0, 3.0, 0.1);
     addSld("Adiabatic Pack Heating", "compressionHeatScale", 0, 2.5, 0.1);
     addSld("Collapse Threshold", "collapseThresholdScale", 0.3, 3.0, 0.1);
     addTgl("Stellar Radiative Cooling", "radiativeCooling");
-    addTgl("Glow Packed Cores", "showPackGlow");
+    addTgl("Compression Color Glow", "showPackGlow");
     addSld("Max Pixel Speed", "maxSpeed", 0.5, 3.5, 0.1);
     addSld("Orbital Drag", "starDrag", 0.94, 1.0, 0.002);
 
@@ -1355,6 +1457,7 @@
       bind(new SelectSetting("Tile Size", "upc_tile_size", [[2, "2x2"], [4, "4x4"], [6, "6x6"], [8, "8x8"]]), "fieldTileSize");
       if (typeof Setting === "function" && typeof settingType !== "undefined") {
         bind(new Setting("Zero-G Space Mode", "upc_zero_g", settingType.BOOLEAN, false, UPC_CONFIG.zeroVanillaGravity), "zeroVanillaGravity");
+        bind(new Setting("Compression Color Glow", "upc_pack_glow", settingType.BOOLEAN, false, UPC_CONFIG.showPackGlow), "showPackGlow");
         bind(new Setting("Auto Bonding", "upc_auto_bond", settingType.BOOLEAN, false, UPC_CONFIG.autoBonding), "autoBonding");
         bind(new Setting("Show Field Vectors", "upc_show_fields", settingType.BOOLEAN, false, UPC_CONFIG.showFields), "showFields");
       }
@@ -1363,7 +1466,7 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 8. INIT: PATCH VANILLA & CHEM.JS + ZERO-G + OZONE FIX + TICK SANITIZER
+  // 8. INIT: PATCH VANILLA & CHEM.JS + CRASH-PROOF ZERO-G + OZONE FIX
   // ---------------------------------------------------------------------------
 
   function initUnifiedPhysics() {
@@ -1372,11 +1475,11 @@
     if (!elements.iron_gas) reg("iron_gas", { color: ["#ffb870", "#ffc98f"], behavior: behaviors.GAS, category: "states", state: "gas", hidden: true, density: 7.8, temp: 2950, tempLow: 2862, stateLow: "molten_iron" });
     if (elements.molten_iron && !elements.molten_iron.stateHigh) { elements.molten_iron.tempHigh = 2862; elements.molten_iron.stateHigh = "iron_gas"; }
 
-    if (elements.neutron) { elements.neutron.desc = "Free neutron (Unified Physics v9)."; if (!elements.neutron.reactions) elements.neutron.reactions = {}; delete elements.neutron.tick1; delete elements.neutron.tick2; elements.neutron.tick = (p) => neutronTick(p, true); }
+    if (elements.neutron) { elements.neutron.desc = "Free neutron (Unified Physics v10)."; if (!elements.neutron.reactions) elements.neutron.reactions = {}; delete elements.neutron.tick1; delete elements.neutron.tick2; elements.neutron.tick = (p) => neutronTick(p, true); }
     if (elements.uranium) { elements.uranium.desc = "Natural/LEU Uranium (patched)."; delete elements.uranium.tick1; delete elements.uranium.tick2; elements.uranium.tick = (p) => { if (Math.random() < 0.00003) spawnNeutronsAround(p.x, p.y, 1, "fast_neutron"); doDefaults(p); }; }
     if (elements.plutonium) { elements.plutonium.desc = "Plutonium-239 (patched)."; delete elements.plutonium.tick1; delete elements.plutonium.tick2; elements.plutonium.tick = (p) => { p.temp += 0.03; if (Math.random() < 0.00012) spawnNeutronsAround(p.x, p.y, 1, "fast_neutron"); doDefaults(p); }; }
 
-    // Cap Oxygen -> Ozone <= 350 C and thermally decompose hot Ozone -> Oxygen
+    // Cap Oxygen -> Ozone <= 350 C and decompose hot Ozone -> Oxygen
     for (const k in elements) {
       const rx = elements[k]?.reactions; if (!rx) continue;
       for (const rk in rx) {
@@ -1393,7 +1496,7 @@
     if (elements.helium) wrapTick("helium", (p) => { const fr = getFusionFactor(p); if (fr > 0 && p.temp >= 65000 && Math.random() < 0.011 * fr) { const o = findAdj(p, "helium"); if (o) { fusePair(p, o, "carbon_vapor", "gamma_ray", 3800); return true; } } return false; });
     if (elements.oxygen) wrapTick("oxygen", (p) => { const fr = getFusionFactor(p); if (fr > 0 && p.temp >= 95000 && Math.random() < 0.014 * fr) { const o = findAdj(p, "oxygen"); if (o) { fusePair(p, o, Math.random() < 0.75 ? "silicon_gas" : (elements.sulfur_gas ? "sulfur_gas" : "silicon_gas"), "gamma_ray", 2800); return true; } } return false; });
 
-    // Thermal dissociation & Thermite & chem.js UO2
+    // Thermal dissociation, Thermite & chem.js UO2
     if (elements.carbon_dioxide) wrapTick("carbon_dioxide", (p) => (p.temp >= 4000 && Math.random() < 0.08 ? (safeChange(p, Math.random() < 0.5 ? "carbon_vapor" : "oxygen"), true) : false));
     if (elements.steam) wrapTick("steam", (p) => (p.temp >= 3200 && Math.random() < 0.07 ? (safeChange(p, Math.random() < 0.66 ? "hydrogen" : "oxygen"), true) : false));
     if (elements.ammonia) wrapTick("ammonia", (p) => (p.temp >= 1200 && Math.random() < 0.08 ? (safeChange(p, Math.random() < 0.75 ? "hydrogen" : "nitrogen"), true) : false));
@@ -1401,7 +1504,7 @@
     if (elements.rust && elements.aluminum) safeAddReaction("rust", "aluminum", { elem1: "molten_iron", elem2: "alumina", tempMin: 1200, chance: 0.22, func: (a, b) => { a.temp += 1500; b.temp += 1500; } });
     if (elements.uranium_dioxide) FISSILE.uranium_dioxide = { th: 0.16, fa: 0.015, n: [2, 3], h: 1200, d: ["barium_141", "krypton_92", "xenon_135"] };
 
-    // True Zero-G hook: removes vanilla downward gravity in star / com / star_gravity modes
+    // Crash-proof Zero-G hook (uses safeReact so reactPixels is ONLY called when a reaction exists!)
     if (typeof window !== "undefined" && typeof window.tryMove === "function" && !window.tryMove._upcWrapped) {
       const origMove = window.tryMove;
       const wrappedMove = function (p, nx, ny, lb, force) {
@@ -1411,11 +1514,11 @@
             if (ny !== p.y && Math.random() < 0.75) { const d = randomDir(); nx = p.x + d[0]; ny = p.y + d[1]; }
             if (!inSafeBounds(nx, ny)) return false;
             if (isEmpty(nx, ny)) return origMove.call(this, p, nx, ny, lb, force);
-            const occ = pixelMap[nx][ny]; if (occ && !occ.del && typeof reactPixels === "function") reactPixels(p, occ);
+            safeReact(p, pixelMap[nx][ny]);
             return false;
           }
           if (st !== "energy") {
-            if (inSafeBounds(nx, ny) && !isEmpty(nx, ny)) { const occ = pixelMap[nx][ny]; if (occ && !occ.del && typeof reactPixels === "function") reactPixels(p, occ); }
+            if (inSafeBounds(nx, ny) && !isEmpty(nx, ny)) safeReact(p, pixelMap[nx][ny]);
             return false;
           }
         }
@@ -1466,7 +1569,7 @@
     if (typeof SettingsTab === "function") registerBetterSettingsTab();
     else if (typeof dependOn === "function") dependOn("betterSettings.js", registerBetterSettingsTab, true);
 
-    console.log("[unified_physics_chem] Loaded v9 successfully!");
+    console.log("[unified_physics_chem] Loaded v10 successfully!");
   }
 
   if (typeof runAfterLoad === "function") runAfterLoad(initUnifiedPhysics);
