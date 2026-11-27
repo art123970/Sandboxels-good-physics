@@ -737,6 +737,7 @@
   }
 
   function getTotalMassKg(p) {
+    if (p.isBlackHole) return Math.max(1e-30, p.bhMass || getDefaultBlackHoleMass());
     let m = getRestMassKg(p.Z, p.A);
     if (p.stored_voxels && p.stored_voxels.length > 0) {
       for (let i = 0; i < p.stored_voxels.length; i++) {
@@ -745,6 +746,87 @@
       }
     }
     return m;
+  }
+
+  function getDefaultBlackHoleMass() {
+    if (CONFIG.voxelSizeMeters >= 1e3) return 3.0 * PHYS.M_sun;
+    return Math.max(getRestMassKg(26, 56) * 40, 1e15);
+  }
+
+  function computeBlackHoleRsCells(massKg) {
+    const L = CONFIG.voxelSizeMeters;
+    const physicalRsCells = (2 * PHYS.G * massKg) / (PHYS.c * PHYS.c * Math.max(1e-10, L));
+    if (!CONFIG.sandboxScaledAstro && physicalRsCells >= 0.8) {
+      return Math.min(14, physicalRsCells);
+    }
+    const refMass = getDefaultBlackHoleMass();
+    const ratio = Math.max(0.25, massKg / Math.max(1e-30, refMass));
+    return Math.max(1.1, Math.min(12, 1.25 * Math.pow(ratio, 0.35) + Math.min(6, physicalRsCells)));
+  }
+
+  function initBlackHoleVoxel(p, massKg, opts = {}) {
+    p._uid = p._uid || (nextUid++);
+    p.Z = 0;
+    p.A = 0;
+    p.is_metastable = false;
+    p.isUPCS = true;
+    p.isBlackHole = true;
+    p.remnant = "bh";
+    p.bhMass = (massKg && massKg > 0) ? massKg : (p.bhMass || getDefaultBlackHoleMass());
+    p.Rs_cells = computeBlackHoleRsCells(p.bhMass);
+    p.absorbedCount = opts.absorbedCount !== undefined ? opts.absorbedCount : (p.absorbedCount || 0);
+    p.vx = opts.vx !== undefined ? opts.vx : (p.vx || 0);
+    p.vy = opts.vy !== undefined ? opts.vy : (p.vy || 0);
+    p.ox = opts.ox !== undefined ? opts.ox : (p.ox || 0);
+    p.oy = opts.oy !== undefined ? opts.oy : (p.oy || 0);
+    p.chi = 1e6;
+    p.charge = 0;
+    p.mx = 0;
+    p.my = 0;
+    p.latent_buf = 0;
+    p.stored_voxels = [];
+    p.spin = opts.spin !== undefined ? opts.spin : (p.spin || 0);
+    p.B_mag = 0;
+    p.temp = -273.15;
+    p.color = "#000000";
+  }
+
+  function collapseVoxelToBlackHole(p, bhMass) {
+    const saved = {
+      _uid: p._uid,
+      vx: p.vx || 0,
+      vy: p.vy || 0,
+      ox: p.ox || 0,
+      oy: p.oy || 0,
+      spin: p.spin || 0,
+      absorbedCount: 1 + (p.stored_voxels ? p.stored_voxels.length : 0)
+    };
+    if (p.element !== "upcs_black_hole" && typeof changePixel === "function") {
+      changePixel(p, "upcs_black_hole", false);
+    } else {
+      p.element = "upcs_black_hole";
+    }
+    initBlackHoleVoxel(p, bhMass, saved);
+  }
+
+  function absorbVoxelIntoBlackHole(bh, victim) {
+    if (!bh || !victim || bh === victim || bh.del || victim.del) return;
+    const m0 = Math.max(1e-30, bh.bhMass || getDefaultBlackHoleMass());
+    const mAbs = victim.isUPCS ? getTotalMassKg(victim) : getRestMassKg(14, 28);
+    const mNew = m0 + mAbs;
+    const vvx = victim.vx || 0;
+    const vvy = victim.vy || 0;
+    bh.vx = (m0 * (bh.vx || 0) + mAbs * vvx) / mNew;
+    bh.vy = (m0 * (bh.vy || 0) + mAbs * vvy) / mNew;
+    const dx = (victim.x + (victim.ox || 0)) - (bh.x + (bh.ox || 0));
+    const dy = (victim.y + (victim.oy || 0)) - (bh.y + (bh.oy || 0));
+    bh.spin = (bh.spin || 0) + (dx * (vvy - bh.vy) - dy * (vvx - bh.vx)) * (mAbs / mNew) * 0.5;
+    if (victim.isBlackHole) bh.spin += (victim.spin || 0);
+    bh.bhMass = mNew;
+    bh.absorbedCount = (bh.absorbedCount || 0) + (victim.isBlackHole ? (victim.absorbedCount || 1) : (1 + (victim.stored_voxels ? victim.stored_voxels.length : 0)));
+    bh.Rs_cells = computeBlackHoleRsCells(bh.bhMass);
+    if (typeof deletePixel === "function") deletePixel(victim.x, victim.y);
+    else victim.del = true;
   }
 
   // Initialize UPCS physics properties on a Sandboxels pixel (100% JSON-serializable)
@@ -767,6 +849,7 @@
     p.remnant = p.remnant || null; // null | "wd" | "bd" | "ns" | "bh"
     p.spin = p.spin || 0;
     p.B_mag = p.B_mag || 0;
+    p.isBlackHole = false;
     p.isUPCS = true;
   }
 
@@ -792,17 +875,16 @@
   }
 
   // ==========================================================================
-  // 5. REGISTER ALL 118 PERIODIC TABLE ELEMENTS IN SANDBOXELS
+  // 5. REGISTER ALL 118 PERIODIC TABLE ELEMENTS (+ BLACK HOLE) IN SANDBOXELS
   // ==========================================================================
   function registerPeriodicTable() {
     if (typeof elements === "undefined") return;
     for (let Z = 1; Z <= 118; Z++) {
       const el = ELEMENTS[Z];
-      const gm = GROUP_META[el.periodic_group];
       elements[el.key] = {
         name: `${el.base_name} (${el.symbol})`,
         color: el.base_color,
-        category: gm.cat,
+        category: "elements",
         state: el.boiling_point < 20 ? "gas" : el.melting_point < 20 ? "liquid" : "solid",
         density: Math.max(0.05, el.rho_0),
         temp: 20,
@@ -825,6 +907,24 @@
         }
       };
     }
+
+    elements["upcs_black_hole"] = {
+      name: "Black Hole",
+      color: "#000000",
+      category: "elements",
+      state: "solid",
+      density: 1e18,
+      temp: -273.15,
+      conduct: 0,
+      behavior: [
+        "XX|XX|XX",
+        "XX|XX|XX",
+        "XX|XX|XX"
+      ],
+      tick: function (pixel) {
+        if (!pixel.isUPCS || !pixel.isBlackHole) initBlackHoleVoxel(pixel);
+      }
+    };
   }
   registerPeriodicTable();
 
@@ -859,6 +959,7 @@
     // 1. Deposit total voxel mass (primary + stored_voxels), pressure, dipoles, velocity
     for (let i = 0; i < activePixels.length; i++) {
       const p = activePixels[i];
+      if (!p || p.del || p.isBlackHole) continue;
       const cx = Math.min(cw - 1, (p.x / bs) | 0);
       const cy = Math.min(ch - 1, (p.y / bs) | 0);
       const idx = cy * cw + cx;
@@ -877,7 +978,7 @@
       // Ferromagnetic & pulsar dipole deposition
       if (CONFIG.enableMagnetism) {
         const el = ELEMENTS[p.Z];
-        if (el.curie_temp > 0 && tempK < el.curie_temp && (p.mx !== 0 || p.my !== 0)) {
+        if (el && el.curie_temp > 0 && tempK < el.curie_temp && (p.mx !== 0 || p.my !== 0)) {
           bxG[idx] += p.mx * 0.8;
           byG[idx] += p.my * 0.8;
         } else if (p.remnant === "ns" && p.B_mag > 0) {
@@ -885,14 +986,6 @@
           byG[idx] += Math.sin(p.spin) * p.B_mag;
         }
       }
-    }
-
-    // Include absorbed Black Hole mass
-    for (let i = 0; i < UPCS.blackHoles.length; i++) {
-      const bh = UPCS.blackHoles[i];
-      const cx = Math.max(0, Math.min(cw - 1, (bh.x / bs) | 0));
-      const cy = Math.max(0, Math.min(ch - 1, (bh.y / bs) | 0));
-      massG[cy * cw + cx] += bh.mass;
     }
 
     for (let i = 0; i < n; i++) {
@@ -969,6 +1062,7 @@
 
   // Unified Equation of State: P_total = P_thermal + P_radiation + P_structural/degeneracy
   function computeEoSPressure(p, mTot, tempK, Vcell) {
+    if (p.isBlackHole) return 0;
     const rho = mTot / Math.max(1e-36, Vcell);
     const mu = Math.max(0.5, p.A / Math.max(1, p.Z + 1)); // mean molecular weight
     const P_thermal = (rho * PHYS.k_B * tempK) / (mu * PHYS.amu);
@@ -1119,7 +1213,8 @@
       if (CONFIG.enableCatalysts) {
         const cx = pA.x, cy = pA.y - 1;
         if (cy >= 0 && pixelMap[cx] && pixelMap[cx][cy] && pixelMap[cx][cy].isUPCS) {
-          if (ELEMENTS[pixelMap[cx][cy].Z].isCatalyst) eaFactor = 0.45;
+          const catEl = ELEMENTS[pixelMap[cx][cy].Z];
+          if (catEl && catEl.isCatalyst) eaFactor = 0.45;
         }
       }
 
@@ -1154,75 +1249,73 @@
     const L = CONFIG.voxelSizeMeters;
     const isStarScale = L >= 1e5 || CONFIG.sandboxScaledAstro;
 
-    // 1. Update Black Holes (Accretion, Photon Sphere, ISCO, Polar Jets, Hawking Radiation)
+    // 1. Update Black Hole Voxels (Schwarzschild radius, horizon capture of vanilla pixels, Hawking evaporation)
     for (let i = UPCS.blackHoles.length - 1; i >= 0; i--) {
       const bh = UPCS.blackHoles[i];
-      // Schwarzschild radius in grid cells
-      const physicalRsCells = (2 * PHYS.G * bh.mass) / (PHYS.c * PHYS.c * Math.max(1e-10, L));
-      bh.Rs_cells = CONFIG.sandboxScaledAstro
-        ? Math.max(1.5, Math.min(18, Math.pow(bh.mass / (PHYS.M_sun * 0.05), 0.33) + physicalRsCells))
-        : Math.max(1.0, physicalRsCells);
+      if (!bh || bh.del) { UPCS.blackHoles.splice(i, 1); continue; }
+      bh.Rs_cells = computeBlackHoleRsCells(bh.bhMass);
+      bh.temp = -273.15;
 
-      // Hawking evaporation (negligible for stellar BH, explosive for micro BH)
-      const T_hawking = 1.227e23 / Math.max(1e5, bh.mass); // K
-      if (T_hawking > 1e6) {
-        const dM = Math.min(bh.mass * 0.05, 1e15 * Math.pow(1e12 / Math.max(1e5, bh.mass), 2) * dt);
-        bh.mass -= dM;
-        UPCS.ledger.E_radiated += dM * PHYS.c * PHYS.c;
-        if (UPCS.photons.length < 500) {
-          const ang = Math.random() * Math.PI * 2;
-          UPCS.photons.push({ x: bh.x, y: bh.y, vx: Math.cos(ang) * 18, vy: Math.sin(ang) * 18, energy: T_hawking, r: 190, g: 230, b: 255, life: 1.0 });
+      // Capture any non-UPCS vanilla Sandboxels pixels that enter the event horizon
+      const rInt = Math.ceil(bh.Rs_cells);
+      const r2Max = bh.Rs_cells * bh.Rs_cells;
+      for (let dx = -rInt; dx <= rInt; dx++) {
+        for (let dy = -rInt; dy <= rInt; dy++) {
+          if (dx === 0 && dy === 0) continue;
+          if (dx * dx + dy * dy > r2Max) continue;
+          const nx = bh.x + dx, ny = bh.y + dy;
+          if (nx < 0 || nx > width || ny < 0 || ny > height) continue;
+          const q = pixelMap[nx] && pixelMap[nx][ny];
+          if (!q || q === bh || q.del) continue;
+          if (q.isBlackHole) {
+            // Merge smaller black hole into larger one
+            if (bh.bhMass > q.bhMass || (bh.bhMass === q.bhMass && bh._uid < q._uid)) {
+              absorbVoxelIntoBlackHole(bh, q);
+            }
+          } else {
+            absorbVoxelIntoBlackHole(bh, q);
+          }
         }
-        if (bh.mass <= 1e5) { UPCS.blackHoles.splice(i, 1); continue; }
       }
 
-      // Collimated polar jets if actively spinning/accreting
-      if (Math.abs(bh.spin) > 0.2 && UPCS.photons.length < 550 && Math.random() < 0.35) {
-        const dir = Math.random() < 0.5 ? -1 : 1;
-        UPCS.photons.push({
-          x: bh.x + (Math.random() - 0.5) * 1.2,
-          y: bh.y + dir * (bh.Rs_cells + 1.2),
-          vx: (Math.random() - 0.5) * 1.5,
-          vy: dir * 24,
-          energy: 1e9, r: 120, g: 200, b: 255, life: 1.4
-        });
+      // Hawking evaporation (negligible for stellar BH, relevant only for tiny micro BH)
+      const T_hawking = 1.227e23 / Math.max(1e5, bh.bhMass); // K
+      if (T_hawking > 1e8 && bh.bhMass < 1e14) {
+        const dM = Math.min(bh.bhMass * 0.02, 1e13 * Math.pow(1e12 / Math.max(1e5, bh.bhMass), 2) * dt);
+        bh.bhMass -= dM;
+        UPCS.ledger.E_radiated += dM * PHYS.c * PHYS.c;
+        if (bh.bhMass <= 1e5) {
+          if (typeof deletePixel === "function") deletePixel(bh.x, bh.y);
+          else bh.del = true;
+          UPCS.blackHoles.splice(i, 1);
+          continue;
+        }
       }
     }
 
     // 2. Per-Voxel Nuclear Reactions, Decay, Stellar Burning & Remnant Formation
     for (let i = 0; i < activePixels.length; i++) {
       const p = activePixels[i];
-      if (!p || !p.isUPCS || p.del) continue;
+      if (!p || !p.isUPCS || p.del || p.isBlackHole) continue;
       const tempK = Math.max(0.5, (p.temp ?? 20) + 273.15);
       const chi = p.chi || 1.0;
 
-      // --- Black Hole Event Horizon Capture & Accretion Disk Shear ---
-      let absorbed = false;
+      // Gentle shear heating only for fast-orbiting matter skimming close to a black hole
       for (let b = 0; b < UPCS.blackHoles.length; b++) {
         const bh = UPCS.blackHoles[b];
-        const dx = p.x - bh.x, dy = p.y - bh.y;
+        if (!bh || bh.del) continue;
+        const dx = (p.x + (p.ox || 0)) - (bh.x + (bh.ox || 0));
+        const dy = (p.y + (p.oy || 0)) - (bh.y + (bh.oy || 0));
         const r = Math.hypot(dx, dy);
-        if (r <= bh.Rs_cells) {
-          const mAbs = getTotalMassKg(p);
-          bh.mass += mAbs;
-          bh.spin += (dx * p.vy - dy * p.vx) * 0.002;
-          bh.px += p.vx * mAbs;
-          bh.py += p.vy * mAbs;
-          if (typeof deletePixel === "function") deletePixel(p.x, p.y);
-          absorbed = true;
-          break;
-        } else if (r <= bh.Rs_cells * 3.5) {
-          // ISCO (3 R_s) & Photon Sphere (1.5 R_s) viscous accretion heating
-          const tangV = Math.abs((-dy * p.vx + dx * p.vy) / Math.max(0.5, r));
-          p.temp = Math.min(1e9, (p.temp ?? 20) + tangV * 1800 + 900);
-          if (r < bh.Rs_cells * 3.0) {
-            // Inside ISCO: spiral inward
-            p.vx -= (dx / r) * 1.8;
-            p.vy -= (dy / r) * 1.8;
+        if (r > bh.Rs_cells && r <= bh.Rs_cells * 2.5) {
+          const rvx = (p.vx || 0) - (bh.vx || 0);
+          const rvy = (p.vy || 0) - (bh.vy || 0);
+          const tangV = Math.abs((-dy * rvx + dx * rvy) / Math.max(0.5, r));
+          if (tangV > 0.6) {
+            p.temp = Math.min(1e9, (p.temp ?? 20) + tangV * tangV * 120);
           }
         }
       }
-      if (absorbed) continue;
 
       // --- Radioactive Decay (Isotope Flag Driven) ---
       if (CONFIG.enableDecay && Math.random() < 0.08) {
@@ -1344,13 +1437,10 @@
         const effTOV = CONFIG.sandboxScaledAstro ? getRestMassKg(26, 56) * 26 : PHYS.M_tov;
 
         if (mTot >= effTOV || storedN >= 28) {
-          // Collapse into Black Hole
+          // Collapse voxel in-place into a deletable Black Hole voxel
           const bhMass = CONFIG.sandboxScaledAstro ? Math.max(mTot, 3.0 * PHYS.M_sun) : mTot;
-          UPCS.blackHoles.push({
-            x: p.x, y: p.y, mass: bhMass, Rs_cells: 2.0,
-            spin: p.spin || 0.5, px: p.vx * mTot, py: p.vy * mTot
-          });
-          if (typeof deletePixel === "function") deletePixel(p.x, p.y);
+          collapseVoxelToBlackHole(p, bhMass);
+          UPCS.blackHoles.push(p);
           continue;
         } else if (mTot >= effChandra || storedN >= 14) {
           if (p.remnant !== "ns") {
@@ -1486,8 +1576,17 @@
           n.y += n.vy * 0.5;
           const gx = Math.floor(n.x), gy = Math.floor(n.y);
           if (gx < 0 || gx >= width || gy < 0 || gy >= height) { consumed = true; break; }
+          for (let b = 0; b < UPCS.blackHoles.length; b++) {
+            const bh = UPCS.blackHoles[b];
+            if (!bh || bh.del) continue;
+            const bdx = n.x - (bh.x + (bh.ox || 0));
+            const bdy = n.y - (bh.y + (bh.oy || 0));
+            if (bdx * bdx + bdy * bdy <= bh.Rs_cells * bh.Rs_cells) { consumed = true; break; }
+          }
+          if (consumed) break;
           const p = pixelMap[gx] && pixelMap[gx][gy];
           if (!p || !p.isUPCS) continue;
+          if (p.isBlackHole) { consumed = true; break; }
 
           const iso = getIsotopeParams(p.Z, p.A, p.is_metastable);
           const isThermal = n.energy_eV < 1.0;
@@ -1576,7 +1675,16 @@
       ph.x += ph.vx;
       ph.y += ph.vy;
       ph.life -= 0.045;
-      if (ph.life <= 0 || ph.x < 0 || ph.x >= width || ph.y < 0 || ph.y >= height) {
+      // Check photon capture by black hole event horizons
+      let swallowed = false;
+      for (let b = 0; b < UPCS.blackHoles.length; b++) {
+        const bh = UPCS.blackHoles[b];
+        if (!bh || bh.del) continue;
+        const dx = ph.x - (bh.x + (bh.ox || 0));
+        const dy = ph.y - (bh.y + (bh.oy || 0));
+        if (dx * dx + dy * dy <= bh.Rs_cells * bh.Rs_cells) { swallowed = true; break; }
+      }
+      if (swallowed || ph.life <= 0 || ph.x < 0 || ph.x >= width || ph.y < 0 || ph.y >= height) {
         UPCS.photons.splice(i, 1);
       }
     }
@@ -1598,10 +1706,116 @@
     const cw = UPCS.cw, ch = UPCS.ch;
     const L = CONFIG.voxelSizeMeters;
     const Vcell = getCellVolume();
+    const refBhMass = UPCS.blackHoles.length > 0 ? getDefaultBlackHoleMass() : 1;
 
     for (let i = 0; i < activePixels.length; i++) {
       const p = activePixels[i];
       if (!p || !p.isUPCS || p.del) continue;
+
+      // Direct smooth softened 1/r^2 gravity & horizon absorption from Black Hole voxels
+      let bhAx = 0, bhAy = 0;
+      let absorbedByBh = false;
+      if (UPCS.blackHoles.length > 0) {
+        const px = p.x + (p.ox || 0);
+        const py = p.y + (p.oy || 0);
+        for (let b = 0; b < UPCS.blackHoles.length; b++) {
+          const bh = UPCS.blackHoles[b];
+          if (!bh || bh === p || bh.del) continue;
+          const dx = (bh.x + (bh.ox || 0)) - px;
+          const dy = (bh.y + (bh.oy || 0)) - py;
+          const r2 = dx * dx + dy * dy;
+          const r = Math.sqrt(r2);
+
+          if (r <= bh.Rs_cells) {
+            if (p.isBlackHole) {
+              // Merge the less massive black hole into the more massive one
+              if (bh.bhMass > p.bhMass || (bh.bhMass === p.bhMass && bh._uid < p._uid)) {
+                absorbVoxelIntoBlackHole(bh, p);
+                absorbedByBh = true;
+                break;
+              }
+            } else {
+              absorbVoxelIntoBlackHole(bh, p);
+              absorbedByBh = true;
+              break;
+            }
+          }
+
+          if (CONFIG.enableGravity && r > 1e-4) {
+            const massFactor = Math.pow(Math.max(0.1, (bh.bhMass || refBhMass) / Math.max(1e-30, refBhMass)), 0.5);
+            const mu = 28.0 * massFactor * Math.max(0.1, CONFIG.gravityMultiplier);
+            const eps = Math.max(0.9, (bh.Rs_cells || 1.25) * 0.65);
+            const accel = Math.min(35.0, mu / (r2 + eps * eps));
+            bhAx += (dx / r) * accel;
+            bhAy += (dy / r) * accel;
+          }
+        }
+      }
+      if (absorbedByBh || p.del) continue;
+
+      // Black Hole voxel kinematics: pure gravity + momentum conservation (no fluid pressure/drag/magnetic artifacts)
+      if (p.isBlackHole) {
+        let ax = bhAx, ay = bhAy;
+        if (CONFIG.enableGravity) {
+          ax += sampleCoarseBilinear(UPCS.gxGrid, p.x, p.y);
+          ay += sampleCoarseBilinear(UPCS.gyGrid, p.x, p.y);
+        }
+        p.vx = (p.vx || 0) + ax * subDt;
+        p.vy = (p.vy || 0) + ay * subDt;
+        const maxV = CONFIG.cflMaxDisp / Math.max(1e-4, subDt);
+        const vMag = Math.hypot(p.vx, p.vy);
+        if (vMag > maxV) {
+          const sc = maxV / vMag;
+          p.vx *= sc;
+          p.vy *= sc;
+        }
+        if (!Number.isFinite(p.vx)) p.vx = 0;
+        if (!Number.isFinite(p.vy)) p.vy = 0;
+
+        p.ox = (p.ox || 0) + p.vx * subDt;
+        p.oy = (p.oy || 0) + p.vy * subDt;
+
+        let stepX = 0, stepY = 0;
+        if (p.ox >= 0.5) stepX = 1; else if (p.ox <= -0.5) stepX = -1;
+        if (p.oy >= 0.5) stepY = 1; else if (p.oy <= -0.5) stepY = -1;
+
+        if (stepX !== 0 || stepY !== 0) {
+          const nx = p.x + stepX, ny = p.y + stepY;
+          if (nx < 0 || nx > width || ny < 0 || ny > height) {
+            if (nx < 0 || nx > width) { p.vx = -p.vx * 0.5; p.ox = Math.max(-0.49, Math.min(0.49, p.ox)); }
+            if (ny < 0 || ny > height) { p.vy = -p.vy * 0.5; p.oy = Math.max(-0.49, Math.min(0.49, p.oy)); }
+          } else if (typeof isEmpty === "function" && isEmpty(nx, ny)) {
+            movePixel(p, nx, ny);
+            p.ox -= stepX;
+            p.oy -= stepY;
+          } else {
+            const target = pixelMap[nx] && pixelMap[nx][ny];
+            if (target && target !== p && !target.del) {
+              if (target.isBlackHole) {
+                if (p.bhMass >= target.bhMass) {
+                  absorbVoxelIntoBlackHole(p, target);
+                  if (typeof isEmpty === "function" && isEmpty(nx, ny)) {
+                    movePixel(p, nx, ny);
+                    p.ox -= stepX;
+                    p.oy -= stepY;
+                  }
+                } else {
+                  absorbVoxelIntoBlackHole(target, p);
+                }
+              } else {
+                absorbVoxelIntoBlackHole(p, target);
+                if (typeof isEmpty === "function" && isEmpty(nx, ny)) {
+                  movePixel(p, nx, ny);
+                  p.ox -= stepX;
+                  p.oy -= stepY;
+                }
+              }
+            }
+          }
+        }
+        continue;
+      }
+
       const el = ELEMENTS[p.Z];
       const tempK = Math.max(0.5, (p.temp ?? 20) + 273.15);
       const mTot = getTotalMassKg(p);
@@ -1612,7 +1826,7 @@
       p.chi = Math.max(1.0, mTot / Math.max(1e-36, mRest));
 
       // 1. Force Summation: F_gravity + F_pressure_gradient + F_magnetic + F_lorentz + F_vorticity + F_drag
-      let ax = 0, ay = 0;
+      let ax = bhAx, ay = bhAy;
 
       if (CONFIG.enableGravity) {
         ax += sampleCoarseBilinear(UPCS.gxGrid, p.x, p.y);
@@ -1633,7 +1847,7 @@
       ay -= Math.max(-18, Math.min(18, dPy * pScale));
 
       // Magnetism: Dipole Force F_mag = ∇(μ · B), Alignment Torque, Curie Demagnetization, Lorentz Force
-      if (CONFIG.enableMagnetism) {
+      if (CONFIG.enableMagnetism && el) {
         const Bx = UPCS.bxGrid[cIdx], By = UPCS.byGrid[cIdx];
         if (el.curie_temp > 0) {
           if (tempK >= el.curie_temp) {
@@ -1712,7 +1926,9 @@
           p.oy -= stepY;
         } else {
           const target = pixelMap[nx] && pixelMap[nx][ny];
-          if (target && target.isUPCS && !target.del) {
+          if (target && target.isBlackHole && !target.del) {
+            absorbVoxelIntoBlackHole(target, p);
+          } else if (target && target.isUPCS && !target.del) {
             resolveVoxelCollisionOrPack(p, target, stepX, stepY);
           } else {
             p.vx = -p.vx * CONFIG.restitution;
@@ -1868,13 +2084,16 @@
 
     for (let i = 0; i < activePixels.length; i++) {
       const p = activePixels[i];
+      if (!p || p.del) continue;
       const m = getTotalMassKg(p);
       M += m;
       stored += p.stored_voxels ? p.stored_voxels.length : 0;
-      const tempK = Math.max(0.5, (p.temp ?? 20) + 273.15);
-      const el = ELEMENTS[p.Z];
-      Eth += m * (el ? el.C_v : 500) * tempK;
-      const vxms = p.vx * vToMS, vyms = p.vy * vToMS;
+      if (!p.isBlackHole) {
+        const tempK = Math.max(0.5, (p.temp ?? 20) + 273.15);
+        const el = ELEMENTS[p.Z];
+        Eth += m * (el ? el.C_v : 500) * tempK;
+      }
+      const vxms = (p.vx || 0) * vToMS, vyms = (p.vy || 0) * vToMS;
       Ekin += 0.5 * m * (vxms * vxms + vyms * vyms);
       Px += m * vxms;
       Py += m * vyms;
@@ -1882,7 +2101,6 @@
       const phi = sampleCoarseBilinear(UPCS.phiGrid, p.x, p.y);
       Egrav += 0.5 * m * phi;
     }
-    for (let i = 0; i < UPCS.blackHoles.length; i++) M += UPCS.blackHoles[i].mass;
 
     const Ldg = UPCS.ledger;
     Ldg.M_total = M;
@@ -1902,11 +2120,18 @@
     const t0 = performance.now();
     tickCounter++;
 
-    // Gather active UPCS voxels
+    // Gather active UPCS voxels and live Black Hole voxels
     const active = [];
+    UPCS.blackHoles.length = 0;
     for (let i = 0; i < currentPixels.length; i++) {
       const p = currentPixels[i];
       if (!p || p.del) continue;
+      if (p.element === "upcs_black_hole") {
+        if (!p.isUPCS || !p.isBlackHole) initBlackHoleVoxel(p);
+        UPCS.blackHoles.push(p);
+        active.push(p);
+        continue;
+      }
       if (!p.isUPCS) {
         const z = Z_BY_ELEMENT_KEY[p.element];
         if (z) initVoxel(p, z);
@@ -1948,35 +2173,94 @@
   // Pass 1: Deep-space Background, Gravity Potential Contours & Magnetic Field Lines
   // Pass 2: Voxel Matter with Sub-Pixel Interpolation, Compression Brightness & ACES Blackbody
   // Pass 3: Crisp Anti-Aliased Vector Bond Lines (Single/Double/Triple/Ionic/Strain)
-  // Pass 4: Post-Processing Additive HDR Glow (Plasma, Stars, Jets, Neutrons/Photons)
+  // Pass 4: Post-Processing Additive HDR Glow (Plasma, Stars, Neutrons/Photons) + Pure-Black BH Horizons
+  // Layered cleanly beneath Sandboxels' transparent #game canvas so Sandboxels' native
+  // selection box, brush cursor, grid, and tool overlays always render unobstructed on top.
   // ==========================================================================
   let overlayCanvas = null;
   let octx = null;
+  let overlayParent = null;
+  let hasRenderPostPixelHook = false;
+
+  if (typeof renderPostPixel === "function") {
+    hasRenderPostPixelHook = true;
+    renderPostPixel(function (pctx) {
+      if (CONFIG.fullCustomRenderer && pctx && pctx.canvas) {
+        pctx.clearRect(0, 0, pctx.canvas.width, pctx.canvas.height);
+      }
+    });
+  }
+
+  function clearSandboxelsPixelsLayer() {
+    if (typeof canvasLayers !== "undefined" && canvasLayers && canvasLayers.pixels) {
+      const pctx = canvasLayers.pixels.getContext("2d");
+      if (pctx) pctx.clearRect(0, 0, canvasLayers.pixels.width, canvasLayers.pixels.height);
+    }
+  }
 
   function acesToneMap(v) {
     const a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
     return Math.max(0, Math.min(1, (v * (a * v + b)) / (v * (c * v + d) + e)));
   }
 
+  function getSandboxelsGridDims(game) {
+    const cols = (typeof pixelSize === "number" && pixelSize > 0 && game && game.width > 0)
+      ? (game.width / pixelSize)
+      : (typeof width === "number" ? width + 1 : 100);
+    const rows = (typeof pixelSize === "number" && pixelSize > 0 && game && game.height > 0)
+      ? (game.height / pixelSize)
+      : (typeof height === "number" ? height + 1 : 100);
+    return { cols: Math.max(1, cols), rows: Math.max(1, rows) };
+  }
+
+  function ensureCanvasLayerStyles() {
+    if (document.getElementById("upcs-canvas-layer-style") || !document.head) return;
+    const st = document.createElement("style");
+    st.id = "upcs-canvas-layer-style";
+    st.textContent = `
+      #game.upcs-transparent-game {
+        position: relative !important;
+        z-index: 2 !important;
+        background-color: transparent !important;
+        background-image: none !important;
+      }
+    `;
+    document.head.appendChild(st);
+  }
+
   function ensureOverlayCanvas() {
     const game = document.getElementById("game");
     if (!game) return null;
+    ensureCanvasLayerStyles();
+
     if (!overlayCanvas) {
       overlayCanvas = document.createElement("canvas");
       overlayCanvas.id = "upcs-overlay";
-      overlayCanvas.style.position = "fixed";
       overlayCanvas.style.pointerEvents = "none";
-      overlayCanvas.style.zIndex = "25";
-      document.body.appendChild(overlayCanvas);
+
+      // Prefer mounting inside #gameDiv (positioned parent) so scrolling & stacking stay exact
+      const parent = game.parentElement;
+      const parentPos = (parent && parent !== document.body && typeof window.getComputedStyle === "function")
+        ? window.getComputedStyle(parent).position
+        : "static";
+      if (parent && parent !== document.body && parentPos !== "static") {
+        overlayParent = parent;
+        overlayCanvas.style.position = "absolute";
+        parent.insertBefore(overlayCanvas, game);
+      } else {
+        overlayParent = null;
+        overlayCanvas.style.position = "fixed";
+        document.body.appendChild(overlayCanvas);
+      }
       octx = overlayCanvas.getContext("2d");
 
       // Track mouse hover & Shift/I pinning on the game canvas
       game.addEventListener("mousemove", (ev) => {
         const rect = game.getBoundingClientRect();
-        const cw = typeof width === "number" ? width : 100;
-        const ch = typeof height === "number" ? height : 100;
-        UPCS.hoverX = Math.floor(((ev.clientX - rect.left) / rect.width) * cw);
-        UPCS.hoverY = Math.floor(((ev.clientY - rect.top) / rect.height) * ch);
+        if (!rect.width || !rect.height) return;
+        const dims = getSandboxelsGridDims(game);
+        UPCS.hoverX = Math.floor(((ev.clientX - rect.left) / rect.width) * dims.cols);
+        UPCS.hoverY = Math.floor(((ev.clientY - rect.top) / rect.height) * dims.rows);
       });
       window.addEventListener("keydown", (ev) => {
         if (ev.key === "i" || ev.key === "I") {
@@ -1985,7 +2269,25 @@
         }
       });
     }
+
+    // Layer #upcs-overlay BEHIND transparent #game when fullCustomRenderer + renderPostPixel is active
+    // so Sandboxels' native selection box, cursor, grid & tools always draw unobstructed on top!
+    const behindGame = CONFIG.fullCustomRenderer && hasRenderPostPixelHook;
+    if (behindGame) {
+      if (game.classList && !game.classList.contains("upcs-transparent-game")) {
+        game.classList.add("upcs-transparent-game");
+        clearSandboxelsPixelsLayer();
+      }
+      overlayCanvas.style.zIndex = "1";
+    } else {
+      if (game.classList && game.classList.contains("upcs-transparent-game")) {
+        game.classList.remove("upcs-transparent-game");
+      }
+      overlayCanvas.style.zIndex = "3";
+    }
+
     const rect = game.getBoundingClientRect();
+    if (!rect || rect.width <= 0 || rect.height <= 0) return null;
     const dpr = Math.min(2, window.devicePixelRatio || 1);
     const targetW = Math.max(1, Math.round(rect.width * dpr));
     const targetH = Math.max(1, Math.round(rect.height * dpr));
@@ -1993,11 +2295,90 @@
       overlayCanvas.width = targetW;
       overlayCanvas.height = targetH;
     }
-    overlayCanvas.style.left = rect.left + "px";
-    overlayCanvas.style.top = rect.top + "px";
+    if (overlayParent) {
+      const pRect = overlayParent.getBoundingClientRect();
+      overlayCanvas.style.left = (rect.left - pRect.left - (overlayParent.clientLeft || 0)) + "px";
+      overlayCanvas.style.top = (rect.top - pRect.top - (overlayParent.clientTop || 0)) + "px";
+    } else {
+      overlayCanvas.style.left = rect.left + "px";
+      overlayCanvas.style.top = rect.top + "px";
+    }
     overlayCanvas.style.width = rect.width + "px";
     overlayCanvas.style.height = rect.height + "px";
-    return { rect, dpr, cellW: rect.width / Math.max(1, width), cellH: rect.height / Math.max(1, height) };
+    const dims = getSandboxelsGridDims(game);
+    return { game, rect, dpr, behindGame, cellW: rect.width / dims.cols, cellH: rect.height / dims.rows };
+  }
+
+  // Fallback overlay compositor used only if Sandboxels lacks renderPostPixel
+  function renderSandboxelsSelectionAndGuiFallback(geom) {
+    const { game, rect, cellW, cellH } = geom;
+
+    if (typeof elements !== "undefined" && game.width > 0 && game.height > 0) {
+      octx.save();
+      octx.globalCompositeOperation = "source-over";
+      octx.globalAlpha = 1;
+      octx.imageSmoothingEnabled = false;
+      octx.scale(rect.width / game.width, rect.height / game.height);
+      try {
+        if (typeof getPixel === "function" && typeof mousePos !== "undefined" && mousePos) {
+          const hoverPixel = getPixel(Math.round(mousePos.x), Math.round(mousePos.y));
+          if (hoverPixel && elements[hoverPixel.element] && typeof elements[hoverPixel.element].hoverRender === "function") {
+            elements[hoverPixel.element].hoverRender(octx);
+          }
+        }
+        if (typeof currentElement !== "undefined" && elements[currentElement] && typeof elements[currentElement].renderTool === "function") {
+          elements[currentElement].renderTool(octx);
+        }
+      } catch (_) {}
+      octx.restore();
+    }
+
+    let drewGuiLayer = false;
+    const pixelsLayer = (typeof canvasLayers !== "undefined" && canvasLayers) ? canvasLayers.pixels : null;
+    const guiLayer = (typeof canvasLayers !== "undefined" && canvasLayers) ? canvasLayers.gui : null;
+
+    octx.save();
+    octx.globalCompositeOperation = "source-over";
+    octx.globalAlpha = 1;
+    octx.imageSmoothingEnabled = false;
+    if (typeof canvasLayersPost !== "undefined" && Array.isArray(canvasLayersPost)) {
+      for (let i = 0; i < canvasLayersPost.length; i++) {
+        const layerCanvas = canvasLayersPost[i];
+        if (!layerCanvas || layerCanvas === pixelsLayer) continue;
+        if (layerCanvas.width > 0 && layerCanvas.height > 0) {
+          octx.drawImage(layerCanvas, 0, 0, rect.width, rect.height);
+          if (layerCanvas === guiLayer) drewGuiLayer = true;
+        }
+      }
+    }
+    if (!drewGuiLayer && guiLayer && guiLayer.width > 0 && guiLayer.height > 0) {
+      octx.drawImage(guiLayer, 0, 0, rect.width, rect.height);
+      drewGuiLayer = true;
+    }
+    octx.restore();
+
+    if (!drewGuiLayer && typeof mousePos !== "undefined" && mousePos && typeof mouseSize === "number") {
+      const mouseOffset = mouseSize / 2;
+      const mouseMin = Math.trunc(mouseOffset);
+      let mouseMax = mouseMin;
+      if (mouseOffset % 1 === 0) mouseMax--;
+      const topLeftX = mousePos.x - mouseMin;
+      const topLeftY = mousePos.y - mouseMin;
+      const boxW = (mousePos.x + mouseMax) - topLeftX + 1;
+      const boxH = (mousePos.y + mouseMax) - topLeftY + 1;
+      const mColor = (typeof mouseColor === "string" && mouseColor)
+        || (typeof settings !== "undefined" && settings && settings.mouseColor)
+        || "white";
+      const mAlpha = (typeof mouseAlpha === "number") ? mouseAlpha : 0.5;
+
+      octx.save();
+      octx.globalCompositeOperation = "source-over";
+      octx.globalAlpha = mAlpha;
+      octx.lineWidth = 2;
+      octx.strokeStyle = mColor;
+      octx.strokeRect(topLeftX * cellW, topLeftY * cellH, boxW * cellW, boxH * cellH);
+      octx.restore();
+    }
   }
 
   function render4Pass() {
@@ -2006,7 +2387,7 @@
     const geom = ensureOverlayCanvas();
     if (!geom || !octx) return;
 
-    const { rect, dpr, cellW, cellH } = geom;
+    const { rect, dpr, behindGame, cellW, cellH } = geom;
     octx.save();
     octx.setTransform(dpr, 0, 0, dpr, 0, 0);
     octx.clearRect(0, 0, rect.width, rect.height);
@@ -2070,7 +2451,7 @@
     if (CONFIG.fullCustomRenderer) {
       for (let i = 0; i < currentPixels.length; i++) {
         const p = currentPixels[i];
-        if (!p || p.del) continue;
+        if (!p || p.del || p.isBlackHole || p.element === "upcs_black_hole") continue;
         const sx = (p.x + (p.ox || 0)) * cellW;
         const sy = (p.y + (p.oy || 0)) * cellH;
 
@@ -2122,28 +2503,6 @@
       }
     }
 
-    // Render Black Holes (Event Horizon + Photon Sphere Ring)
-    for (let i = 0; i < UPCS.blackHoles.length; i++) {
-      const bh = UPCS.blackHoles[i];
-      const bx = (bh.x + 0.5) * cellW, by = (bh.y + 0.5) * cellH;
-      const rsPx = bh.Rs_cells * cellW;
-      // Photon sphere 1.5 R_s glow
-      const pGrad = octx.createRadialGradient(bx, by, rsPx * 0.9, bx, by, rsPx * 2.6);
-      pGrad.addColorStop(0, "rgba(0,0,0,1)");
-      pGrad.addColorStop(0.35, "rgba(255,190,90,0.92)");
-      pGrad.addColorStop(0.65, "rgba(90,170,255,0.35)");
-      pGrad.addColorStop(1, "rgba(0,0,0,0)");
-      octx.fillStyle = pGrad;
-      octx.beginPath();
-      octx.arc(bx, by, rsPx * 2.6, 0, Math.PI * 2);
-      octx.fill();
-      // Pitch-black Event Horizon
-      octx.fillStyle = "#000000";
-      octx.beginPath();
-      octx.arc(bx, by, rsPx, 0, Math.PI * 2);
-      octx.fill();
-    }
-
     // --- PASS 3: Sleek Non-Voxel Vector Bond Overlay Layer ---
     if (CONFIG.showVectorBonds && UPCS.bonds.length > 0) {
       octx.lineCap = "round";
@@ -2151,7 +2510,9 @@
         const b = UPCS.bonds[i];
         const pA = UPCS.uidToPixel.get(b.aUid);
         const pB = UPCS.uidToPixel.get(b.bUid);
-        if (!pA || !pB) continue;
+        if (!pA || !pB || pA.isBlackHole || pB.isBlackHole) continue;
+        const elA = ELEMENTS[pA.Z], elB = ELEMENTS[pB.Z];
+        if (!elA || !elB) continue;
 
         const x1 = (pA.x + (pA.ox || 0) + 0.5) * cellW;
         const y1 = (pA.y + (pA.oy || 0) + 0.5) * cellH;
@@ -2165,7 +2526,7 @@
         if (b.strain > 0.65) {
           octx.strokeStyle = `rgba(251, 191, 36, ${Math.min(0.95, 0.5 + b.strain * 0.45)})`;
         } else {
-          const rgbA = ELEMENTS[pA.Z].rgb, rgbB = ELEMENTS[pB.Z].rgb;
+          const rgbA = elA.rgb, rgbB = elB.rgb;
           const mr = ((rgbA[0] + rgbB[0]) >> 1), mg = ((rgbA[1] + rgbB[1]) >> 1), mb = ((rgbA[2] + rgbB[2]) >> 1);
           octx.strokeStyle = `rgba(${mr}, ${mg}, ${mb}, 0.78)`;
         }
@@ -2238,13 +2599,32 @@
       octx.globalAlpha = 1;
     }
 
-    // Highlight Pinned Inspector Voxel
+    // Render Black Hole Voxel Event Horizons on top of light/bloom (pure pitch-black, no misleading light)
     octx.globalCompositeOperation = "source-over";
+    octx.globalAlpha = 1;
+    for (let i = 0; i < currentPixels.length; i++) {
+      const bh = currentPixels[i];
+      if (!bh || bh.del || (!bh.isBlackHole && bh.element !== "upcs_black_hole")) continue;
+      const bx = (bh.x + (bh.ox || 0) + 0.5) * cellW;
+      const by = (bh.y + (bh.oy || 0) + 0.5) * cellH;
+      const rsPx = Math.max(cellW * 0.65, (bh.Rs_cells || 1.25) * cellW);
+      octx.fillStyle = "#000000";
+      octx.beginPath();
+      octx.arc(bx, by, rsPx, 0, Math.PI * 2);
+      octx.fill();
+    }
+
+    // Highlight Pinned Inspector Voxel
     const pinned = getInspectedPixel();
     if (pinned && UPCS.pinnedUid) {
       octx.strokeStyle = "#38BDF8";
       octx.lineWidth = 1.5;
       octx.strokeRect(pinned.x * cellW - 1, pinned.y * cellH - 1, cellW + 2, cellH + 2);
+    }
+
+    // Fallback: composite Sandboxels GUI manually only when renderPostPixel hook is unavailable
+    if (CONFIG.fullCustomRenderer && !behindGame) {
+      renderSandboxelsSelectionAndGuiFallback(geom);
     }
 
     octx.restore();
@@ -2510,7 +2890,10 @@
     };
     bindChk("upcs-brush-meta", "brushMetastable");
     document.getElementById("upcs-brush-dip").onchange = (e) => { CONFIG.brushDipole = parseFloat(e.target.value) || 0; };
-    bindChk("upcs-4pass", "fullCustomRenderer");
+    document.getElementById("upcs-4pass").onchange = (e) => {
+      CONFIG.fullCustomRenderer = e.target.checked;
+      if (CONFIG.fullCustomRenderer) clearSandboxelsPixelsLayer();
+    };
     bindChk("upcs-bonds-v", "showVectorBonds");
     bindChk("upcs-bloom", "enableHDRBloom");
     bindRng("upcs-blm", "bloomIntensity", "upcs-blm-v");
@@ -2552,7 +2935,7 @@
   }
 
   function pinHoveredVoxel() {
-    if (UPCS.hoverX < 0 || UPCS.hoverY < 0 || UPCS.hoverX >= width || UPCS.hoverY >= height) return;
+    if (UPCS.hoverX < 0 || UPCS.hoverY < 0 || UPCS.hoverX > width || UPCS.hoverY > height) return;
     const p = pixelMap[UPCS.hoverX] && pixelMap[UPCS.hoverX][UPCS.hoverY];
     if (p && p.isUPCS) {
       UPCS.pinnedUid = (UPCS.pinnedUid === p._uid) ? null : p._uid;
@@ -2563,7 +2946,7 @@
 
   function getInspectedPixel() {
     if (UPCS.pinnedUid && UPCS.uidToPixel.has(UPCS.pinnedUid)) return UPCS.uidToPixel.get(UPCS.pinnedUid);
-    if (UPCS.hoverX >= 0 && UPCS.hoverX < width && UPCS.hoverY >= 0 && UPCS.hoverY < height) {
+    if (UPCS.hoverX >= 0 && UPCS.hoverX <= width && UPCS.hoverY >= 0 && UPCS.hoverY <= height) {
       const p = pixelMap[UPCS.hoverX] && pixelMap[UPCS.hoverX][UPCS.hoverY];
       if (p && p.isUPCS) return p;
     }
@@ -2577,7 +2960,30 @@
     const p = getInspectedPixel();
     if (!p) { body.innerHTML = `<div style="color:#64748B">Hover a Periodic Table voxel or press <b>I</b> to pin.</div>`; return; }
 
+    if (p.isBlackHole || p.element === "upcs_black_hole") {
+      const mKg = getTotalMassKg(p);
+      const vCells = Math.hypot(p.vx || 0, p.vy || 0);
+      const vMS = vCells * CONFIG.voxelSizeMeters / Math.max(1e-15, CONFIG.dtSim);
+      body.innerHTML = `
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+          <b style="font-size:13px;color:#F8FAFC">Black Hole (Singularity Voxel)</b>
+          <span class="upcs-badge cache">EVENT HORIZON</span>
+        </div>
+        <div class="upcs-kv">
+          <span>Mass (kg):</span><b>${fmtSci(mKg)} kg</b>
+          <span>Mass (Solar M☉):</span><b>${fmtSci(mKg / PHYS.M_sun)} M☉</b>
+          <span>Horizon Radius (R_s):</span><b>${(p.Rs_cells || 1.25).toFixed(2)} cells</b>
+          <span>Absorbed Voxels:</span><b>${p.absorbedCount || 0}</b>
+          <span>Spin Parameter:</span><b>${(p.spin || 0).toFixed(2)}</b>
+          <span>Velocity |v|:</span><b>${vCells.toFixed(2)} c/s (${fmtSci(vMS)} m/s)</b>
+        </div>
+        <div style="color:#94A3B8;font-size:10.5px">Right-click or use Erase on this voxel to delete the Black Hole.</div>
+      `;
+      return;
+    }
+
     const el = ELEMENTS[p.Z];
+    if (!el) return;
     const iso = getIsotopeParams(p.Z, p.A, p.is_metastable);
     const name = getIsotopeDisplayName(p.Z, p.A, p.is_metastable);
     const tempK = Math.max(0.5, (p.temp ?? 20) + 273.15);
