@@ -442,13 +442,33 @@
     return solved;
   }
 
-  // --- Tier 2 Analytical Isotope & Nuclear Stability Solver (Bethe-Weizsäcker) ---
+  // --- Tier 2 Analytical Isotope & Nuclear Stability Solver (AME2020 + Bethe-Weizsäcker) ---
+  // Exact experimental total binding energies (MeV, AME2020) for key fusion, stellar & actinide nuclides
+  const EXACT_BINDING_MEV = Object.create(null);
+  (function initExactBindingTable() {
+    const tbl = [
+      [1,2,2.22457],[1,3,8.48180],[2,3,7.71804],[2,4,28.29567],
+      [3,6,31.9940],[3,7,39.2450],[4,7,37.6004],[4,8,56.4995],[4,9,58.1643],
+      [5,10,64.7507],[5,11,76.2048],[6,12,92.1617],[6,13,97.1080],[6,14,105.2845],
+      [7,13,94.1053],[7,14,104.6586],[7,15,115.4920],
+      [8,15,111.9554],[8,16,127.6193],[8,17,131.7624],[9,19,147.8013],
+      [10,20,160.6448],[11,23,186.5644],[12,24,198.2570],[13,27,224.9519],
+      [14,28,236.5369],[15,31,262.9173],[16,32,271.7805],[18,36,306.7165],
+      [20,40,342.0522],[22,44,375.4750],[24,48,411.4690],[26,52,447.6980],
+      [26,56,492.2595],[27,56,486.9060],[28,56,483.9960],[28,62,545.2620],
+      [90,232,1766.69],[90,233,1771.48],[91,233,1771.26],[92,233,1771.73],
+      [92,235,1783.87],[92,236,1790.41],[92,238,1801.69],[92,239,1806.50],
+      [93,239,1806.98],[94,239,1806.92],[94,240,1813.45],[94,241,1818.69],[98,252,1881.27]
+    ];
+    for (let i = 0; i < tbl.length; i++) {
+      EXACT_BINDING_MEV[(tbl[i][0] << 9) | tbl[i][1]] = tbl[i][2];
+    }
+  })();
+
   function bindingEnergyMeV(Z, A) {
     if (A <= 1 || Z < 0 || Z > A) return 0;
-    if (Z === 1 && A === 2) return 2.224;
-    if (Z === 1 && A === 3) return 8.482;
-    if (Z === 2 && A === 3) return 7.718;
-    if (Z === 2 && A === 4) return 28.296;
+    const exact = EXACT_BINDING_MEV[(Z << 9) | A];
+    if (exact !== undefined) return exact;
     const N = A - Z;
     const av = 15.75, as = 17.8, ac = 0.711, aa = 23.7, ap = 11.18;
     let delta = 0;
@@ -472,6 +492,7 @@
         daughterZ: Z, daughterA: A, daughterMeta: false,
         sigmaFissionThermal: 0, sigmaFissionFast: 0, sigmaCapture: 0.2,
         isModerator: false, isControlAbsorber: false,
+        nuBar: 0, betaDelayed: 0, fastFissThresh_eV: 0, sfRatePerTick: 0,
         B_per_A: A > 0 ? B / A : 0,
         source: "SOLVED"
       };
@@ -479,14 +500,21 @@
 
     // Drip lines
     if (A < Z || Z < 1) {
-      return { Z, A, stable: false, decayMode: "p-drip", halfLifeSec: 1e-18, Q_MeV: 2, daughterZ: Math.max(1, Z - 1), daughterA: Math.max(1, A - 1), daughterMeta: false, sigmaFissionThermal: 0, sigmaFissionFast: 0, sigmaCapture: 0, isModerator: false, isControlAbsorber: false, B_per_A: 0, source: "SOLVED" };
+      return {
+        Z, A, stable: false, decayMode: "p-drip", halfLifeSec: 1e-18, Q_MeV: 2,
+        daughterZ: Math.max(1, Z - 1), daughterA: Math.max(1, A - 1), daughterMeta: false,
+        sigmaFissionThermal: 0, sigmaFissionFast: 0, sigmaCapture: 0,
+        isModerator: false, isControlAbsorber: false,
+        nuBar: 0, betaDelayed: 0, fastFissThresh_eV: 0, sfRatePerTick: 0,
+        B_per_A: 0, source: "SOLVED"
+      };
     }
 
     // Compare neighbor Q-values (beta-, beta+/EC, alpha)
     const Q_betaM = (Z + 1 <= 118) ? (bindingEnergyMeV(Z + 1, A) - B + 0.782) : -99;
     const Q_betaP = (Z - 1 >= 1)   ? (bindingEnergyMeV(Z - 1, A) - B - 0.782) : -99;
-    const Q_alpha = (Z >= 60 && A > 120) ? (bindingEnergyMeV(Z - 2, A - 4) + 28.296 - B) : -99;
-    const Q_sf    = (Z >= 92 && (Z * Z / A) > 36) ? 180 : -99;
+    const Q_alpha = (Z >= 60 && A > 120) ? (bindingEnergyMeV(Z - 2, A - 4) + 28.29567 - B) : -99;
+    const Q_sf    = (Z >= 92 && (Z * Z / A) > 36) ? 195 : -99;
 
     // Band of stability check
     const N = A - Z;
@@ -528,17 +556,23 @@
     }
 
     const oddN = ((A - Z) & 1) === 1;
-    const sigmaFissionThermal = (Z >= 90 && oddN && A >= 229) ? 450 : 0;
-    const sigmaFissionFast = (Z >= 90) ? 1.5 : 0;
-    const sigmaCapture = (Z >= 90 && !oddN) ? 3.0 : (Z === 5 && A === 10) ? 3840 : (Z === 48) ? 2500 : (Z === 72) ? 104 : 0.15;
+    const fissility = A > 0 ? (Z * Z) / A : 0;
+    const sigmaFissionThermal = (Z >= 92 && oddN && fissility >= 35.9) ? 450 : 0;
+    const sigmaFissionFast = (Z >= 90 && fissility >= 34.5) ? 1.5 : 0;
+    const sigmaCapture = (Z >= 90 && !oddN) ? 3.0 : (Z === 5 && A === 10) ? 3840 : (Z === 48) ? 2500 : (Z === 72) ? 104 : (Z === 64) ? 49000 : 0.15;
+    const nuBar = Z >= 90 ? (2.2 + 0.08 * Math.max(0, Z - 90) + 0.015 * Math.max(0, A - 232)) : 0;
+    const betaDelayed = Z >= 90 ? 0.005 : 0;
+    const fastFissThresh_eV = (Z >= 90 && !oddN) ? 1.0e6 : 0;
+    const sfRatePerTick = (Z >= 98) ? 0.01 : (Z >= 94 && !oddN ? 0.0004 : 0);
 
     return {
       Z, A, isMeta: false,
       stable, decayMode, halfLifeSec, Q_MeV,
       daughterZ: dZ, daughterA: dA, daughterMeta: false,
       sigmaFissionThermal, sigmaFissionFast, sigmaCapture,
-      isModerator: (Z === 1 || Z === 6 || Z === 8 || Z === 4),
+      isModerator: (Z === 1 || Z === 4 || Z === 6 || Z === 8),
       isControlAbsorber: (Z === 5 && A === 10) || Z === 48 || Z === 72 || Z === 64,
+      nuBar, betaDelayed, fastFissThresh_eV, sfRatePerTick,
       B_per_A: A > 0 ? B / A : 0,
       mExcess,
       source: "SOLVED"
@@ -578,23 +612,46 @@
     }
 
     const curatedIsos = [
-      // [Z, A, meta, stable, mode, t1/2(s), Q, dZ, dA, dMeta, sigFTh, sigFFast, sigCap, mod, ctrl]
-      [1,1,false,true,"Stable",Infinity,0,1,1,false,0,0,0.33,true,false],
-      [1,2,false,true,"Stable",Infinity,0,1,2,false,0,0,0.0005,true,false],
-      [1,3,false,false,"β⁻",3.888e8,0.0186,2,3,false,0,0,0,true,false],
-      [2,3,false,true,"Stable",Infinity,0,2,3,false,0,0,5330,false,false],
-      [2,4,false,true,"Stable",Infinity,0,2,4,false,0,0,0,false,false],
-      [5,10,false,true,"Stable",Infinity,0,5,10,false,0,0,3840,false,true],
-      [6,12,false,true,"Stable",Infinity,0,6,12,false,0,0,0.0035,true,false],
-      [6,14,false,false,"β⁻",1.808e11,0.156,7,14,false,0,0,0,true,false],
-      [43,99,true,false,"IT (γ)",21624,0.142,43,99,false,0,0,0,false,false],
-      [90,232,false,false,"α",4.43e17,4.08,88,228,false,0,0.07,7.4,false,false],
-      [92,233,false,false,"α",5.02e12,4.91,90,229,false,531,2.0,45,false,false],
-      [92,235,false,false,"α",2.22e16,4.68,90,231,false,585,1.2,99,false,false],
-      [92,238,false,false,"α",1.41e17,4.27,90,234,false,0,0.3,2.7,false,false],
-      [92,239,false,false,"β⁻",1407,1.26,93,239,false,0,0,22,false,false],
-      [93,239,false,false,"β⁻",203558,0.72,94,239,false,0,0,35,false,false],
-      [94,239,false,false,"α",7.61e11,5.24,92,235,false,748,1.8,270,false,false]
+      // [Z, A, meta, stable, mode, t1/2(s), Q_MeV, dZ, dA, dMeta, sigFTh, sigFFast, sigCap, mod, ctrl, nuBar, betaDel, fastThresh_eV, sfRate]
+      [1,1,false,true,"Stable",Infinity,0,1,1,false,0,0,0.332,true,false,0,0,0,0],
+      [1,2,false,true,"Stable",Infinity,0,1,2,false,0,0,0.00052,true,false,0,0,0,0],
+      [1,3,false,false,"β⁻",3.888e8,0.0186,2,3,false,0,0,0,true,false,0,0,0,0],
+      [2,3,false,true,"Stable",Infinity,0,2,3,false,0,0,5333,false,false,0,0,0,0],
+      [2,4,false,true,"Stable",Infinity,0,2,4,false,0,0,0,false,false,0,0,0,0],
+      [3,6,false,true,"Stable",Infinity,0,3,6,false,0,0,940,false,false,0,0,0,0],
+      [3,7,false,true,"Stable",Infinity,0,3,7,false,0,0,0.045,false,false,0,0,0,0],
+      [4,9,false,true,"Stable",Infinity,0,4,9,false,0,0,0.008,true,false,0,0,0,0],
+      [5,10,false,true,"Stable",Infinity,0,5,10,false,0,0,3840,false,true,0,0,0,0],
+      [5,11,false,true,"Stable",Infinity,0,5,11,false,0,0,0.005,false,false,0,0,0,0],
+      [6,12,false,true,"Stable",Infinity,0,6,12,false,0,0,0.0035,true,false,0,0,0,0],
+      [6,13,false,true,"Stable",Infinity,0,6,13,false,0,0,0.0014,true,false,0,0,0,0],
+      [6,14,false,false,"β⁻",1.808e11,0.156,7,14,false,0,0,0,true,false,0,0,0,0],
+      [7,13,false,false,"β⁺/EC",598,2.22,6,13,false,0,0,0,false,false,0,0,0,0],
+      [7,14,false,true,"Stable",Infinity,0,7,14,false,0,0,1.83,false,false,0,0,0,0],
+      [7,15,false,true,"Stable",Infinity,0,7,15,false,0,0,0.00002,false,false,0,0,0,0],
+      [8,15,false,false,"β⁺/EC",122.2,2.75,7,15,false,0,0,0,false,false,0,0,0,0],
+      [8,16,false,true,"Stable",Infinity,0,8,16,false,0,0,0.00019,true,false,0,0,0,0],
+      [27,56,false,false,"β⁺/EC",6.674e6,4.57,26,56,false,0,0,0,false,false,0,0,0,0],
+      [28,56,false,false,"β⁺/EC",5.249e5,2.13,27,56,false,0,0,0,false,false,0,0,0,0],
+      [43,99,true,false,"IT (γ)",21624,0.142,43,99,false,0,0,0,false,false,0,0,0,0],
+      [48,113,false,true,"Stable",Infinity,0,48,113,false,0,0,20600,false,true,0,0,0,0],
+      [53,135,false,false,"β⁻",23652,2.63,54,135,false,0,0,0.02,false,false,0,0,0,0],
+      [54,135,false,false,"β⁻",32904,1.16,55,135,false,0,0,2.65e6,false,true,0,0,0,0],
+      [62,149,false,true,"Stable",Infinity,0,62,149,false,0,0,40140,false,true,0,0,0,0],
+      [64,157,false,true,"Stable",Infinity,0,64,157,false,0,0,254000,false,true,0,0,0,0],
+      [72,177,false,true,"Stable",Infinity,0,72,177,false,0,0,373,false,true,0,0,0,0],
+      [90,232,false,false,"α",4.43e17,4.08,88,228,false,0,0.075,7.4,false,false,2.30,0.0203,1.4e6,1e-7],
+      [90,233,false,false,"β⁻",1308,1.24,91,233,false,0,0,1500,false,false,0,0,0,0],
+      [91,233,false,false,"β⁻",2.33e6,0.57,92,233,false,0,0,40,false,false,0,0,0,0],
+      [92,233,false,false,"α",5.02e12,4.91,90,229,false,531,1.90,45,false,false,2.49,0.0026,0,2e-6],
+      [92,235,false,false,"α",2.22e16,4.68,90,231,false,585,1.22,99,false,false,2.43,0.0065,0,3e-6],
+      [92,238,false,false,"α",1.41e17,4.27,90,234,false,0,0.31,2.68,false,false,2.79,0.0157,1.0e6,8e-6],
+      [92,239,false,false,"β⁻",1407,1.26,93,239,false,0,0,22,false,false,0,0,0,0],
+      [93,239,false,false,"β⁻",203558,0.72,94,239,false,0,0,35,false,false,0,0,0,0],
+      [94,239,false,false,"α",7.61e11,5.24,92,235,false,748,1.80,270,false,false,2.88,0.0021,0,1.2e-5],
+      [94,240,false,false,"α",2.07e11,5.26,92,236,false,0.06,1.36,290,false,false,2.80,0.0030,5e5,8e-4],
+      [94,241,false,false,"β⁻",4.53e8,0.021,95,241,false,1012,1.65,363,false,false,2.94,0.0054,0,2e-5],
+      [98,252,false,false,"SF",8.35e7,6.22,96,248,false,32,2.2,20,false,false,3.76,0.0086,0,0.045]
     ];
     for (const c of curatedIsos) {
       isoCache.set(makeIsoKey(c[0], c[1], c[2]), {
@@ -602,6 +659,8 @@
         Q_MeV: c[6], daughterZ: c[7], daughterA: c[8], daughterMeta: c[9],
         sigmaFissionThermal: c[10], sigmaFissionFast: c[11], sigmaCapture: c[12],
         isModerator: c[13], isControlAbsorber: c[14],
+        nuBar: c[15] || 0, betaDelayed: c[16] || 0,
+        fastFissThresh_eV: c[17] || 0, sfRatePerTick: c[18] || 0,
         B_per_A: bindingEnergyMeV(c[0], c[1]) / c[1],
         source: "CACHE"
       });
@@ -947,6 +1006,7 @@
           "XX|XX|XX",
           "XX|XX|XX"
         ],
+        ignoreAir: true,
         tick: function (pixel) {
           if (!pixel.isUPCS) initVoxel(pixel, Z);
           // Fallback to light vanilla gravity only when continuous kinematics are disabled
@@ -974,6 +1034,7 @@
         "XX|XX|XX",
         "XX|XX|XX"
       ],
+      ignoreAir: true,
       tick: function (pixel) {
         if (!pixel.isUPCS || !pixel.isBlackHole) initBlackHoleVoxel(pixel);
       }
@@ -1240,13 +1301,15 @@
       b.strain = Math.min(1.5, (strainEnergy + thermalKJ) / Math.max(10, b.breakEnergy));
 
       if (b.strain >= 1.0 || dist > 4.2 || pA.chi > 6 || pB.chi > 6) {
-        // Endothermic bond breaking: subtract dissociation enthalpy from local thermal energy
-        const dT = Math.min(450, b.breakEnergy * 0.35);
-        pA.temp = Math.max(-272, (pA.temp ?? 20) - dT);
-        pB.temp = Math.max(-272, (pB.temp ?? 20) - dT);
-        UPCS.ledger.E_chemical -= b.breakEnergy * 1e3;
-        UPCS.ledger.E_thermal -= b.breakEnergy * 1e3;
-        if (UPCS.sparks.length < 350) {
+        // Endothermic bond breaking: absorb the exact symmetric enthalpy released on formation
+        const dT = b.releaseDT !== undefined ? b.releaseDT : 0;
+        if (dT > 0) {
+          pA.temp = Math.max(-272, (pA.temp ?? 20) - dT);
+          pB.temp = Math.max(-272, (pB.temp ?? 20) - dT);
+          UPCS.ledger.E_chemical -= (b.netEnthalpyKJ || b.breakEnergy) * 1e3;
+          UPCS.ledger.E_thermal -= (b.netEnthalpyKJ || b.breakEnergy) * 1e3;
+        }
+        if (UPCS.sparks.length < 350 && dT > 5) {
           UPCS.sparks.push({
             x: 0.5 * (pA.x + pB.x), y: 0.5 * (pA.y + pB.y),
             vx: (Math.random() - 0.5) * 8, vy: (Math.random() - 0.5) * 8,
@@ -1275,6 +1338,7 @@
     for (let i = 0; i < activePixels.length; i++) {
       if (Math.random() > 0.25) continue;
       const pA = activePixels[i];
+      if (!pA || pA.del || pA.isBlackHole) continue;
       const elA = ELEMENTS[pA.Z];
       if (!elA || elA.valence_slots === 0 || pA.chi > 4) continue;
       const usedA = UPCS.bondCountByUid.get(pA._uid) || 0;
@@ -1285,7 +1349,7 @@
       const nx = pA.x + d[0], ny = pA.y + d[1];
       if (nx < 0 || nx >= width || ny < 0 || ny >= height || !pixelMap[nx]) continue;
       const pB = pixelMap[nx][ny];
-      if (!pB || !pB.isUPCS || pB.chi > 4) continue;
+      if (!pB || !pB.isUPCS || pB.del || pB.isBlackHole || pB.chi > 4) continue;
       const elB = ELEMENTS[pB.Z];
       if (!elB || elB.valence_slots === 0) continue;
       const usedB = UPCS.bondCountByUid.get(pB._uid) || 0;
@@ -1309,25 +1373,43 @@
         }
       }
 
-      const relV2 = (pA.vx - pB.vx) ** 2 + (pA.vy - pB.vy) ** 2;
+      const isHomo = pA.Z === pB.Z;
       const avgTempK = 0.5 * ((pA.temp ?? 20) + (pB.temp ?? 20)) + 273.15;
-      const availableE = (PHYS.R_gas * avgTempK / 1000) * 14 + relV2 * 8;
-      if (availableE >= bp.Ea_kJ * eaFactor * 0.22) {
+      const L = CONFIG.voxelSizeMeters;
+      const dt = Math.max(1e-15, CONFIG.dtSim);
+      const relVMS2 = ((pA.vx - pB.vx) ** 2 + (pA.vy - pB.vy) ** 2) * ((L / dt) ** 2);
+      // Physical kinetic energy per mole (kJ/mol) from relative velocity + thermal kT
+      const mAvgKgMol = 0.5 * (pA.A + pB.A) * 1e-3;
+      const kinKJ = Math.min(400, 0.5 * mAvgKgMol * relVMS2 * 1e-3);
+      const thermalKJ = (PHYS.R_gas * avgTempK / 1000) * 6.5;
+      const availableE = thermalKJ + kinKJ;
+      const eaThresh = bp.Ea_kJ * eaFactor * (isHomo ? 0.25 : 0.30);
+
+      if (availableE >= eaThresh) {
+        // Homonuclear lattice/diatomic bonding at equilibrium is athermal so cold blocks don't self-heat;
+        // heteronuclear reactions release only net exothermic enthalpy relative to elemental reference states.
+        let netEnthalpyKJ = 0;
+        let releaseDT = 0;
+        if (!isHomo) {
+          netEnthalpyKJ = Math.max(0, bp.breakEnergy - 0.45 * (elA.D_AA + elB.D_AA));
+          releaseDT = Math.min(350, netEnthalpyKJ * 0.45);
+        }
         UPCS.bonds.push({
           aUid: pA._uid, bUid: pB._uid,
           order: bp.order, type: bp.type,
           restLength: bp.restLength, k_bond: bp.k_bond, breakEnergy: bp.breakEnergy,
+          netEnthalpyKJ, releaseDT,
           strain: 0
         });
         UPCS.bondCountByUid.set(pA._uid, usedA + order);
         UPCS.bondCountByUid.set(pB._uid, usedB + order);
 
-        // Exothermic bond formation releases enthalpy as local heat
-        const dT = Math.min(350, bp.breakEnergy * 0.28);
-        pA.temp = (pA.temp ?? 20) + dT;
-        pB.temp = (pB.temp ?? 20) + dT;
-        UPCS.ledger.E_chemical += bp.breakEnergy * 1e3;
-        UPCS.ledger.E_thermal += bp.breakEnergy * 1e3;
+        if (releaseDT > 0) {
+          pA.temp = (pA.temp ?? 20) + releaseDT;
+          pB.temp = (pB.temp ?? 20) + releaseDT;
+          UPCS.ledger.E_chemical += netEnthalpyKJ * 1e3;
+          UPCS.ledger.E_thermal += netEnthalpyKJ * 1e3;
+        }
       }
     }
   }
@@ -1335,6 +1417,209 @@
   // ==========================================================================
   // 8. NUCLEAR FUSION, STELLAR EVOLUTION, DECAY & COMPACT REMNANTS
   // ==========================================================================
+
+  // Exact Gamow Coulomb-barrier tunneling factor normalized to reference peak temperature
+  function gamowTunnelFactor(Z1, A1, Z2, A2, tempK, refTempK) {
+    const T6 = Math.max(0.05, tempK * 1e-6);
+    const T6ref = Math.max(0.05, refTempK * 1e-6);
+    const mu = (A1 * A2) / Math.max(1, A1 + A2);
+    const c = 42.487 * Math.cbrt(Z1 * Z1 * Z2 * Z2 * mu);
+    const tau = c / Math.cbrt(T6);
+    const tauRef = c / Math.cbrt(T6ref);
+    const logRatio = 2 * Math.log(tau / tauRef) - (tau - tauRef);
+    if (logRatio < -40) return 0;
+    return Math.min(25, Math.exp(Math.min(4, logRatio)));
+  }
+
+  // Locate a live reactant partner either inside p.stored_voxels or in the 8-neighborhood
+  function findFusionPartner(p, targetZ, targetA, excludePixel) {
+    if (p.stored_voxels && p.stored_voxels.length > 0) {
+      for (let k = 0; k < p.stored_voxels.length; k++) {
+        const sv = p.stored_voxels[k];
+        if (sv.Z === targetZ && (targetA === null || sv.A === targetA)) {
+          return { kind: "stored", idx: k, sv };
+        }
+      }
+    }
+    const start = (Math.random() * 8) | 0;
+    const dirs = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[-1,1],[1,-1],[-1,-1]];
+    for (let d = 0; d < 8; d++) {
+      const dir = dirs[(start + d) & 7];
+      const nx = p.x + dir[0], ny = p.y + dir[1];
+      if (nx < 0 || nx >= width || ny < 0 || ny >= height || !pixelMap[nx]) continue;
+      const q = pixelMap[nx][ny];
+      if (!q || q === p || q === excludePixel || !q.isUPCS || q.del || q.isBlackHole) continue;
+      if (q.Z === targetZ && (targetA === null || q.A === targetA)) {
+        return { kind: "pixel", q };
+      }
+    }
+    return null;
+  }
+
+  // Consume a merged reactant partner while conserving momentum and all packed stored_voxels
+  function consumeFusionPartner(p, partner) {
+    if (!partner) return;
+    if (partner.kind === "stored") {
+      if (p.stored_voxels && partner.idx >= 0 && partner.idx < p.stored_voxels.length) {
+        p.stored_voxels.splice(partner.idx, 1);
+      }
+      return;
+    }
+    const q = partner.q;
+    if (!q || q.del) return;
+    const m1 = Math.max(1e-30, getTotalMassKg(p));
+    const m2 = Math.max(1e-30, getTotalMassKg(q));
+    p.vx = (m1 * (p.vx || 0) + m2 * (q.vx || 0)) / (m1 + m2);
+    p.vy = (m1 * (p.vy || 0) + m2 * (q.vy || 0)) / (m1 + m2);
+    if (q.stored_voxels && q.stored_voxels.length > 0) {
+      if (!p.stored_voxels) p.stored_voxels = [];
+      for (let k = 0; k < q.stored_voxels.length; k++) {
+        if (p.stored_voxels.length < CONFIG.maxStoredPerCell) {
+          p.stored_voxels.push(q.stored_voxels[k]);
+        }
+      }
+      q.stored_voxels.length = 0;
+    }
+    if (typeof deletePixel === "function") deletePixel(q.x, q.y);
+    q.del = true;
+  }
+
+  // Place a nuclear reaction product in an adjacent empty cell, or pack into host.stored_voxels so no nucleon is ever lost
+  function spawnOrPackNuclide(hostP, Z, A, tempC, kickVx, kickVy) {
+    Z = Math.max(1, Math.min(118, Z | 0));
+    A = Math.max(Z, Math.min(350, A | 0));
+    const dirs = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[-1,1],[1,-1],[-1,-1]];
+    const start = (Math.random() * 8) | 0;
+    for (let d = 0; d < 8; d++) {
+      const dir = dirs[(start + d) & 7];
+      const nx = hostP.x + dir[0], ny = hostP.y + dir[1];
+      if (nx >= 0 && nx < width && ny >= 0 && ny < height && typeof isEmpty === "function" && isEmpty(nx, ny)) {
+        const key = ELEMENT_KEY_BY_Z[Z];
+        if (key && typeof createPixel === "function") {
+          createPixel(key, nx, ny);
+          const q = pixelMap[nx] && pixelMap[nx][ny];
+          if (q) {
+            initVoxel(q, Z);
+            q.A = A;
+            q.is_metastable = false;
+            q.temp = tempC;
+            q.vx = (hostP.vx || 0) + kickVx;
+            q.vy = (hostP.vy || 0) + kickVy;
+            return q;
+          }
+        }
+      }
+    }
+    if (!hostP.stored_voxels) hostP.stored_voxels = [];
+    if (hostP.stored_voxels.length < CONFIG.maxStoredPerCell) {
+      hostP.stored_voxels.push({
+        Z, A, is_metastable: false,
+        mass: getRestMassKg(Z, A),
+        temp: tempC,
+        vx: (hostP.vx || 0) + kickVx,
+        vy: (hostP.vy || 0) + kickVy,
+        charge: 0, mx: 0, my: 0
+      });
+    }
+    return null;
+  }
+
+  function applyNuclearFusionHeat(p, qOpt, Q_total_MeV, Q_local_MeV) {
+    const Q_tot = Math.max(0, Q_total_MeV);
+    const Q_loc = Math.max(0, Q_local_MeV);
+    const Q_esc = Math.max(0, Q_tot - Q_loc);
+    UPCS.ledger.E_nuclear -= Q_tot * PHYS.MeV_to_J;
+    UPCS.ledger.E_thermal += Q_loc * PHYS.MeV_to_J;
+    UPCS.ledger.E_radiated += Q_esc * PHYS.MeV_to_J;
+    const dT = Math.min(2.2e7, Q_loc * 3.8e5);
+    if (qOpt && !qOpt.del) {
+      p.temp = Math.min(6e9, (p.temp ?? 20) + dT * 0.5);
+      qOpt.temp = Math.min(6e9, (qOpt.temp ?? 20) + dT * 0.5);
+    } else {
+      p.temp = Math.min(6e9, (p.temp ?? 20) + dT);
+    }
+  }
+
+  // Watt fission neutron spectrum sampler (mean ~2.0 MeV, physical range 0.15 - 8.5 MeV)
+  function sampleWattNeutronEnergy() {
+    const u1 = Math.max(1e-6, Math.random());
+    const u2 = Math.max(1e-6, Math.random());
+    const u3 = Math.random();
+    const g = -Math.log(u1 * u2); // Gamma(2,1), mean = 2
+    const E_MeV = Math.max(0.15, Math.min(8.5, 0.965 * g * (0.75 + 0.5 * u3)));
+    return E_MeV * 1e6;
+  }
+
+  // Sample exact prompt + delayed fission multiplicity around isotope nuBar
+  function sampleFissionNu(nuBar) {
+    const mean = nuBar > 0 ? nuBar : 2.43;
+    const base = Math.floor(mean);
+    let nu = base + (Math.random() < (mean - base) ? 1 : 0);
+    const r = Math.random();
+    if (r < 0.14) nu -= 1;
+    else if (r > 0.86) nu += 1;
+    return Math.max(1, Math.min(5, nu));
+  }
+
+  // Shared exact asymmetric double-humped fission event (used by both induced & spontaneous fission)
+  function performFissionEvent(p, iso, isSpontaneous) {
+    const Zc = p.Z;
+    const Ac = isSpontaneous ? p.A : (p.A + 1);
+    const nu = sampleFissionNu(iso.nuBar);
+
+    // Gaussian double-humped heavy peak centered on N=82 / Sn-132 shell closure (A_H ~ 138.5 +/- 4.5)
+    const u1 = Math.max(1e-6, Math.random());
+    const u2 = Math.random();
+    const gNorm = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+    const maxAH = Math.max(126, Ac - nu - 72);
+    const minAH = Math.min(maxAH, 128);
+    const dA_H = Math.max(minAH, Math.min(maxAH, Math.round(138.5 + gNorm * 4.5)));
+    const dA_L = Math.max(60, Ac - nu - dA_H);
+
+    // Unchanged Charge Distribution (UCD) with slight neutron-rich heavy fragment polarization
+    const idealZH = Zc * (dA_H / Math.max(1, dA_H + dA_L)) - 0.5 + (Math.random() - 0.5) * 1.2;
+    const dZ_H = Math.max(46, Math.min(Zc - 28, Math.round(idealZH)));
+    const dZ_L = Math.max(1, Zc - dZ_H);
+
+    // Exact fission Q-value from nuclear binding energies
+    const B_init = bindingEnergyMeV(p.Z, p.A);
+    const B_frag = bindingEnergyMeV(dZ_L, dA_L) + bindingEnergyMeV(dZ_H, dA_H);
+    const Q_MeV = Math.max(160, Math.min(240, B_frag - B_init));
+    const Q_fragKE = Q_MeV * 0.84; // ~168 MeV deposited locally as fission fragment kinetic heat
+    const dT_each = Math.min(2.8e4, Q_fragKE * 62);
+
+    const rAng = Math.random() * Math.PI * 2;
+    const kickL = 3.2 * (dA_H / Math.max(1, dA_L + dA_H));
+    const kickH = 3.2 * (dA_L / Math.max(1, dA_L + dA_H));
+
+    // Mutate host voxel into light fission fragment, and spawn or pack heavy fragment (zero lost daughters!)
+    mutateVoxelElement(p, dZ_L, dA_L, false);
+    p.temp = Math.min(2e8, (p.temp ?? 20) + dT_each);
+    p.vx += Math.cos(rAng) * kickL;
+    p.vy += Math.sin(rAng) * kickL;
+
+    spawnOrPackNuclide(p, dZ_H, dA_H, p.temp, -Math.cos(rAng) * kickH, -Math.sin(rAng) * kickH);
+
+    // Emit nu neutrons using exact isotope delayed fraction beta (preserving U-235 > U-233 > Pu-239 ordering)
+    const effBeta = Math.min(0.08, (iso.betaDelayed || 0.0065) * 3.0);
+    for (let k = 0; k < nu; k++) {
+      if (Math.random() < effBeta) {
+        UPCS.delayedNeutrons.push({
+          x: p.x, y: p.y,
+          timer: 40 + ((Math.random() * 110) | 0),
+          energy_eV: 4.5e5 // Delayed neutrons are softer (~0.45 MeV)
+        });
+      } else {
+        spawnNeutron(p.x, p.y, sampleWattNeutronEnergy());
+      }
+    }
+
+    UPCS.ledger.E_nuclear -= Q_MeV * PHYS.MeV_to_J;
+    UPCS.ledger.E_thermal += Q_fragKE * PHYS.MeV_to_J;
+    UPCS.ledger.E_radiated += (Q_MeV - Q_fragKE) * PHYS.MeV_to_J;
+    emitPhoton(p.x, p.y, 18000, 0.9);
+  }
+
   function stepNuclearAndAstrophysics(activePixels) {
     const dt = CONFIG.dtSim;
     const L = CONFIG.voxelSizeMeters;
@@ -1391,7 +1676,7 @@
       const tempK = Math.max(0.5, (p.temp ?? 20) + 273.15);
       const chi = p.chi || 1.0;
 
-      // Gentle shear heating only for fast-orbiting matter skimming close to a black hole
+      // Physical viscous shear heating for high-speed matter skimming a black hole horizon
       for (let b = 0; b < UPCS.blackHoles.length; b++) {
         const bh = UPCS.blackHoles[b];
         if (!bh || bh.del) continue;
@@ -1403,119 +1688,400 @@
           const rvy = (p.vy || 0) - (bh.vy || 0);
           const tangV = Math.abs((-dy * rvx + dx * rvy) / Math.max(0.5, r));
           if (tangV > 0.6) {
-            p.temp = Math.min(1e9, (p.temp ?? 20) + tangV * tangV * 120);
+            const vTangMS = tangV * (L / Math.max(1e-15, dt));
+            const th = getThermoProps(p.Z, p.A, tempK, chi);
+            const dT_shear = Math.min(5e6, (0.015 * vTangMS * vTangMS) / Math.max(100, th.C_v));
+            if (Number.isFinite(dT_shear) && dT_shear > 0.01) {
+              p.temp = Math.min(1e9, (p.temp ?? 20) + dT_shear);
+            }
           }
         }
       }
 
-      // --- Radioactive Decay (Isotope Flag Driven) ---
-      if (CONFIG.enableDecay && Math.random() < 0.08) {
-        const iso = getIsotopeParams(p.Z, p.A, p.is_metastable);
-        if (!iso.stable && iso.halfLifeSec < 1e20) {
-          const lambda = 0.693147 / Math.max(1e-6, iso.halfLifeSec);
-          const prob = 1 - Math.exp(-lambda * Math.max(dt, 0.05) * 12);
-          if (Math.random() < prob) {
-            const heatDelta = Math.min(2500, iso.Q_MeV * 180);
+      // --- Spontaneous Fission Startup Neutrons & Radioactive Decay ---
+      const iso = (CONFIG.enableDecay || CONFIG.enableFission) ? getIsotopeParams(p.Z, p.A, p.is_metastable) : null;
+
+      if (CONFIG.enableFission && iso && iso.sfRatePerTick > 0) {
+        if (Math.random() < iso.sfRatePerTick) {
+          if (p.Z === 98 && p.A === 252) {
+            // Cf-252 intense spontaneous fission neutron startup source (preserves source voxel most ticks)
+            const nu = sampleFissionNu(iso.nuBar);
+            for (let k = 0; k < nu; k++) spawnNeutron(p.x, p.y, sampleWattNeutronEnergy());
+            p.temp = (p.temp ?? 20) + 12;
+            if (Math.random() < 0.015) performFissionEvent(p, iso, true);
+          } else {
+            // Rare self-initiation neutron from Pu-240 / Pu-239 / U-235 / U-238
+            spawnNeutron(p.x, p.y, sampleWattNeutronEnergy());
+          }
+        }
+      }
+
+      if (CONFIG.enableDecay && iso && !iso.stable && iso.halfLifeSec < 1e20 && Math.random() < 0.08) {
+        const lambda = 0.693147 / Math.max(1e-6, iso.halfLifeSec);
+        const prob = 1 - Math.exp(-lambda * Math.max(dt, 0.05) * 12);
+        if (Math.random() < prob) {
+          if (iso.decayMode === "SF") {
+            performFissionEvent(p, iso, true);
+          } else {
+            const heatDelta = Math.min(2500, iso.Q_MeV * 150);
             p.temp = (p.temp ?? 20) + heatDelta;
             UPCS.ledger.E_nuclear -= iso.Q_MeV * PHYS.MeV_to_J;
             UPCS.ledger.E_thermal += iso.Q_MeV * PHYS.MeV_to_J;
-            if (iso.decayMode === "SF") {
-              // Spontaneous fission emits prompt neutrons
-              spawnNeutron(p.x, p.y, 2e6);
-              spawnNeutron(p.x, p.y, 2e6);
-              mutateVoxelElement(p, 36, 92, false);
-            } else {
-              mutateVoxelElement(p, iso.daughterZ, iso.daughterA, iso.daughterMeta);
-            }
+            mutateVoxelElement(p, iso.daughterZ, iso.daughterA, iso.daughterMeta);
           }
         }
       }
 
-      // --- Nuclear Fusion & Stellar Evolution (Emergent from T, chi, Z, A) ---
-      if (CONFIG.enableFusion && tempK >= 1.5e6) {
+      // --- Accurate Nuclear Fusion & Stellar Nucleosynthesis (Gamow Tunneling + Strict Z/A Conservation) ---
+      if (CONFIG.enableFusion && tempK >= 1.5e6 && !p.del) {
         const rateMult = CONFIG.fusionRateMult * Math.min(10, chi);
         const Z = p.Z, A = p.A;
+        let fused = false;
 
-        // 1. D-T & D-D Low-Barrier Fusion (Hydrogen-2 / Hydrogen-3)
-        if (Z === 1 && (A === 2 || A === 3) && tempK >= 1.5e6) {
-          const prob = Math.min(0.35, 0.015 * rateMult * Math.pow(tempK / 1.5e7, 2));
-          if (Math.random() < prob) {
-            if (A === 3) {
-              // D + T -> He-4 + 14.1 MeV fast neutron
+        // 1. D + T -> He-4 + n (14.07 MeV) [Lowest Coulomb barrier; peaks ~150 MK, ignites >= 15 MK]
+        if (!fused && Z === 1 && (A === 2 || A === 3) && tempK >= 5e6) {
+          const needA = A === 2 ? 3 : 2;
+          const partner = findFusionPartner(p, 1, needA, null);
+          if (partner) {
+            const gFac = gamowTunnelFactor(1, 2, 1, 3, tempK, 1.5e8);
+            const prob = Math.min(0.45, 0.14 * rateMult * gFac);
+            if (Math.random() < prob) {
+              const Q = bindingEnergyMeV(2, 4) - (bindingEnergyMeV(1, 2) + bindingEnergyMeV(1, 3)); // 17.589 MeV
+              consumeFusionPartner(p, partner);
               mutateVoxelElement(p, 2, 4, false);
-              p.temp += 1.8e6;
-              spawnNeutron(p.x, p.y, 1.41e7);
-            } else {
-              // D + D -> He-3 + n OR H-3 + p
-              if (Math.random() < 0.5) { mutateVoxelElement(p, 2, 3, false); spawnNeutron(p.x, p.y, 2.45e6); }
-              else { mutateVoxelElement(p, 1, 3, false); }
-              p.temp += 8.5e5;
+              spawnNeutron(p.x, p.y, 1.407e7); // 14.07 MeV fast fusion neutron (80% of Q)
+              applyNuclearFusionHeat(p, null, Q, Q * 0.20); // 3.52 MeV alpha heats plasma locally
+              emitPhoton(p.x, p.y, tempK, 0.9);
+              fused = true;
             }
-            UPCS.ledger.E_nuclear -= 17.6 * PHYS.MeV_to_J;
-            UPCS.ledger.E_thermal += 17.6 * PHYS.MeV_to_J;
           }
         }
-        // 2. Main Sequence Hydrogen Burning (p-p Chain T >= 4e6 K & CNO Cycle T >= 1.5e7 K)
-        else if (Z === 1 && A === 1 && tempK >= 4e6) {
-          const hasCarbonNeighbor = hasNeighborZ(p.x, p.y, 6);
-          const epsPP = 0.0008 * rateMult * Math.pow(tempK / 1.5e7, 4);
-          const epsCNO = (hasCarbonNeighbor && tempK >= 1.5e7) ? 0.004 * rateMult * Math.pow(tempK / 2e7, 8) : 0;
-          if (Math.random() < Math.min(0.18, epsPP + epsCNO)) {
-            // Mutate H-1 -> H-2 -> He-3 -> He-4 progressively
-            if (Math.random() < 0.45) mutateVoxelElement(p, 1, 2, false);
-            else mutateVoxelElement(p, 2, 4, false);
-            p.temp += 1.4e6;
-            UPCS.ledger.E_nuclear -= 26.7 * PHYS.MeV_to_J;
-            UPCS.ledger.E_thermal += 26.7 * PHYS.MeV_to_J;
-            emitPhoton(p.x, p.y, tempK, 1.0);
+
+        // 2. D + He-3 -> He-4 + H-1 (18.353 MeV aneutronic) [Ignites >= 40 MK]
+        if (!fused && ((Z === 1 && A === 2) || (Z === 2 && A === 3)) && tempK >= 3e7) {
+          const partner = (Z === 1) ? findFusionPartner(p, 2, 3, null) : findFusionPartner(p, 1, 2, null);
+          if (partner) {
+            const gFac = gamowTunnelFactor(1, 2, 2, 3, tempK, 5e8);
+            const prob = Math.min(0.32, 0.08 * rateMult * gFac);
+            if (Math.random() < prob) {
+              const Q = bindingEnergyMeV(2, 4) - (bindingEnergyMeV(1, 2) + bindingEnergyMeV(2, 3)); // 18.353 MeV
+              if (partner.kind === "pixel") {
+                mutateVoxelElement(p, 2, 4, false);
+                mutateVoxelElement(partner.q, 1, 1, false);
+                applyNuclearFusionHeat(p, partner.q, Q, Q); // 100% charged products!
+              } else {
+                consumeFusionPartner(p, partner);
+                mutateVoxelElement(p, 2, 4, false);
+                spawnOrPackNuclide(p, 1, 1, p.temp ?? 20, (Math.random() - 0.5) * 2, (Math.random() - 0.5) * 2);
+                applyNuclearFusionHeat(p, null, Q, Q);
+              }
+              fused = true;
+            }
           }
         }
-        // 3. Helium Burning / Triple-Alpha Process (T >= 1e8 K) & Helium Flash
-        else if (Z === 2 && A === 4 && tempK >= 1e8 && chi >= 1.8) {
-          const flashBoost = chi > 4.0 ? 3.5 : 1.0; // Electron-degenerate Helium Flash
-          const prob = Math.min(0.25, 0.004 * rateMult * flashBoost * Math.pow(tempK / 1e8, 5));
-          if (Math.random() < prob) {
-            mutateVoxelElement(p, 6, 12, false);
-            p.temp += 3.5e6 * flashBoost;
-            UPCS.ledger.E_nuclear -= 7.27 * PHYS.MeV_to_J;
-            UPCS.ledger.E_thermal += 7.27 * PHYS.MeV_to_J;
+
+        // 3. D + D -> He-3 + n (2.45 MeV, 50%) OR H-3 + H-1 (4.033 MeV, 50%)
+        if (!fused && Z === 1 && A === 2 && tempK >= 1.5e7) {
+          const partner = findFusionPartner(p, 1, 2, null);
+          if (partner) {
+            const gFac = gamowTunnelFactor(1, 2, 1, 2, tempK, 2e8);
+            const prob = Math.min(0.28, 0.05 * rateMult * gFac);
+            if (Math.random() < prob) {
+              if (Math.random() < 0.5) {
+                const Q = bindingEnergyMeV(2, 3) - 2 * bindingEnergyMeV(1, 2); // 3.269 MeV
+                consumeFusionPartner(p, partner);
+                mutateVoxelElement(p, 2, 3, false);
+                spawnNeutron(p.x, p.y, 2.45e6);
+                applyNuclearFusionHeat(p, null, Q, Q * 0.25); // 0.82 MeV He-3 recoil
+              } else {
+                const Q = bindingEnergyMeV(1, 3) - 2 * bindingEnergyMeV(1, 2); // 4.033 MeV
+                if (partner.kind === "pixel") {
+                  mutateVoxelElement(p, 1, 3, false);
+                  mutateVoxelElement(partner.q, 1, 1, false);
+                  applyNuclearFusionHeat(p, partner.q, Q, Q);
+                } else {
+                  consumeFusionPartner(p, partner);
+                  mutateVoxelElement(p, 1, 3, false);
+                  spawnOrPackNuclide(p, 1, 1, p.temp ?? 20, (Math.random() - 0.5) * 2, (Math.random() - 0.5) * 2);
+                  applyNuclearFusionHeat(p, null, Q, Q);
+                }
+              }
+              fused = true;
+            }
           }
         }
-        // 4. Carbon Burning (T >= 5e8 K): C-12 -> O-16 / Ne-20 / Mg-24
-        else if (Z === 6 && tempK >= 5e8) {
-          if (Math.random() < Math.min(0.22, 0.01 * rateMult)) {
-            const r = Math.random();
-            if (r < 0.35) mutateVoxelElement(p, 8, 16, false);
-            else if (r < 0.72) mutateVoxelElement(p, 10, 20, false);
-            else mutateVoxelElement(p, 12, 24, false);
-            p.temp += 8e6;
+
+        // 4. Proton-Proton (p-p I) Chain (strict 2-body conservation):
+        //    Step A: H-1 + H-1 -> H-2 + e+ + nu_e (Q = 1.442 MeV including e+e- annihilation)
+        //    Step B: H-2 + H-1 -> He-3 + gamma (Q = 5.493 MeV, fast once D forms)
+        //    Step C: He-3 + He-3 -> He-4 + 2 H-1 (Q = 12.860 MeV)
+        if (!fused && Z === 1 && A === 2 && tempK >= 1.5e6) {
+          const pH = findFusionPartner(p, 1, 1, null);
+          if (pH) {
+            const gFac = gamowTunnelFactor(1, 2, 1, 1, tempK, 1.5e7);
+            if (Math.random() < Math.min(0.30, 0.04 * rateMult * gFac)) {
+              const Q = bindingEnergyMeV(2, 3) - bindingEnergyMeV(1, 2); // 5.493 MeV
+              consumeFusionPartner(p, pH);
+              mutateVoxelElement(p, 2, 3, false);
+              applyNuclearFusionHeat(p, null, Q, Q);
+              emitPhoton(p.x, p.y, tempK, 0.8);
+              fused = true;
+            }
           }
         }
-        // 5. Neon Burning (T >= 1.2e9 K)
-        else if (Z === 10 && tempK >= 1.2e9) {
-          if (Math.random() < Math.min(0.25, 0.015 * rateMult)) {
-            mutateVoxelElement(p, Math.random() < 0.5 ? 8 : 12, Math.random() < 0.5 ? 16 : 24, false);
-            p.temp += 1.2e7;
+        if (!fused && Z === 2 && A === 3 && tempK >= 8e6) {
+          const pHe3 = findFusionPartner(p, 2, 3, null);
+          if (pHe3) {
+            const gFac = gamowTunnelFactor(2, 3, 2, 3, tempK, 1.5e7);
+            if (Math.random() < Math.min(0.24, 0.03 * rateMult * gFac)) {
+              const Q = bindingEnergyMeV(2, 4) - 2 * bindingEnergyMeV(2, 3); // 12.860 MeV
+              if (pHe3.kind === "pixel") {
+                mutateVoxelElement(p, 2, 4, false);
+                mutateVoxelElement(pHe3.q, 1, 1, false);
+                spawnOrPackNuclide(p, 1, 1, p.temp ?? 20, (Math.random() - 0.5) * 1.5, (Math.random() - 0.5) * 1.5);
+                applyNuclearFusionHeat(p, pHe3.q, Q, Q);
+              } else {
+                consumeFusionPartner(p, pHe3);
+                mutateVoxelElement(p, 2, 4, false);
+                spawnOrPackNuclide(p, 1, 1, p.temp ?? 20, 0.8, 0.4);
+                spawnOrPackNuclide(p, 1, 1, p.temp ?? 20, -0.8, -0.4);
+                applyNuclearFusionHeat(p, null, Q, Q);
+              }
+              emitPhoton(p.x, p.y, tempK, 1.0);
+              fused = true;
+            }
           }
         }
-        // 6. Oxygen Burning (T >= 1.5e9 K): O-16 -> Si-28 / S-32
-        else if (Z === 8 && tempK >= 1.5e9) {
-          if (Math.random() < Math.min(0.28, 0.02 * rateMult)) {
-            if (Math.random() < 0.65) mutateVoxelElement(p, 14, 28, false);
-            else mutateVoxelElement(p, 16, 32, false);
-            p.temp += 2e7;
+        if (!fused && Z === 1 && A === 1 && tempK >= 4e6) {
+          const pH = findFusionPartner(p, 1, 1, null);
+          if (pH) {
+            const gFac = gamowTunnelFactor(1, 1, 1, 1, tempK, 1.5e7);
+            // Weak-interaction bottleneck makes p+p much slower than D+p (T^4 behavior around 15 MK)
+            if (Math.random() < Math.min(0.08, 0.004 * rateMult * gFac)) {
+              const Q_tot = 1.442; // 0.420 MeV kinetic + 1.022 MeV e+e- annihilation
+              const Q_loc = 1.180; // ~0.26 MeV carried away by pp neutrino
+              consumeFusionPartner(p, pH);
+              mutateVoxelElement(p, 1, 2, false);
+              applyNuclearFusionHeat(p, null, Q_tot, Q_loc);
+              emitPhoton(p.x, p.y, tempK, 0.7);
+              fused = true;
+            }
           }
         }
-        // 7. Silicon Burning (T >= 2.7e9 K): Si-28 / S-32 / Mg-24 -> Fe-56 / Ni-56
-        else if ((Z === 14 || Z === 16 || Z === 12) && tempK >= 2.7e9) {
-          if (Math.random() < Math.min(0.32, 0.03 * rateMult)) {
-            if (Math.random() < 0.6) mutateVoxelElement(p, 26, 56, false);
-            else mutateVoxelElement(p, 28, 56, false);
-            p.temp += 2.5e7;
+
+        // 5. Real 4-Step Catalytic CNO-I Cycle (T >= 1.5e7 K; catalyst conserved, steep Gamow ~ T^16)
+        //    C-12 + p -> N-13 (+1.94 MeV) --[b+]--> C-13
+        //    C-13 + p -> N-14 (+7.55 MeV)
+        //    N-14 + p -> O-15 (+7.29 MeV) --[b+]--> N-15
+        //    N-15 + p -> C-12 + He-4 (+4.97 MeV)
+        if (!fused && tempK >= 1.5e7 && ((Z === 6 && (A === 12 || A === 13)) || (Z === 7 && (A === 14 || A === 15)))) {
+          const pH = findFusionPartner(p, 1, 1, null);
+          if (pH) {
+            const gFac = gamowTunnelFactor(Z, A, 1, 1, tempK, 2.2e7);
+            const rateBase = (Z === 7 && A === 14) ? 0.012 : 0.035; // N-14(p,g) is the rate-limiting step
+            if (Math.random() < Math.min(0.25, rateBase * rateMult * gFac)) {
+              if (Z === 6 && A === 12) {
+                const Q = bindingEnergyMeV(7, 13) - bindingEnergyMeV(6, 12); // 1.944 MeV
+                consumeFusionPartner(p, pH);
+                mutateVoxelElement(p, 7, 13, false);
+                applyNuclearFusionHeat(p, null, Q, Q);
+              } else if (Z === 6 && A === 13) {
+                const Q = bindingEnergyMeV(7, 14) - bindingEnergyMeV(6, 13); // 7.551 MeV
+                consumeFusionPartner(p, pH);
+                mutateVoxelElement(p, 7, 14, false);
+                applyNuclearFusionHeat(p, null, Q, Q);
+              } else if (Z === 7 && A === 14) {
+                const Q = bindingEnergyMeV(8, 15) - bindingEnergyMeV(7, 14); // 7.297 MeV
+                consumeFusionPartner(p, pH);
+                mutateVoxelElement(p, 8, 15, false);
+                applyNuclearFusionHeat(p, null, Q, Q);
+              } else { // N-15 + p -> C-12 + He-4 (catalyst regenerated!)
+                const Q = (bindingEnergyMeV(6, 12) + bindingEnergyMeV(2, 4)) - bindingEnergyMeV(7, 15); // 4.965 MeV
+                if (pH.kind === "pixel") {
+                  mutateVoxelElement(p, 6, 12, false);
+                  mutateVoxelElement(pH.q, 2, 4, false);
+                  applyNuclearFusionHeat(p, pH.q, Q, Q);
+                } else {
+                  consumeFusionPartner(p, pH);
+                  mutateVoxelElement(p, 6, 12, false);
+                  spawnOrPackNuclide(p, 2, 4, p.temp ?? 20, (Math.random() - 0.5) * 1.5, (Math.random() - 0.5) * 1.5);
+                  applyNuclearFusionHeat(p, null, Q, Q);
+                }
+              }
+              emitPhoton(p.x, p.y, tempK, 1.0);
+              fused = true;
+            }
           }
         }
-        // 8. Core-Collapse Supernova: Endothermic Fe-56 / Ni-56 Photodisintegration (T >= 5e9 K)
-        else if ((Z === 26 || Z === 28) && tempK >= 5e9 && chi >= 3.0) {
+
+        // 6. Aneutronic Light-Ion Fusion: p + Li-7 -> 2 He-4 (17.346 MeV) & p + B-11 -> 3 He-4 (8.682 MeV)
+        if (!fused && Z === 3 && A === 7 && tempK >= 2.5e6) {
+          const pH = findFusionPartner(p, 1, 1, null);
+          if (pH) {
+            const gFac = gamowTunnelFactor(3, 7, 1, 1, tempK, 1e8);
+            if (Math.random() < Math.min(0.25, 0.05 * rateMult * gFac)) {
+              const Q = 2 * bindingEnergyMeV(2, 4) - bindingEnergyMeV(3, 7); // 17.346 MeV
+              if (pH.kind === "pixel") {
+                mutateVoxelElement(p, 2, 4, false);
+                mutateVoxelElement(pH.q, 2, 4, false);
+                applyNuclearFusionHeat(p, pH.q, Q, Q);
+              } else {
+                consumeFusionPartner(p, pH);
+                mutateVoxelElement(p, 2, 4, false);
+                spawnOrPackNuclide(p, 2, 4, p.temp ?? 20, (Math.random() - 0.5) * 2, (Math.random() - 0.5) * 2);
+                applyNuclearFusionHeat(p, null, Q, Q);
+              }
+              fused = true;
+            }
+          }
+        }
+        if (!fused && Z === 5 && A === 11 && tempK >= 1.5e8) {
+          const pH = findFusionPartner(p, 1, 1, null);
+          if (pH) {
+            const gFac = gamowTunnelFactor(5, 11, 1, 1, tempK, 6e8);
+            if (Math.random() < Math.min(0.22, 0.04 * rateMult * gFac)) {
+              const Q = 3 * bindingEnergyMeV(2, 4) - bindingEnergyMeV(5, 11); // 8.682 MeV
+              if (pH.kind === "pixel") {
+                mutateVoxelElement(p, 2, 4, false);
+                mutateVoxelElement(pH.q, 2, 4, false);
+                spawnOrPackNuclide(p, 2, 4, p.temp ?? 20, (Math.random() - 0.5) * 2, (Math.random() - 0.5) * 2);
+                applyNuclearFusionHeat(p, pH.q, Q, Q);
+              } else {
+                consumeFusionPartner(p, pH);
+                mutateVoxelElement(p, 2, 4, false);
+                spawnOrPackNuclide(p, 2, 4, p.temp ?? 20, 1.0, 0.5);
+                spawnOrPackNuclide(p, 2, 4, p.temp ?? 20, -1.0, -0.5);
+                applyNuclearFusionHeat(p, null, Q, Q);
+              }
+              fused = true;
+            }
+          }
+        }
+
+        // 7. Triple-Alpha Process: 3 He-4 -> C-12 (7.275 MeV) [Requires 2 He-4 partners; T >= 1e8 K]
+        if (!fused && Z === 2 && A === 4 && tempK >= 1e8 && chi >= 1.5) {
+          const h1 = findFusionPartner(p, 2, 4, null);
+          const h2 = h1 ? findFusionPartner(p, 2, 4, h1.kind === "pixel" ? h1.q : null) : null;
+          if (h1 && h2 && !(h1.kind === "stored" && h2.kind === "stored" && h1.idx === h2.idx)) {
+            const flashBoost = chi > 4.0 ? 3.0 : 1.0; // Electron-degenerate Helium Flash
+            const gFac = gamowTunnelFactor(2, 4, 4, 8, tempK, 1.5e8);
+            if (Math.random() < Math.min(0.24, 0.018 * rateMult * flashBoost * gFac)) {
+              const Q = bindingEnergyMeV(6, 12) - 3 * bindingEnergyMeV(2, 4); // 7.275 MeV
+              // Consume higher stored index first if both are stored
+              if (h1.kind === "stored" && h2.kind === "stored") {
+                const hi = Math.max(h1.idx, h2.idx), lo = Math.min(h1.idx, h2.idx);
+                p.stored_voxels.splice(hi, 1);
+                p.stored_voxels.splice(lo, 1);
+              } else {
+                consumeFusionPartner(p, h1);
+                consumeFusionPartner(p, h2);
+              }
+              mutateVoxelElement(p, 6, 12, false);
+              applyNuclearFusionHeat(p, null, Q, Q * flashBoost);
+              emitPhoton(p.x, p.y, tempK, 1.0);
+              fused = true;
+            }
+          }
+        }
+
+        // 8. Alpha-Capture Ladder: C-12 -> O-16 -> Ne-20 -> Mg-24 -> Si-28 -> S-32 -> Ar-36 -> Ca-40 -> Ti-44 -> Cr-48 -> Fe-52 -> Ni-56
+        if (!fused && (Z & 1) === 0 && Z >= 6 && Z <= 26 && A === 2 * Z && tempK >= 1.2e8) {
+          const alphaMinT = Z === 6 ? 1.2e8 : Z === 8 ? 2.5e8 : Z === 10 ? 8e8 : Z === 12 ? 1.4e9 : Z === 14 ? 2.2e9 : 2.6e9;
+          if (tempK >= alphaMinT) {
+            const pAlpha = findFusionPartner(p, 2, 4, null);
+            if (pAlpha) {
+              const gFac = gamowTunnelFactor(Z, A, 2, 4, tempK, alphaMinT * 1.4);
+              if (Math.random() < Math.min(0.25, 0.03 * rateMult * gFac)) {
+                const nZ = Z + 2, nA = A + 4;
+                const Q = bindingEnergyMeV(nZ, nA) - (bindingEnergyMeV(Z, A) + bindingEnergyMeV(2, 4));
+                if (Q > 0) {
+                  consumeFusionPartner(p, pAlpha);
+                  mutateVoxelElement(p, nZ, nA, false);
+                  applyNuclearFusionHeat(p, null, Q, Q);
+                  fused = true;
+                }
+              }
+            }
+          }
+        }
+
+        // 9. Carbon Burning (T >= 5e8 K): C-12 + C-12 -> Ne-20 + He-4 (4.62 MeV) OR Na-23 + H-1 (2.24 MeV)
+        if (!fused && Z === 6 && A === 12 && tempK >= 5e8) {
+          const pC = findFusionPartner(p, 6, 12, null);
+          if (pC) {
+            const gFac = gamowTunnelFactor(6, 12, 6, 12, tempK, 8e8);
+            if (Math.random() < Math.min(0.22, 0.025 * rateMult * gFac)) {
+              const branchAlpha = Math.random() < 0.55;
+              const oZ1 = branchAlpha ? 10 : 11, oA1 = branchAlpha ? 20 : 23;
+              const oZ2 = branchAlpha ? 2 : 1, oA2 = branchAlpha ? 4 : 1;
+              const Q = (bindingEnergyMeV(oZ1, oA1) + bindingEnergyMeV(oZ2, oA2)) - 2 * bindingEnergyMeV(6, 12);
+              if (pC.kind === "pixel") {
+                mutateVoxelElement(p, oZ1, oA1, false);
+                mutateVoxelElement(pC.q, oZ2, oA2, false);
+                applyNuclearFusionHeat(p, pC.q, Q, Q);
+              } else {
+                consumeFusionPartner(p, pC);
+                mutateVoxelElement(p, oZ1, oA1, false);
+                spawnOrPackNuclide(p, oZ2, oA2, p.temp ?? 20, (Math.random() - 0.5) * 2, (Math.random() - 0.5) * 2);
+                applyNuclearFusionHeat(p, null, Q, Q);
+              }
+              fused = true;
+            }
+          }
+        }
+
+        // 10. Neon Photodisintegration (T >= 1.2e9 K): Ne-20 + gamma -> O-16 + He-4 (endothermic -4.73 MeV; He-4 then captures on Ne-20 -> Mg-24)
+        if (!fused && Z === 10 && A === 20 && tempK >= 1.2e9) {
+          if (Math.random() < Math.min(0.16, 0.015 * rateMult * Math.pow(tempK / 1.4e9, 3))) {
+            mutateVoxelElement(p, 8, 16, false);
+            spawnOrPackNuclide(p, 2, 4, Math.max(1e8, (p.temp ?? 20) - 1.5e6), (Math.random() - 0.5) * 2, (Math.random() - 0.5) * 2);
+            p.temp = Math.max(1e8, (p.temp ?? 20) - 1.5e6);
+            fused = true;
+          }
+        }
+
+        // 11. Oxygen Burning (T >= 1.5e9 K): O-16 + O-16 -> Si-28 + He-4 (9.59 MeV) OR P-31 + H-1 (7.68 MeV)
+        if (!fused && Z === 8 && A === 16 && tempK >= 1.5e9) {
+          const pO = findFusionPartner(p, 8, 16, null);
+          if (pO) {
+            const gFac = gamowTunnelFactor(8, 16, 8, 16, tempK, 2.0e9);
+            if (Math.random() < Math.min(0.24, 0.03 * rateMult * gFac)) {
+              const branchAlpha = Math.random() < 0.6;
+              const oZ1 = branchAlpha ? 14 : 15, oA1 = branchAlpha ? 28 : 31;
+              const oZ2 = branchAlpha ? 2 : 1, oA2 = branchAlpha ? 4 : 1;
+              const Q = (bindingEnergyMeV(oZ1, oA1) + bindingEnergyMeV(oZ2, oA2)) - 2 * bindingEnergyMeV(8, 16);
+              if (pO.kind === "pixel") {
+                mutateVoxelElement(p, oZ1, oA1, false);
+                mutateVoxelElement(pO.q, oZ2, oA2, false);
+                applyNuclearFusionHeat(p, pO.q, Q, Q);
+              } else {
+                consumeFusionPartner(p, pO);
+                mutateVoxelElement(p, oZ1, oA1, false);
+                spawnOrPackNuclide(p, oZ2, oA2, p.temp ?? 20, (Math.random() - 0.5) * 2, (Math.random() - 0.5) * 2);
+                applyNuclearFusionHeat(p, null, Q, Q);
+              }
+              fused = true;
+            }
+          }
+        }
+
+        // 12. Silicon Burning (T >= 2.7e9 K): Si-28 + Si-28 -> Ni-56 (10.92 MeV; Ni-56 then beta-decays -> Co-56 -> Fe-56!)
+        if (!fused && Z === 14 && A === 28 && tempK >= 2.7e9) {
+          const pSi = findFusionPartner(p, 14, 28, null);
+          if (pSi) {
+            const gFac = gamowTunnelFactor(14, 28, 14, 28, tempK, 3.2e9);
+            if (Math.random() < Math.min(0.25, 0.035 * rateMult * gFac)) {
+              const Q = bindingEnergyMeV(28, 56) - 2 * bindingEnergyMeV(14, 28); // 10.922 MeV
+              consumeFusionPartner(p, pSi);
+              mutateVoxelElement(p, 28, 56, false);
+              applyNuclearFusionHeat(p, null, Q, Q);
+              fused = true;
+            }
+          }
+        }
+
+        // 13. Core-Collapse Supernova: Endothermic Iron-Peak Photodisintegration (Fe-56/Ni-56, T >= 5e9 K, chi >= 3)
+        if (!fused && (Z === 26 || Z === 28) && A >= 52 && tempK >= 5e9 && chi >= 3.0) {
           triggerCoreCollapseBounce(p, activePixels);
         }
       }
@@ -1631,12 +2197,26 @@
   }
 
   // ==========================================================================
-  // 9. SUB-GRID NEUTRON TRANSPORT & NUCLEAR FISSION
+  // 9. SUB-GRID NEUTRON TRANSPORT & ACCURATE NUCLEAR FISSION
   // ==========================================================================
+
+  // Exact elastic scattering mean logarithmic energy decrement xi(A)
+  function elasticModerationXi(A) {
+    if (A <= 1) return 1.0;
+    const alpha = Math.pow((A - 1) / (A + 1), 2);
+    return 1.0 + (alpha * Math.log(alpha)) / (1.0 - alpha);
+  }
+
+  function neutronSpeedForEnergy(energy_eV) {
+    if (energy_eV >= 1e5) return 2.4;
+    if (energy_eV >= 10) return 1.55;
+    return 0.85;
+  }
+
   function spawnNeutron(x, y, energy_eV = 2e6) {
     if (UPCS.neutrons.length >= 750) return;
     const ang = Math.random() * Math.PI * 2;
-    const speed = energy_eV > 1e4 ? 2.4 : 0.85; // Fast vs Thermal velocity in cells/substep
+    const speed = neutronSpeedForEnergy(energy_eV);
     UPCS.neutrons.push({
       x, y, vx: Math.cos(ang) * speed, vy: Math.sin(ang) * speed,
       energy_eV, age: 0
@@ -1655,17 +2235,39 @@
   }
 
   function stepNeutronsAndPhotons() {
-    // 1. Delayed neutron emitters (~0.65% delayed fraction for stable reactor control)
+    // 0. Bridge vanilla Sandboxels 'neutron' pixels into UPCS sub-grid neutrons when near UPCS matter
+    if (CONFIG.enableFission && typeof currentPixels !== "undefined" && UPCS.neutrons.length < 700) {
+      for (let i = 0; i < currentPixels.length; i++) {
+        const vp = currentPixels[i];
+        if (!vp || vp.del || vp.element !== "neutron") continue;
+        // Check if adjacent to any UPCS element
+        let nearUPCS = false;
+        for (let dx = -1; dx <= 1 && !nearUPCS; dx++) {
+          for (let dy = -1; dy <= 1 && !nearUPCS; dy++) {
+            const nx = vp.x + dx, ny = vp.y + dy;
+            const nb = (nx >= 0 && nx < width && ny >= 0 && ny < height && pixelMap[nx]) ? pixelMap[nx][ny] : null;
+            if (nb && nb.isUPCS) nearUPCS = true;
+          }
+        }
+        if (nearUPCS) {
+          spawnNeutron(vp.x, vp.y, 2e6);
+          if (typeof deletePixel === "function") deletePixel(vp.x, vp.y);
+          else vp.del = true;
+        }
+      }
+    }
+
+    // 1. Delayed neutron emitters (critical for controllable thermal nuclear reactors)
     for (let i = UPCS.delayedNeutrons.length - 1; i >= 0; i--) {
       const dn = UPCS.delayedNeutrons[i];
       dn.timer -= 1;
       if (dn.timer <= 0) {
-        spawnNeutron(dn.x, dn.y, 5e5);
+        spawnNeutron(dn.x, dn.y, dn.energy_eV || 4.5e5);
         UPCS.delayedNeutrons.splice(i, 1);
       }
     }
 
-    // 2. Sub-grid neutron transport with CFL-safe stepping
+    // 2. Sub-grid neutron transport with exact moderation, 1/sqrt(E) cross-sections & asymmetric fission
     if (CONFIG.enableFission) {
       for (let i = UPCS.neutrons.length - 1; i >= 0; i--) {
         const n = UPCS.neutrons[i];
@@ -1688,84 +2290,149 @@
           }
           if (consumed) break;
           const p = pixelMap[gx] && pixelMap[gx][gy];
-          if (!p || !p.isUPCS) continue;
+          if (!p || !p.isUPCS || p.del) continue;
           if (p.isBlackHole) { consumed = true; break; }
 
           const iso = getIsotopeParams(p.Z, p.A, p.is_metastable);
-          const isThermal = n.energy_eV < 1.0;
+          const tempK = Math.max(1, (p.temp ?? 20) + 273.15);
+          const E_th = 1.2926e-4 * tempK; // Thermal equilibrium energy (3/2 k_B T in eV; ~0.0388 eV at 300 K)
+          const isThermal = n.energy_eV < Math.max(1.0, E_th * 12);
+          // 1/v (1/sqrt(E)) thermal cross-section law normalized at 0.0253 eV (2200 m/s)
+          const invSqrtE = n.energy_eV < 100
+            ? Math.min(2.5, Math.sqrt(0.0253 / Math.max(0.01, n.energy_eV)))
+            : (0.015 / Math.sqrt(Math.max(100, n.energy_eV) * 1e-2));
 
-          // Control Rod Absorption (Boron-10, Cadmium, Hafnium, Gadolinium)
-          if (iso.isControlAbsorber && Math.random() < (isThermal ? 0.78 : 0.12)) {
-            p.temp = (p.temp ?? 20) + 85;
-            consumed = true;
-            break;
-          }
-
-          // Elastic Moderation (Water / Heavy Water / Graphite slows fast neutrons -> thermal)
-          if (iso.isModerator && !isThermal && Math.random() < 0.45) {
-            n.energy_eV *= 0.04;
-            const ang = Math.random() * Math.PI * 2;
-            const spd = n.energy_eV < 1.0 ? 0.85 : 1.5;
-            n.vx = Math.cos(ang) * spd;
-            n.vy = Math.sin(ang) * spd;
-            p.temp = (p.temp ?? 20) + 18;
+          // A. Beryllium-9 (n, 2n) Fast Neutron Multiplier (threshold 1.85 MeV; critical for Demon Core / reflectors)
+          if (p.Z === 4 && p.A === 9 && n.energy_eV > 1.85e6 && Math.random() < 0.18) {
+            const eChild = Math.max(1e5, (n.energy_eV - 1.665e6) * 0.45);
+            n.energy_eV = eChild;
+            const ang1 = Math.random() * Math.PI * 2;
+            const spd1 = neutronSpeedForEnergy(eChild);
+            n.vx = Math.cos(ang1) * spd1;
+            n.vy = Math.sin(ang1) * spd1;
+            spawnNeutron(p.x, p.y, eChild);
+            // Rare transmutation of Be-9 -> 2 He-4
+            if (Math.random() < 0.08) {
+              mutateVoxelElement(p, 2, 4, false);
+              spawnOrPackNuclide(p, 2, 4, p.temp ?? 20, (Math.random() - 0.5) * 1.5, (Math.random() - 0.5) * 1.5);
+            }
             continue;
           }
 
-          // Fission Cross-Section (U-235, Pu-239, U-233)
-          const sigF = isThermal ? iso.sigmaFissionThermal : iso.sigmaFissionFast;
-          if (sigF > 0 && Math.random() < Math.min(0.82, sigF * 0.0012)) {
-            // Split nucleus into radioactive fission fragments (e.g., Kr-92 + Ba-141)
-            const dZ1 = 36 + ((Math.random() * 6) | 0);
-            const dA1 = Math.max(dZ1, Math.round(p.A * 0.39));
-            const dZ2 = Math.max(1, p.Z - dZ1);
-            const dA2 = Math.max(dZ2, p.A - dA1 - 2);
-            mutateVoxelElement(p, dZ1, dA1, false);
-            p.temp = (p.temp ?? 20) + 4200; // ~200 MeV fission kinetic heat
-
-            // Recoil impulse
-            const rAng = Math.random() * Math.PI * 2;
-            p.vx += Math.cos(rAng) * 3.5;
-            p.vy += Math.sin(rAng) * 3.5;
-
-            // Spawn second fission daughter in adjacent empty cell if available
-            const nx = p.x + (Math.cos(rAng) > 0 ? -1 : 1);
-            const ny = p.y + (Math.sin(rAng) > 0 ? -1 : 1);
-            if (nx >= 0 && nx < width && ny >= 0 && ny < height && typeof isEmpty === "function" && isEmpty(nx, ny)) {
-              createPixel(ELEMENT_KEY_BY_Z[dZ2], nx, ny);
-              const q = pixelMap[nx][ny];
-              if (q) {
-                initVoxel(q, dZ2);
-                q.A = dA2;
-                q.temp = p.temp;
-                q.vx = -Math.cos(rAng) * 3.5;
-                q.vy = -Math.sin(rAng) * 3.5;
-              }
+          // B. Lithium-6 (n, alpha) H-3 Tritium Breeding Blanket (sigma_th = 940 b, Q = 4.784 MeV)
+          if (p.Z === 3 && p.A === 6) {
+            const sigLi6 = 940 * invSqrtE;
+            const probLi6 = 1 - Math.exp(-sigLi6 * 0.0012);
+            if (Math.random() < probLi6) {
+              const Q = (bindingEnergyMeV(2, 4) + bindingEnergyMeV(1, 3)) - bindingEnergyMeV(3, 6); // 4.784 MeV
+              mutateVoxelElement(p, 1, 3, false); // Bred Tritium (H-3)!
+              p.temp = (p.temp ?? 20) + Math.min(2500, Q * 180);
+              spawnOrPackNuclide(p, 2, 4, p.temp, (Math.random() - 0.5) * 2, (Math.random() - 0.5) * 2);
+              UPCS.ledger.E_nuclear -= Q * PHYS.MeV_to_J;
+              UPCS.ledger.E_thermal += Q * PHYS.MeV_to_J;
+              consumed = true;
+              break;
             }
-
-            // Emit ν ≈ 2.4–2.9 neutrons (99.35% prompt, 0.65% delayed)
-            const nu = Math.random() < 0.55 ? 3 : 2;
-            for (let k = 0; k < nu; k++) {
-              if (Math.random() < 0.04) { // slightly boosted delayed fraction for visible reactor control
-                UPCS.delayedNeutrons.push({ x: p.x, y: p.y, timer: 45 + ((Math.random() * 75) | 0) });
-              } else {
-                spawnNeutron(p.x, p.y, 2e6);
-              }
-            }
-
-            UPCS.ledger.E_nuclear -= 200 * PHYS.MeV_to_J;
-            UPCS.ledger.E_thermal += 200 * PHYS.MeV_to_J;
-            emitPhoton(p.x, p.y, 18000, 0.9);
-            consumed = true;
-            break;
           }
 
-          // Fertile Neutron Capture & Breeding (e.g., U-238 + n -> U-239 -> Np-239 -> Pu-239)
-          if (iso.sigmaCapture > 0.5 && Math.random() < Math.min(0.25, iso.sigmaCapture * 0.015)) {
-            p.A += 1;
-            p.temp = (p.temp ?? 20) + 120;
-            consumed = true;
-            break;
+          // C. Boron-10 (n, alpha) Li-7 Control Rod Absorption (sigma_th = 3840 b, Q = 2.790 MeV)
+          if (p.Z === 5 && p.A === 10) {
+            const sigB10 = 3840 * invSqrtE;
+            const probB10 = 1 - Math.exp(-sigB10 * 0.0009);
+            if (Math.random() < probB10) {
+              const Q = (bindingEnergyMeV(3, 7) + bindingEnergyMeV(2, 4)) - bindingEnergyMeV(5, 10); // 2.790 MeV
+              p.temp = (p.temp ?? 20) + Math.min(1200, Q * 120);
+              // Burnout B-10 -> Li-7 + He-4 gradually so control rods have realistic lifetime
+              if (Math.random() < 0.05) {
+                mutateVoxelElement(p, 3, 7, false);
+                spawnOrPackNuclide(p, 2, 4, p.temp, (Math.random() - 0.5) * 1.5, (Math.random() - 0.5) * 1.5);
+              }
+              UPCS.ledger.E_nuclear -= Q * PHYS.MeV_to_J;
+              UPCS.ledger.E_thermal += Q * PHYS.MeV_to_J;
+              consumed = true;
+              break;
+            }
+          }
+
+          // D. Control Absorbers & Reactor Neutron Poisons (Xe-135, Gd-157, Sm-149, Cd-113, Hf-177, He-3)
+          if (iso.isControlAbsorber || (p.Z === 2 && p.A === 3)) {
+            const effCap = iso.sigmaCapture * invSqrtE;
+            const probAbs = 1 - Math.exp(-effCap * 0.0006);
+            if (Math.random() < probAbs) {
+              p.temp = (p.temp ?? 20) + 45;
+              if (p.Z === 2 && p.A === 3) {
+                // He-3(n, p)H-3
+                mutateVoxelElement(p, 1, 3, false);
+                spawnOrPackNuclide(p, 1, 1, p.temp, (Math.random() - 0.5) * 1.5, (Math.random() - 0.5) * 1.5);
+              } else if (p.Z === 54 && p.A === 135) {
+                // Xe-135 poison burns out into stable Xe-136!
+                p.A = 136;
+              } else if (Math.random() < 0.08) {
+                p.A = Math.min(350, p.A + 1);
+              }
+              consumed = true;
+              break;
+            }
+          }
+
+          // E. Exact Mass-Dependent Elastic Scattering & Moderation (H-1, H-2, Be-9, C-12, O-16, heavy reflectors)
+          const xi = elasticModerationXi(p.A);
+          const scatProb = iso.isModerator ? 0.52 : (p.A >= 50 ? 0.14 : 0.18);
+          if (!isThermal && Math.random() < scatProb) {
+            const oldE = n.energy_eV;
+            // Macroscopic voxel represents several elastic mean free paths for light moderators
+            const meanColl = iso.isModerator ? 4.8 : 1.6;
+            const newE = Math.max(E_th, oldE * Math.exp(-xi * meanColl));
+            n.energy_eV = newE;
+            const ang = Math.random() * Math.PI * 2;
+            const spd = neutronSpeedForEnergy(newE);
+            n.vx = Math.cos(ang) * spd;
+            n.vy = Math.sin(ang) * spd;
+            // Realistic moderator recoil warming proportional to lost neutron MeV
+            const dE_MeV = Math.max(0, (oldE - newE) * 1e-6);
+            p.temp = (p.temp ?? 20) + Math.min(18, dE_MeV * 6.0);
+            continue;
+          }
+
+          // F. Energy-Dependent Nuclear Fission (respecting thermal 1/sqrt(E) & fast-fission thresholds)
+          let sigF = 0;
+          if (n.energy_eV < 100) {
+            sigF = iso.sigmaFissionThermal * invSqrtE;
+          } else {
+            if (!iso.fastFissThresh_eV || n.energy_eV >= iso.fastFissThresh_eV) {
+              sigF = iso.sigmaFissionFast;
+            }
+          }
+          if (sigF > 0) {
+            // Fast neutrons have ~500x smaller microscopic cross-section than thermal, scaled for macroscopic solid density
+            const probF = n.energy_eV < 100
+              ? (1 - Math.exp(-sigF * 0.0014))
+              : (1 - Math.exp(-sigF * 0.045));
+            if (Math.random() < probF) {
+              performFissionEvent(p, iso, false);
+              consumed = true;
+              break;
+            }
+          }
+
+          // G. Radiative Capture & Fertile Breeding (U-238 -> U-239 -> Np-239 -> Pu-239, Th-232 -> Th-233 -> Pa-233 -> U-233)
+          //    Includes Doppler resonance broadening (negative temperature feedback!) in epithermal range
+          if (iso.sigmaCapture > 0.01) {
+            const isResonance = n.energy_eV >= 1.0 && n.energy_eV <= 1e5;
+            const doppler = (isResonance && p.Z >= 90) ? Math.sqrt(Math.max(0.5, tempK / 300)) * 2.5 : 1.0;
+            const effSigCap = iso.sigmaCapture * (n.energy_eV < 100 ? invSqrtE : 0.12) * doppler;
+            const probCap = 1 - Math.exp(-effSigCap * 0.004);
+            if (Math.random() < probCap) {
+              const B_before = bindingEnergyMeV(p.Z, p.A);
+              const B_after = bindingEnergyMeV(p.Z, p.A + 1);
+              const Q_cap = Math.max(2.0, B_after - B_before); // Binding energy of captured neutron (~5-8 MeV gamma)
+              p.A = Math.min(350, p.A + 1);
+              p.temp = (p.temp ?? 20) + Math.min(400, Q_cap * 18);
+              UPCS.ledger.E_nuclear -= Q_cap * PHYS.MeV_to_J;
+              UPCS.ledger.E_thermal += Q_cap * PHYS.MeV_to_J;
+              consumed = true;
+              break;
+            }
           }
         }
         if (consumed) UPCS.neutrons.splice(i, 1);
@@ -2057,16 +2724,9 @@
       if (p.del) continue;
 
       // 3. Multi-Voxel Thermal/Momentum Equilibration & Decompression Pop-Out
+      // (Exact adiabatic heating & cooling are applied directly on compression pack and expansion pop-out)
       if (CONFIG.enableMultiVoxelStack && p.stored_voxels && p.stored_voxels.length > 0) {
         equilibrateAndDecompress(p, Vcell);
-      }
-
-      // 4. Adiabatic Heating/Cooling from Δχ
-      if (CONFIG.enableCompression && Math.abs(p.chi - oldChi) > 0.01) {
-        const dChi = p.chi - oldChi;
-        const th = getThermoProps(p.Z, p.A, tempK, p.chi);
-        const dT_ad = Math.max(-800, Math.min(3500, dChi * 160 * (tempK / 300) / Math.max(0.2, th.C_v / 1000)));
-        p.temp = Math.max(-270, (p.temp ?? 20) + dT_ad);
       }
     }
   }
@@ -2094,6 +2754,7 @@
     const P_ram = 0.5 * rho2 * vImpactMS * vImpactMS;
     const P_grav = rho2 * gMS2 * L;
     const el2 = ELEMENTS[p2.Z];
+    const tempK1 = Math.max(0.5, (p1.temp ?? 20) + 273.15);
     const tempK2 = Math.max(0.5, (p2.temp ?? 20) + 273.15);
     const ph2 = getVoxelPhase(el2, tempK2, p2.chi || 1);
     const K_eff = rho2 > 500
@@ -2107,6 +2768,7 @@
       (P_ram + P_grav) >= internalResist;
 
     if (canPack) {
+      const oldChi2 = Math.max(1.0, p2.chi || 1.0);
       // Pack primary p1 (and all of its stored_voxels) into p2.stored_voxels
       p2.stored_voxels.push({
         Z: p1.Z, A: p1.A, is_metastable: !!p1.is_metastable,
@@ -2119,13 +2781,27 @@
         }
         p1.stored_voxels.length = 0;
       }
-      // Conserve center-of-mass momentum & convert inelastic impact energy to adiabatic heat
+      // Conserve center-of-mass momentum & convert exact inelastic KE + adiabatic work into ΔT
       const mSum = m1 + m2;
       p2.vx = (m1 * p1.vx + m2 * p2.vx) / mSum;
       p2.vy = (m1 * p1.vy + m2 * p2.vy) / mSum;
-      const dT = Math.min(2e5, impactSpeed * impactSpeed * 95 + 45 + (L >= 1e5 ? gMS2 * L * 1e-6 : 0));
-      p2.temp = (p2.temp ?? 20) + dT;
-      p2.chi = getTotalMassKg(p2) / Math.max(1e-36, getRestMassKg(p2.Z, p2.A));
+
+      const th1 = getThermoProps(p1.Z, p1.A, tempK1, p1.chi || 1);
+      const th2 = getThermoProps(p2.Z, p2.A, tempK2, oldChi2);
+      const mRed = (m1 * m2) / mSum;
+      const Q_lost = 0.5 * mRed * vImpactMS * vImpactMS;
+      const heatCap = Math.max(1e-30, m1 * th1.C_v + m2 * th2.C_v);
+      const dT_impact = Number.isFinite(Q_lost / heatCap) ? (Q_lost / heatCap) : 0;
+
+      const newChi2 = Math.max(1.0, getTotalMassKg(p2) / Math.max(1e-36, getRestMassKg(p2.Z, p2.A)));
+      const avgT = (m1 * (p1.temp ?? 20) + m2 * (p2.temp ?? 20)) / mSum;
+      const avgK = Math.max(1.0, avgT + 273.15);
+      const gamma = ph2 >= 2 ? (5 / 3) : 1.08;
+      const dT_ad = newChi2 > oldChi2 ? avgK * (Math.pow(newChi2 / oldChi2, gamma - 1) - 1) : 0;
+      const dT = Math.min(2e6, Math.max(0, dT_impact) + (Number.isFinite(dT_ad) ? Math.max(0, dT_ad) : 0));
+
+      p2.temp = Math.min(6e9, avgT + dT);
+      p2.chi = newChi2;
       p2._lastP = computeEoSPressure(p2, mSum, Math.max(0.5, (p2.temp ?? 20) + 273.15), Vcell);
 
       if (typeof deletePixel === "function") deletePixel(p1.x, p1.y);
@@ -2143,10 +2819,19 @@
       p2.vx -= impX / m2;
       p2.vy -= impY / m2;
 
-      // Convert lost inelastic KE into local ΔT
-      const dT = Math.min(800, (1 - e * e) * velAlongNormal * velAlongNormal * 14);
-      p1.temp = (p1.temp ?? 20) + dT;
-      p2.temp = (p2.temp ?? 20) + dT;
+      // Exact first-principles inelastic kinetic energy dissipation:
+      // Q_lost = 0.5 * (m1*m2/(m1+m2)) * (1 - e^2) * v_rel_ms^2,  dT = Q_lost / (m1*Cv1 + m2*Cv2)
+      const vRelMS = velAlongNormal * (L / dt);
+      const mRed = (m1 * m2) / (m1 + m2);
+      const Q_lost = 0.5 * mRed * (1 - e * e) * vRelMS * vRelMS;
+      const th1 = getThermoProps(p1.Z, p1.A, tempK1, p1.chi || 1);
+      const th2 = getThermoProps(p2.Z, p2.A, tempK2, p2.chi || 1);
+      const heatCap = Math.max(1e-30, m1 * th1.C_v + m2 * th2.C_v);
+      const dT = Math.min(2e6, Q_lost / heatCap);
+      if (Number.isFinite(dT) && dT > 0) {
+        p1.temp = Math.min(6e9, (p1.temp ?? 20) + dT);
+        p2.temp = Math.min(6e9, (p2.temp ?? 20) + dT);
+      }
     }
     p1.ox = Math.max(-0.48, Math.min(0.48, p1.ox));
     p1.oy = Math.max(-0.48, Math.min(0.48, p1.oy));
@@ -2191,7 +2876,16 @@
         }
       }
       if (bestDir) {
+        const oldChi = Math.max(1.0, p.chi || 1.0);
         const sv = arr.pop();
+        const newChi = Math.max(1.0, getTotalMassKg(p) / Math.max(1e-36, getRestMassKg(p.Z, p.A)));
+        const elP = ELEMENTS[p.Z];
+        const phP = getVoxelPhase(elP, tempK, oldChi);
+        const gamma = phP >= 2 ? (5 / 3) : 1.08;
+        // Exact symmetric adiabatic expansion cooling: T_new = T_old * (chi_new / chi_old)^(gamma - 1)
+        const cooledK = Math.max(1.0, tempK * Math.pow(newChi / oldChi, gamma - 1));
+        const cooledC = Math.max(-270, cooledK - 273.15);
+
         const nx = p.x + bestDir[0], ny = p.y + bestDir[1];
         const key = ELEMENT_KEY_BY_Z[sv.Z];
         if (key && typeof createPixel === "function") {
@@ -2204,13 +2898,12 @@
             const ejectV = Math.min(1.6, 0.35 + Math.log10(Math.max(1, P_internal / Math.max(1, P_grav + remnantHold))) * 0.45);
             q.vx = p.vx + bestDir[0] * ejectV;
             q.vy = p.vy + bestDir[1] * ejectV;
-            // Adiabatic cooling on expansion
-            q.temp = Math.max(-270, avgT * 0.92 - 15);
-            p.temp = Math.max(-270, avgT * 0.96 - 8);
+            q.temp = cooledC;
+            p.temp = cooledC;
             q.charge = sv.charge; q.mx = sv.mx; q.my = sv.my;
           }
         }
-        p.chi = Math.max(1.0, getTotalMassKg(p) / Math.max(1e-36, getRestMassKg(p.Z, p.A)));
+        p.chi = newChi;
       }
     }
   }
