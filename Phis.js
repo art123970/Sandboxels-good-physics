@@ -711,6 +711,42 @@
     UPCS.curlGrid  = new Float32Array(n);
   }
 
+  function computeAutoDt(meters) {
+    const m = Math.max(1e-12, meters);
+    if (m <= SCALE_PRESETS[0].meters) return SCALE_PRESETS[0].autoDt;
+    const last = SCALE_PRESETS[SCALE_PRESETS.length - 1];
+    if (m >= last.meters) {
+      return last.autoDt * Math.pow(m / last.meters, 0.75);
+    }
+    const logM = Math.log10(m);
+    for (let i = 0; i < SCALE_PRESETS.length - 1; i++) {
+      const a = SCALE_PRESETS[i], b = SCALE_PRESETS[i + 1];
+      if (m >= a.meters && m <= b.meters) {
+        const t = (logM - Math.log10(a.meters)) / Math.max(1e-9, Math.log10(b.meters) - Math.log10(a.meters));
+        return Math.pow(10, Math.log10(a.autoDt) * (1 - t) + Math.log10(b.autoDt) * t);
+      }
+    }
+    return 1e-2;
+  }
+
+  function onScaleChanged() {
+    // Wipe stale gravity & pressure potentials from the previous scale
+    if (UPCS.phiGrid) UPCS.phiGrid.fill(0);
+    if (UPCS.gxGrid) UPCS.gxGrid.fill(0);
+    if (UPCS.gyGrid) UPCS.gyGrid.fill(0);
+    if (UPCS.pressGrid) UPCS.pressGrid.fill(0);
+    // Rescale Schwarzschild radii of any existing Black Hole voxels
+    if (typeof currentPixels !== "undefined" && Array.isArray(currentPixels)) {
+      for (let i = 0; i < currentPixels.length; i++) {
+        const p = currentPixels[i];
+        if (p && !p.del && p.isBlackHole) {
+          p.Rs_cells = computeBlackHoleRsCells(p.bhMass);
+        }
+      }
+    }
+    syncConfigUI();
+  }
+
   function applyScalePreset(presetId) {
     const p = SCALE_PRESETS.find(s => s.id === presetId);
     if (!p) return;
@@ -718,7 +754,16 @@
     CONFIG.voxelSizeMeters = p.meters;
     CONFIG.isAtomicMode = p.isAtomic;
     if (CONFIG.autoDt) CONFIG.dtSim = p.autoDt;
-    syncConfigUI();
+    onScaleChanged();
+  }
+
+  function applyCustomVoxelSize(meters) {
+    if (!Number.isFinite(meters) || meters <= 0) return;
+    CONFIG.scalePreset = "custom";
+    CONFIG.voxelSizeMeters = Math.max(1e-11, Math.min(1e12, meters));
+    CONFIG.isAtomicMode = CONFIG.voxelSizeMeters <= 5e-10;
+    if (CONFIG.autoDt) CONFIG.dtSim = computeAutoDt(CONFIG.voxelSizeMeters);
+    onScaleChanged();
   }
 
   function getCellVolume() {
@@ -988,21 +1033,35 @@
       }
     }
 
+    const tileCells = bs * bs;
     for (let i = 0; i < n; i++) {
       if (countG[i] > 0) {
         vxG[i] /= countG[i];
         vyG[i] /= countG[i];
-        pressG[i] /= countG[i];
       }
+      // Tile-averaged pressure proportional to local number density (so dense walls push back!)
+      pressG[i] /= tileCells;
     }
 
-    // 2. Gauss-Seidel Poisson Solver: ∇²Φ = 4π G ρ
+    // Gentle reflecting-boundary smoothing pass on pressG to eliminate coarse-grid stair-stepping
+    const pSmooth = new Float64Array(n);
+    for (let y = 0; y < ch; y++) {
+      const yU = y > 0 ? y - 1 : 0;
+      const yD = y < ch - 1 ? y + 1 : ch - 1;
+      for (let x = 0; x < cw; x++) {
+        const xL = x > 0 ? x - 1 : 0;
+        const xR = x < cw - 1 ? x + 1 : cw - 1;
+        const idx = y * cw + x;
+        pSmooth[idx] = 0.6 * pressG[idx] + 0.1 * (pressG[y * cw + xL] + pressG[y * cw + xR] + pressG[yU * cw + x] + pressG[yD * cw + x]);
+      }
+    }
+    pressG.set(pSmooth);
+
+    // 2. Gauss-Seidel Poisson Solver: ∇²Φ = 4π G ρ (dimensionally consistent cells/tick^2)
     if (CONFIG.enableGravity) {
-      // Scale factor converting mass per coarse tile to cell acceleration units
-      const tileSizeM = bs * L;
-      const gScale = (4 * Math.PI * PHYS.G * CONFIG.gravityMultiplier) / Math.max(1e-30, tileSizeM);
-      // Add sandbox auto-boost only if user has gravityMultiplier > 1 or large scale
-      const effectiveScale = CONFIG.sandboxScaledAstro && L >= 1e5 ? gScale * 1e-3 : gScale;
+      const dt = Math.max(1e-15, CONFIG.dtSim);
+      // a_cells/tick^2 = (G * M / (r_cells^2 * L^2)) * (dt^2 / L) = G * M * dt^2 / (L^3 * r_cells^2)
+      const effectiveScale = (4 * Math.PI * PHYS.G * dt * dt * CONFIG.gravityMultiplier) / Math.max(1e-36, Vcell * bs);
 
       for (let it = 0; it < CONFIG.poissonIterations; it++) {
         for (let y = 1; y < ch - 1; y++) {
@@ -1015,13 +1074,19 @@
         }
       }
 
-      // Compute acceleration g = -∇Φ
-      for (let y = 1; y < ch - 1; y++) {
+      // Compute acceleration g = -∇Φ across all tiles (one-sided at domain boundaries)
+      for (let y = 0; y < ch; y++) {
+        const yU = y > 0 ? y - 1 : 0;
+        const yD = y < ch - 1 ? y + 1 : ch - 1;
+        const dySpan = Math.max(1, yD - yU);
         const row = y * cw;
-        for (let x = 1; x < cw - 1; x++) {
+        for (let x = 0; x < cw; x++) {
+          const xL = x > 0 ? x - 1 : 0;
+          const xR = x < cw - 1 ? x + 1 : cw - 1;
+          const dxSpan = Math.max(1, xR - xL);
           const idx = row + x;
-          let gx = -0.5 * (phiG[idx + 1] - phiG[idx - 1]) / bs;
-          let gy = -0.5 * (phiG[idx + cw] - phiG[idx - cw]) / bs;
+          let gx = -((phiG[row + xR] - phiG[row + xL]) / dxSpan) / bs;
+          let gy = -((phiG[yD * cw + x] - phiG[yU * cw + x]) / dySpan) / bs;
           // Clamp extreme singularities outside horizon
           const mag = Math.hypot(gx, gy);
           if (mag > 400) { gx = (gx / mag) * 400; gy = (gy / mag) * 400; }
@@ -1030,6 +1095,7 @@
         }
       }
     } else {
+      phiG.fill(0);
       gxG.fill(0);
       gyG.fill(0);
     }
@@ -1050,6 +1116,7 @@
 
     // 4. Vorticity Curl Field: ω = ∂vy/∂x - ∂vx/∂y
     if (CONFIG.enableVorticity) {
+      curlG.fill(0);
       for (let y = 1; y < ch - 1; y++) {
         const row = y * cw;
         for (let x = 1; x < cw - 1; x++) {
@@ -1064,13 +1131,18 @@
   function computeEoSPressure(p, mTot, tempK, Vcell) {
     if (p.isBlackHole) return 0;
     const rho = mTot / Math.max(1e-36, Vcell);
-    const mu = Math.max(0.5, p.A / Math.max(1, p.Z + 1)); // mean molecular weight
-    const P_thermal = (rho * PHYS.k_B * tempK) / (mu * PHYS.amu);
+    const chi = Math.max(1.0, p.chi || 1.0);
+    const el = ELEMENTS[p.Z];
+    const phase = getVoxelPhase(el, tempK, chi);
+
+    // Solids are bound by lattice cohesion at chi=1; gases/plasmas exert full ideal-gas thermal pressure
+    const mu = Math.max(0.5, p.A / Math.max(1, p.Z + 1));
+    const P_ideal = (rho * PHYS.k_B * tempK) / (mu * PHYS.amu);
+    const P_thermal = phase >= 2 ? P_ideal : (phase === 1 ? P_ideal * 0.08 : 0);
+
     const T2 = tempK * tempK;
     const P_rad = (1 / 3) * PHYS.a_rad * T2 * T2;
 
-    const chi = Math.max(1.0, p.chi || 1.0);
-    const el = ELEMENTS[p.Z];
     let P_struct = 0;
     if (chi > 1.0) {
       // Switch to electron/neutron degeneracy pressure exponents at extreme compression
@@ -1247,7 +1319,7 @@
   function stepNuclearAndAstrophysics(activePixels) {
     const dt = CONFIG.dtSim;
     const L = CONFIG.voxelSizeMeters;
-    const isStarScale = L >= 1e5 || CONFIG.sandboxScaledAstro;
+    const isStarScale = L >= 1e6; // True stellar scale (>= 1,000 km per voxel)
 
     // 1. Update Black Hole Voxels (Schwarzschild radius, horizon capture of vanilla pixels, Hawking evaporation)
     for (let i = UPCS.blackHoles.length - 1; i >= 0; i--) {
@@ -1430,26 +1502,37 @@
       }
 
       // --- Compact Remnant Thresholds (White Dwarf -> Black Dwarf, Neutron Star, Black Hole) ---
-      if (isStarScale && chi >= 4.0) {
-        const storedN = p.stored_voxels ? p.stored_voxels.length : 0;
-        const mTot = getTotalMassKg(p);
-        const effChandra = CONFIG.sandboxScaledAstro ? getRestMassKg(6, 12) * 14 : PHYS.M_chandra;
-        const effTOV = CONFIG.sandboxScaledAstro ? getRestMassKg(26, 56) * 26 : PHYS.M_tov;
+      const mTot = getTotalMassKg(p);
+      const physRs = (2 * PHYS.G * mTot) / (PHYS.c * PHYS.c);
+      const meetsPhysicalBH = (mTot >= PHYS.M_tov) || (physRs >= 0.5 * L);
+      const storedN = p.stored_voxels ? p.stored_voxels.length : 0;
 
-        if (mTot >= effTOV || storedN >= 28) {
-          // Collapse voxel in-place into a deletable Black Hole voxel
+      if (meetsPhysicalBH) {
+        collapseVoxelToBlackHole(p, mTot);
+        UPCS.blackHoles.push(p);
+        continue;
+      }
+
+      // Scaled stellar remnants ONLY apply at true stellar voxel scales (L >= 1,000 km)
+      if (isStarScale && chi >= 6.0) {
+        const effWD = CONFIG.sandboxScaledAstro ? 5e25 : PHYS.M_chandra * 0.5;
+        const effNS = CONFIG.sandboxScaledAstro ? 1.8e26 : PHYS.M_chandra;
+        const effBH = CONFIG.sandboxScaledAstro ? 4.5e26 : PHYS.M_tov;
+
+        if (mTot >= effBH && storedN >= 32 && (p.remnant === "ns" || chi >= 18.0)) {
+          // Collapse stellar core in-place into a deletable Black Hole voxel
           const bhMass = CONFIG.sandboxScaledAstro ? Math.max(mTot, 3.0 * PHYS.M_sun) : mTot;
           collapseVoxelToBlackHole(p, bhMass);
           UPCS.blackHoles.push(p);
           continue;
-        } else if (mTot >= effChandra || storedN >= 14) {
+        } else if (mTot >= effNS && storedN >= 16 && chi >= 8.0) {
           if (p.remnant !== "ns") {
             p.remnant = "ns";
             p.spin = (p.spin || 0.2) * 12;   // Angular momentum conservation spin-up
             p.B_mag = Math.max(15, (p.B_mag || 1) * 20); // Flux conservation magnetar amplification
           }
           p.spin += 0.4;
-        } else if ((p.Z === 6 || p.Z === 8 || p.Z === 2) && storedN >= 5 && p.remnant !== "ns") {
+        } else if ((p.Z === 6 || p.Z === 8 || p.Z === 2) && mTot >= effWD && storedN >= 6 && p.remnant !== "ns") {
           p.remnant = tempK < 900 ? "bd" : "wd";
         }
       }
@@ -1824,27 +1907,37 @@
       // Update continuous compression factor χ = ρ_effective / ρ_rest
       const oldChi = p.chi || 1.0;
       p.chi = Math.max(1.0, mTot / Math.max(1e-36, mRest));
+      const phase = getVoxelPhase(el, tempK, p.chi);
 
       // 1. Force Summation: F_gravity + F_pressure_gradient + F_magnetic + F_lorentz + F_vorticity + F_drag
       let ax = bhAx, ay = bhAy;
+      const dt = Math.max(1e-15, CONFIG.dtSim);
 
       if (CONFIG.enableGravity) {
         ax += sampleCoarseBilinear(UPCS.gxGrid, p.x, p.y);
         ay += sampleCoarseBilinear(UPCS.gyGrid, p.x, p.y);
       }
       if (CONFIG.earthDownwardG) {
-        ay += 9.81 / Math.max(1e-3, L) * 0.025;
+        // Exact downward 9.81 m/s^2 converted to cells/tick^2
+        ay += Math.min(25, (9.81 * dt * dt) / Math.max(1e-6, L));
       }
 
-      // Pressure Gradient Force (-∇P / ρ)
-      const cx = Math.max(1, Math.min(cw - 2, (p.x / bs) | 0));
-      const cy = Math.max(1, Math.min(ch - 2, (p.y / bs) | 0));
+      // Pressure Gradient Force (-∇P / ρ) with reflecting zero-flux wall boundaries
+      const cx = Math.max(0, Math.min(cw - 1, (p.x / bs) | 0));
+      const cy = Math.max(0, Math.min(ch - 1, (p.y / bs) | 0));
       const cIdx = cy * cw + cx;
-      const dPx = (UPCS.pressGrid[cIdx + 1] - UPCS.pressGrid[cIdx - 1]);
-      const dPy = (UPCS.pressGrid[cIdx + cw] - UPCS.pressGrid[cIdx - cw]);
-      const pScale = 1.0 / (Math.max(1e-12, (mTot / Vcell)) * Math.max(1e-4, L) * 1e6 + 1e3);
-      ax -= Math.max(-18, Math.min(18, dPx * pScale));
-      ay -= Math.max(-18, Math.min(18, dPy * pScale));
+      const cxL = cx > 0 ? cx - 1 : 0;
+      const cxR = cx < cw - 1 ? cx + 1 : cw - 1;
+      const cyU = cy > 0 ? cy - 1 : 0;
+      const cyD = cy < ch - 1 ? cy + 1 : ch - 1;
+      const dPx = (UPCS.pressGrid[cy * cw + cxR] - UPCS.pressGrid[cy * cw + cxL]) / Math.max(1, cxR - cxL);
+      const dPy = (UPCS.pressGrid[cyD * cw + cx] - UPCS.pressGrid[cyU * cw + cx]) / Math.max(1, cyD - cyU);
+      const rho = Math.max(1e-12, mTot / Math.max(1e-36, Vcell));
+      const rawPAx = -(dPx / (rho * bs * Math.max(1e-10, L))) * (dt * dt);
+      const rawPAy = -(dPy / (rho * bs * Math.max(1e-10, L))) * (dt * dt);
+      const maxPAccel = Math.min(18, 2.2 * Math.sqrt(Math.max(0.2, tempK / 300)) + Math.max(0, p.chi - 1) * 4.0);
+      ax += maxPAccel * (rawPAx / (Math.abs(rawPAx) + maxPAccel * 8 + 1e-12));
+      ay += maxPAccel * (rawPAy / (Math.abs(rawPAy) + maxPAccel * 8 + 1e-12));
 
       // Magnetism: Dipole Force F_mag = ∇(μ · B), Alignment Torque, Curie Demagnetization, Lorentz Force
       if (CONFIG.enableMagnetism && el) {
@@ -1860,17 +1953,16 @@
               const mMag = Math.hypot(p.mx, p.my) || 0.25;
               p.mx = p.mx * 0.92 + (Bx / bMag) * mMag * 0.08;
               p.my = p.my * 0.92 + (By / bMag) * mMag * 0.08;
-              const dB = (UPCS.bxGrid[cIdx + 1] - UPCS.bxGrid[cIdx - 1]) * p.mx +
-                         (UPCS.byGrid[cIdx + 1] - UPCS.byGrid[cIdx - 1]) * p.my;
-              const dBy = (UPCS.bxGrid[cIdx + cw] - UPCS.bxGrid[cIdx - cw]) * p.mx +
-                          (UPCS.byGrid[cIdx + cw] - UPCS.byGrid[cIdx - cw]) * p.my;
+              const dB = ((UPCS.bxGrid[cy * cw + cxR] - UPCS.bxGrid[cy * cw + cxL]) * p.mx +
+                          (UPCS.byGrid[cy * cw + cxR] - UPCS.byGrid[cy * cw + cxL]) * p.my) / Math.max(1, cxR - cxL);
+              const dBy = ((UPCS.bxGrid[cyD * cw + cx] - UPCS.bxGrid[cyU * cw + cx]) * p.mx +
+                           (UPCS.byGrid[cyD * cw + cx] - UPCS.byGrid[cyU * cw + cx]) * p.my) / Math.max(1, cyD - cyU);
               ax += Math.max(-12, Math.min(12, dB * 1.4));
               ay += Math.max(-12, Math.min(12, dBy * 1.4));
             }
           }
         }
         // Lorentz Force F = q (v × B_z) for charged particles & ionized plasma
-        const phase = getVoxelPhase(el, tempK, p.chi);
         const effQ = p.charge !== 0 ? p.charge : (phase === 3 ? 1.0 : 0);
         if (effQ !== 0) {
           const Bz = (Bx - By) * 0.35 + (UPCS.curlGrid[cIdx] * 0.2);
@@ -1879,8 +1971,8 @@
         }
       }
 
-      // Fluid Vorticity Confinement
-      if (CONFIG.enableVorticity) {
+      // Fluid Vorticity Confinement (interior tiles only so walls don't pull gas into borders)
+      if (CONFIG.enableVorticity && cx > 0 && cx < cw - 1 && cy > 0 && cy < ch - 1) {
         const wC = UPCS.curlGrid[cIdx];
         const dwx = Math.abs(UPCS.curlGrid[cIdx + 1]) - Math.abs(UPCS.curlGrid[cIdx - 1]);
         const dwy = Math.abs(UPCS.curlGrid[cIdx + cw]) - Math.abs(UPCS.curlGrid[cIdx - cw]);
@@ -1915,10 +2007,11 @@
 
       if (stepX !== 0 || stepY !== 0) {
         const nx = p.x + stepX, ny = p.y + stepY;
-        if (nx < 0 || nx >= width || ny < 0 || ny >= height) {
-          // Boundary reflection
-          if (nx < 0 || nx >= width) { p.vx = -p.vx * CONFIG.restitution; p.ox = Math.max(-0.49, Math.min(0.49, p.ox)); }
-          if (ny < 0 || ny >= height) { p.vy = -p.vy * CONFIG.restitution; p.oy = Math.max(-0.49, Math.min(0.49, p.oy)); }
+        const wallRest = phase >= 2 ? Math.max(0.85, CONFIG.restitution) : CONFIG.restitution;
+        if (nx < 0 || nx > width || ny < 0 || ny > height) {
+          // Boundary reflection (elastic for gases so they rebound cleanly off borders)
+          if (nx < 0 || nx > width) { p.vx = -p.vx * wallRest; p.ox = Math.max(-0.49, Math.min(0.49, p.ox)); }
+          if (ny < 0 || ny > height) { p.vy = -p.vy * wallRest; p.oy = Math.max(-0.49, Math.min(0.49, p.oy)); }
         } else if (typeof isEmpty === "function" && isEmpty(nx, ny)) {
           // Clean sub-pixel traversal into empty cell
           movePixel(p, nx, ny);
@@ -1931,8 +2024,8 @@
           } else if (target && target.isUPCS && !target.del) {
             resolveVoxelCollisionOrPack(p, target, stepX, stepY);
           } else {
-            p.vx = -p.vx * CONFIG.restitution;
-            p.vy = -p.vy * CONFIG.restitution;
+            p.vx = -p.vx * wallRest;
+            p.vy = -p.vy * wallRest;
             p.ox = Math.max(-0.49, Math.min(0.49, p.ox));
             p.oy = Math.max(-0.49, Math.min(0.49, p.oy));
           }
@@ -1962,16 +2055,28 @@
     const ux = nx / nLen, uy = ny / nLen;
     const velAlongNormal = rvx * ux + rvy * uy;
 
-    // Check Compression Packing into target cell's stored_voxels array
+    // Check Compression Packing using physical ram + gravitational pressure vs material bulk modulus
     const impactSpeed = Math.max(0, velAlongNormal);
     const localG = Math.hypot(
       sampleCoarseBilinear(UPCS.gxGrid, p2.x, p2.y),
       sampleCoarseBilinear(UPCS.gyGrid, p2.x, p2.y)
     );
-    const packPressure = impactSpeed * 0.65 + localG * 0.45;
+    const L = CONFIG.voxelSizeMeters;
+    const dt = Math.max(1e-15, CONFIG.dtSim);
+    const Vcell = getCellVolume();
+    const rho2 = m2 / Math.max(1e-36, Vcell);
+    const vImpactMS = impactSpeed * (L / dt);
+    const gMS2 = localG * (L / (dt * dt));
+    const P_ram = 0.5 * rho2 * vImpactMS * vImpactMS;
+    const P_grav = rho2 * gMS2 * L * Math.max(1, p2.chi || 1);
+    const el2 = ELEMENTS[p2.Z];
+    const tempK2 = Math.max(0.5, (p2.temp ?? 20) + 273.15);
+    const ph2 = getVoxelPhase(el2, tempK2, p2.chi || 1);
+    const K_eff = ph2 >= 2 ? 2e5 : Math.max(1e7, el2 ? el2.K_bulk : 1e9);
+    const physPackRatio = (P_ram + P_grav) / K_eff;
     const canPack = CONFIG.enableCompression && CONFIG.enableMultiVoxelStack &&
       p2.stored_voxels.length < CONFIG.maxStoredPerCell &&
-      (packPressure >= CONFIG.packingChiThreshold || (p1.chi + p2.chi >= 2.5 && impactSpeed > 1.2));
+      physPackRatio >= 0.25 * CONFIG.packingChiThreshold;
 
     if (canPack) {
       // Pack primary p1 (and any of its stored_voxels) into p2.stored_voxels
@@ -1999,7 +2104,7 @@
 
     // Standard Momentum-Conserving Elastic/Inelastic Collision
     if (velAlongNormal > 0) {
-      const e = CONFIG.restitution;
+      const e = ph2 >= 2 ? Math.max(0.85, CONFIG.restitution) : CONFIG.restitution;
       const j = -(1 + e) * velAlongNormal / (1 / m1 + 1 / m2);
       const impX = j * ux, impY = j * uy;
       p1.vx += impX / m1;
@@ -2849,18 +2954,26 @@
       el.oninput = () => { CONFIG[key] = parseFloat(el.value); if (valId) document.getElementById(valId).textContent = el.value; };
     };
 
-    document.getElementById("upcs-apply-custom").onclick = () => {
+    const applyCustomFromInputs = () => {
       const v = parseFloat(document.getElementById("upcs-custom-val").value);
       const u = document.getElementById("upcs-custom-unit").value;
       if (v > 0 && UNIT_TO_METERS[u]) {
-        CONFIG.scalePreset = "custom";
-        CONFIG.voxelSizeMeters = v * UNIT_TO_METERS[u];
-        CONFIG.isAtomicMode = CONFIG.voxelSizeMeters <= 5e-10;
-        if (CONFIG.autoDt) CONFIG.dtSim = Math.max(1e-14, Math.pow(CONFIG.voxelSizeMeters, 0.75) * 0.1);
-        syncConfigUI();
+        applyCustomVoxelSize(v * UNIT_TO_METERS[u]);
       }
     };
-    document.getElementById("upcs-auto-dt").onchange = (e) => { CONFIG.autoDt = e.target.checked; syncConfigUI(); };
+    document.getElementById("upcs-apply-custom").onclick = applyCustomFromInputs;
+    document.getElementById("upcs-custom-val").onkeydown = (e) => {
+      if (e.key === "Enter") { e.preventDefault(); applyCustomFromInputs(); }
+    };
+    document.getElementById("upcs-custom-unit").onchange = applyCustomFromInputs;
+    document.getElementById("upcs-auto-dt").onchange = (e) => {
+      CONFIG.autoDt = e.target.checked;
+      if (CONFIG.autoDt) {
+        const preset = SCALE_PRESETS.find(s => s.id === CONFIG.scalePreset);
+        CONFIG.dtSim = preset ? preset.autoDt : computeAutoDt(CONFIG.voxelSizeMeters);
+      }
+      syncConfigUI();
+    };
     document.getElementById("upcs-manual-dt").onchange = (e) => {
       const v = parseFloat(e.target.value);
       if (v > 0) { CONFIG.autoDt = false; CONFIG.dtSim = v; document.getElementById("upcs-auto-dt").checked = false; syncConfigUI(); }
@@ -2912,15 +3025,33 @@
     syncConfigUI();
   }
 
+  function formatMetersBestUnit(meters) {
+    const units = [["Mm", 1e6], ["km", 1e3], ["m", 1], ["cm", 1e-2], ["mm", 1e-3], ["um", 1e-6], ["nm", 1e-9], ["A", 1e-10]];
+    for (let i = 0; i < units.length; i++) {
+      if (meters >= units[i][1] * 0.999) {
+        const val = meters / units[i][1];
+        return { unit: units[i][0], val: Number(val.toPrecision(4)) };
+      }
+    }
+    return { unit: "A", val: Number((meters / 1e-10).toPrecision(4)) };
+  }
+
   function syncConfigUI() {
     const pill = document.getElementById("upcs-scale-pill");
     const ro = document.getElementById("upcs-scale-readout");
     if (!pill || !ro) return;
     const preset = SCALE_PRESETS.find(s => s.id === CONFIG.scalePreset);
-    pill.textContent = preset ? preset.label : `${fmtSci(CONFIG.voxelSizeMeters)} m`;
+    const best = formatMetersBestUnit(CONFIG.voxelSizeMeters);
+    pill.textContent = preset ? preset.label : `${best.val} ${best.unit === "um" ? "µm" : best.unit === "A" ? "Å" : best.unit}`;
     document.querySelectorAll("#upcs-preset-grid .upcs-chip").forEach(c => {
       c.classList.toggle("active", c.dataset.scale === CONFIG.scalePreset);
     });
+    const cVal = document.getElementById("upcs-custom-val");
+    const cUnit = document.getElementById("upcs-custom-unit");
+    if (cVal && cUnit && document.activeElement !== cVal) {
+      cVal.value = best.val;
+      cUnit.value = best.unit;
+    }
     const mDt = document.getElementById("upcs-manual-dt");
     if (mDt) mDt.value = CONFIG.dtSim;
 
