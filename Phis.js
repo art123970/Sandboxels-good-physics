@@ -778,7 +778,15 @@
     const el = ELEMENTS[Z];
     if (!el) return A * PHYS.amu;
     const isoScale = A / Math.max(1, el.default_mass_number);
-    return Math.max(1e-30, el.rho_0 * isoScale * getCellVolume());
+    let rho = el.rho_0;
+    // At planetary/stellar scales (L > 10 km), STP gases represent self-gravitating
+    // condensed planetary/stellar plasma (e.g. Solar mean H density ~1,400 kg/m^3)
+    if (rho < 100 && CONFIG.voxelSizeMeters > 1e4) {
+      const t = Math.max(0, Math.min(1, (Math.log10(CONFIG.voxelSizeMeters) - 4) / 3)); // 10 km -> 10,000 km
+      const stellarRho = Math.min(3500, 1400 * Math.pow(Math.max(1, el.default_mass_number), 0.35));
+      rho = rho * Math.pow(stellarRho / Math.max(1e-3, rho), t);
+    }
+    return Math.max(1e-30, rho * isoScale * getCellVolume());
   }
 
   function getTotalMassKg(p) {
@@ -1057,19 +1065,26 @@
     }
     pressG.set(pSmooth);
 
-    // 2. Gauss-Seidel Poisson Solver: ∇²Φ = 4π G ρ (dimensionally consistent cells/tick^2)
+    // 2. SOR Poisson Solver: ∇²Φ = 4π G ρ (dimensionally consistent cells/tick^2)
     if (CONFIG.enableGravity) {
       const dt = Math.max(1e-15, CONFIG.dtSim);
+      // At planetary/stellar scales (L > 10 km), a 2D circular cross-section represents a 3D sphere (~12x column depth)
+      const depthBoost = L > 1e4
+        ? 1.0 + 11.0 * Math.min(1, (Math.log10(L) - 4) / 3)
+        : 1.0;
       // a_cells/tick^2 = (G * M / (r_cells^2 * L^2)) * (dt^2 / L) = G * M * dt^2 / (L^3 * r_cells^2)
-      const effectiveScale = (4 * Math.PI * PHYS.G * dt * dt * CONFIG.gravityMultiplier) / Math.max(1e-36, Vcell * bs);
+      const effectiveScale = (4 * Math.PI * PHYS.G * dt * dt * CONFIG.gravityMultiplier * depthBoost) / Math.max(1e-36, Vcell * bs);
 
-      for (let it = 0; it < CONFIG.poissonIterations; it++) {
+      const iters = Math.max(20, CONFIG.poissonIterations);
+      const omega = 1.55;
+      for (let it = 0; it < iters; it++) {
         for (let y = 1; y < ch - 1; y++) {
           const row = y * cw;
           for (let x = 1; x < cw - 1; x++) {
             const idx = row + x;
             const rhs = massG[idx] * effectiveScale;
-            phiG[idx] = 0.25 * (phiG[idx - 1] + phiG[idx + 1] + phiG[idx - cw] + phiG[idx + cw] - rhs);
+            const gs = 0.25 * (phiG[idx - 1] + phiG[idx + 1] + phiG[idx - cw] + phiG[idx + cw] - rhs);
+            phiG[idx] += omega * (gs - phiG[idx]);
           }
         }
       }
@@ -1150,7 +1165,11 @@
       if (chi > 12 || p.remnant === "wd") gamma = 1.3333; // 4/3 relativistic degeneracy
       if (p.remnant === "ns") gamma = 2.2; // strong-force repulsive nuclear stiffness
       const K = (el ? el.K_bulk : 1e9);
-      P_struct = K * Math.pow(chi - 1.0, gamma);
+      const P_bulk = K * Math.pow(chi - 1.0, gamma);
+      // Quantum electron degeneracy pressure: P_e ≈ 1.004e7 * (rho / mu_e)^(5/3) Pa (smoothly on for chi > 1)
+      const mu_e = Math.max(1.0, p.A / Math.max(1, p.Z));
+      const P_deg = 1.004e7 * Math.pow(Math.max(0, rho / mu_e), 1.6667) * Math.min(1, chi - 1.0);
+      P_struct = P_bulk + P_deg;
     }
     return P_thermal + P_rad + P_struct;
   }
@@ -1515,17 +1534,18 @@
 
       // Scaled stellar remnants ONLY apply at true stellar voxel scales (L >= 1,000 km)
       if (isStarScale && chi >= 6.0) {
-        const effWD = CONFIG.sandboxScaledAstro ? 5e25 : PHYS.M_chandra * 0.5;
-        const effNS = CONFIG.sandboxScaledAstro ? 1.8e26 : PHYS.M_chandra;
-        const effBH = CONFIG.sandboxScaledAstro ? 4.5e26 : PHYS.M_tov;
+        const effWD = CONFIG.sandboxScaledAstro ? 6e25 : PHYS.M_chandra * 0.5;
+        const effNS = CONFIG.sandboxScaledAstro ? 2.5e26 : PHYS.M_chandra;
+        // Black holes are truly rare: only an already-collapsed supermassive Neutron Star core at L >= 10,000 km
+        const effBH = CONFIG.sandboxScaledAstro ? 2.5e27 : PHYS.M_tov;
 
-        if (mTot >= effBH && storedN >= 32 && (p.remnant === "ns" || chi >= 18.0)) {
-          // Collapse stellar core in-place into a deletable Black Hole voxel
+        if (L >= 1e7 && p.remnant === "ns" && mTot >= effBH && storedN >= 48 && chi >= 35.0) {
+          // Collapse overloaded Neutron Star core in-place into a deletable Black Hole voxel
           const bhMass = CONFIG.sandboxScaledAstro ? Math.max(mTot, 3.0 * PHYS.M_sun) : mTot;
           collapseVoxelToBlackHole(p, bhMass);
           UPCS.blackHoles.push(p);
           continue;
-        } else if (mTot >= effNS && storedN >= 16 && chi >= 8.0) {
+        } else if (mTot >= effNS && storedN >= 16 && chi >= 10.0) {
           if (p.remnant !== "ns") {
             p.remnant = "ns";
             p.spin = (p.spin || 0.2) * 12;   // Angular momentum conservation spin-up
@@ -1923,6 +1943,7 @@
       }
 
       // Pressure Gradient Force (-∇P / ρ) with reflecting zero-flux wall boundaries
+      // a_cells/tick^2 = -(dP / (rho * bs * L)) * (dt^2 / L) = -(dP * dt^2) / (rho * bs * L^2)
       const cx = Math.max(0, Math.min(cw - 1, (p.x / bs) | 0));
       const cy = Math.max(0, Math.min(ch - 1, (p.y / bs) | 0));
       const cIdx = cy * cw + cx;
@@ -1933,8 +1954,9 @@
       const dPx = (UPCS.pressGrid[cy * cw + cxR] - UPCS.pressGrid[cy * cw + cxL]) / Math.max(1, cxR - cxL);
       const dPy = (UPCS.pressGrid[cyD * cw + cx] - UPCS.pressGrid[cyU * cw + cx]) / Math.max(1, cyD - cyU);
       const rho = Math.max(1e-12, mTot / Math.max(1e-36, Vcell));
-      const rawPAx = -(dPx / (rho * bs * Math.max(1e-10, L))) * (dt * dt);
-      const rawPAy = -(dPy / (rho * bs * Math.max(1e-10, L))) * (dt * dt);
+      const invLenSq = 1.0 / Math.max(1e-20, bs * L * L);
+      const rawPAx = -(dPx / rho) * invLenSq * (dt * dt);
+      const rawPAy = -(dPy / rho) * invLenSq * (dt * dt);
       const maxPAccel = Math.min(18, 2.2 * Math.sqrt(Math.max(0.2, tempK / 300)) + Math.max(0, p.chi - 1) * 4.0);
       ax += maxPAccel * (rawPAx / (Math.abs(rawPAx) + maxPAccel * 8 + 1e-12));
       ay += maxPAccel * (rawPAy / (Math.abs(rawPAy) + maxPAccel * 8 + 1e-12));
@@ -2032,6 +2054,8 @@
         }
       }
 
+      if (p.del) continue;
+
       // 3. Multi-Voxel Thermal/Momentum Equilibration & Decompression Pop-Out
       if (CONFIG.enableMultiVoxelStack && p.stored_voxels && p.stored_voxels.length > 0) {
         equilibrateAndDecompress(p, Vcell);
@@ -2055,7 +2079,7 @@
     const ux = nx / nLen, uy = ny / nLen;
     const velAlongNormal = rvx * ux + rvy * uy;
 
-    // Check Compression Packing using physical ram + gravitational pressure vs material bulk modulus
+    // Check Compression Packing using physical ram + gravitational pressure vs bulk modulus & internal degeneracy pressure
     const impactSpeed = Math.max(0, velAlongNormal);
     const localG = Math.hypot(
       sampleCoarseBilinear(UPCS.gxGrid, p2.x, p2.y),
@@ -2068,43 +2092,50 @@
     const vImpactMS = impactSpeed * (L / dt);
     const gMS2 = localG * (L / (dt * dt));
     const P_ram = 0.5 * rho2 * vImpactMS * vImpactMS;
-    const P_grav = rho2 * gMS2 * L * Math.max(1, p2.chi || 1);
+    const P_grav = rho2 * gMS2 * L;
     const el2 = ELEMENTS[p2.Z];
     const tempK2 = Math.max(0.5, (p2.temp ?? 20) + 273.15);
     const ph2 = getVoxelPhase(el2, tempK2, p2.chi || 1);
-    const K_eff = ph2 >= 2 ? 2e5 : Math.max(1e7, el2 ? el2.K_bulk : 1e9);
-    const physPackRatio = (P_ram + P_grav) / K_eff;
+    const K_eff = rho2 > 500
+      ? Math.max(2e10, el2 ? el2.K_bulk : 2e10)
+      : (ph2 >= 2 ? 2e5 : Math.max(1e7, el2 ? el2.K_bulk : 1e9));
+    const p1Stored = p1.stored_voxels ? p1.stored_voxels.length : 0;
+    const internalResist = K_eff * 0.5 * CONFIG.packingChiThreshold + (p2._lastP || 0) * 1.25;
+    // Never drop stored_voxels: require full capacity to conserve 100% of mass
     const canPack = CONFIG.enableCompression && CONFIG.enableMultiVoxelStack &&
-      p2.stored_voxels.length < CONFIG.maxStoredPerCell &&
-      physPackRatio >= 0.25 * CONFIG.packingChiThreshold;
+      (p2.stored_voxels.length + 1 + p1Stored) <= CONFIG.maxStoredPerCell &&
+      (P_ram + P_grav) >= internalResist;
 
     if (canPack) {
-      // Pack primary p1 (and any of its stored_voxels) into p2.stored_voxels
+      // Pack primary p1 (and all of its stored_voxels) into p2.stored_voxels
       p2.stored_voxels.push({
         Z: p1.Z, A: p1.A, is_metastable: !!p1.is_metastable,
         mass: getRestMassKg(p1.Z, p1.A), temp: p1.temp ?? 20,
         vx: p1.vx, vy: p1.vy, charge: p1.charge, mx: p1.mx, my: p1.my
       });
-      if (p1.stored_voxels && p1.stored_voxels.length > 0) {
-        for (let k = 0; k < p1.stored_voxels.length && p2.stored_voxels.length < CONFIG.maxStoredPerCell; k++) {
+      if (p1Stored > 0) {
+        for (let k = 0; k < p1Stored; k++) {
           p2.stored_voxels.push(p1.stored_voxels[k]);
         }
+        p1.stored_voxels.length = 0;
       }
       // Conserve center-of-mass momentum & convert inelastic impact energy to adiabatic heat
       const mSum = m1 + m2;
       p2.vx = (m1 * p1.vx + m2 * p2.vx) / mSum;
       p2.vy = (m1 * p1.vy + m2 * p2.vy) / mSum;
-      const dT = Math.min(6000, impactSpeed * impactSpeed * 95 + 45);
+      const dT = Math.min(2e5, impactSpeed * impactSpeed * 95 + 45 + (L >= 1e5 ? gMS2 * L * 1e-6 : 0));
       p2.temp = (p2.temp ?? 20) + dT;
       p2.chi = getTotalMassKg(p2) / Math.max(1e-36, getRestMassKg(p2.Z, p2.A));
+      p2._lastP = computeEoSPressure(p2, mSum, Math.max(0.5, (p2.temp ?? 20) + 273.15), Vcell);
 
       if (typeof deletePixel === "function") deletePixel(p1.x, p1.y);
+      p1.del = true;
       return;
     }
 
     // Standard Momentum-Conserving Elastic/Inelastic Collision
     if (velAlongNormal > 0) {
-      const e = ph2 >= 2 ? Math.max(0.85, CONFIG.restitution) : CONFIG.restitution;
+      const e = ph2 >= 2 ? Math.max(0.75, CONFIG.restitution) : CONFIG.restitution;
       const j = -(1 + e) * velAlongNormal / (1 / m1 + 1 / m2);
       const impX = j * ux, impY = j * uy;
       p1.vx += impX / m1;
@@ -2133,22 +2164,28 @@
       arr[i].vy = p.vy;
     }
 
-    // Compare outward thermal/degeneracy pressure vs confining gravity
+    // Compare physical internal pressure vs confining gravitational overburden
     const gMag = Math.hypot(
       sampleCoarseBilinear(UPCS.gxGrid, p.x, p.y),
       sampleCoarseBilinear(UPCS.gyGrid, p.x, p.y)
     );
+    const L = CONFIG.voxelSizeMeters;
+    const dt = Math.max(1e-15, CONFIG.dtSim);
+    const mTot = getTotalMassKg(p);
+    const rho = mTot / Math.max(1e-36, Vcell);
+    const gMS2 = gMag * (L / (dt * dt));
+    const P_grav = rho * gMS2 * L;
     const tempK = Math.max(1, avgT + 273.15);
-    const P_out = (tempK / 2500) + (p.chi - 1) * 0.55;
-    const P_in = gMag * 0.9 + (p.remnant === "ns" ? 12 : p.remnant === "wd" ? 4 : 0.6);
+    const P_internal = p._lastP || computeEoSPressure(p, mTot, tempK, Vcell);
+    const remnantHold = p.remnant === "ns" ? 1e18 : p.remnant === "wd" ? 1e14 : 1e5;
 
-    if (P_out > P_in && Math.random() < 0.28) {
-      // Find lowest-pressure adjacent empty cell
+    if (P_internal > (P_grav + remnantHold) * 1.4 && Math.random() < 0.18) {
+      // Find an adjacent empty cell
       const dirs = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[-1,1],[1,-1],[-1,-1]];
       let bestDir = null;
       for (let d = 0; d < dirs.length; d++) {
         const nx = p.x + dirs[d][0], ny = p.y + dirs[d][1];
-        if (nx >= 0 && nx < width && ny >= 0 && ny < height && typeof isEmpty === "function" && isEmpty(nx, ny)) {
+        if (nx >= 0 && nx <= width && ny >= 0 && ny <= height && typeof isEmpty === "function" && isEmpty(nx, ny)) {
           bestDir = dirs[d];
           break;
         }
@@ -2164,12 +2201,12 @@
             initVoxel(q, sv.Z);
             q.A = sv.A;
             q.is_metastable = sv.is_metastable;
-            const ejectV = Math.min(6.0, 0.8 + (P_out - P_in) * 0.6);
+            const ejectV = Math.min(1.6, 0.35 + Math.log10(Math.max(1, P_internal / Math.max(1, P_grav + remnantHold))) * 0.45);
             q.vx = p.vx + bestDir[0] * ejectV;
             q.vy = p.vy + bestDir[1] * ejectV;
             // Adiabatic cooling on expansion
-            q.temp = Math.max(-270, avgT * 0.88 - 25);
-            p.temp = Math.max(-270, avgT * 0.94 - 12);
+            q.temp = Math.max(-270, avgT * 0.92 - 15);
+            p.temp = Math.max(-270, avgT * 0.96 - 8);
             q.charge = sv.charge; q.mx = sv.mx; q.my = sv.my;
           }
         }
